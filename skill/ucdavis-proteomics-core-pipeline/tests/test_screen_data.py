@@ -922,6 +922,7 @@ class DetectionChances(unittest.TestCase):
         self.assertEqual(out[6], "TRUE")           # a fit whose objective is not limpa's is withheld
 
 
+@unittest.skipUnless(r_has(*fx.R_NEEDS), "needs R with " + "/".join(fx.R_NEEDS))   # make_session builds its fixture in R
 class DesignRefusals(unittest.TestCase):
     """screen_support() refuses what the page cannot describe, with its reason (M1, M2)."""
 

@@ -60,8 +60,32 @@ def job_env(tmpdir, base=None, **extra):
                SKILL_CONFIG_DIR=os.path.join(tmpdir, "skill_config"),
                HPCCF_SLURM_BIN=os.path.join(tmpdir, "no_slurm_bin"),
                UCD_HPC_CLUSTER_CONF=os.path.join(tmpdir, "no_cluster_file"))
+    env["PYTHONPATH"] = os.pathsep.join(
+        [roomy_disk_dir(tmpdir)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env.update({k: str(v) for k, v in extra.items()})
     return env
+
+
+_ROOMY_DISK = (
+    "import shutil\n"
+    "_real = shutil.disk_usage\n"
+    "def disk_usage(path):\n"
+    "    t, u, f = _real(path)\n"
+    "    return shutil._ntuple_diskusage(max(t, 1 << 50), u, max(f, 1 << 50))\n"
+    "shutil.disk_usage = disk_usage\n")
+
+
+def roomy_disk_dir(tmpdir):
+    """A folder whose sitecustomize.py makes a job-script test's child process see 1 PiB free.
+    run_search refuses a FragPipe search whose stage would not fit (1.2 GB a run), and a test
+    that builds 100-219 runs asks for 120-260 GB: the answer must not depend on the disk of the
+    machine running the suite (a GitHub runner has 87 GB). The refusal itself is tested in
+    test_fragpipe_dda_stage.py, in-process, with shutil.disk_usage mocked."""
+    d = os.path.join(tmpdir, "_roomy_disk")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "sitecustomize.py"), "w") as fh:
+        fh.write(_ROOMY_DISK)
+    return d
 
 
 # The system folders stay even if a cluster put sbatch there: dropping /usr/bin would break the

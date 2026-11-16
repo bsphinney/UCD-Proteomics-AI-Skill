@@ -30,7 +30,7 @@ SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
 sys.path.insert(0, SCRIPTS)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from job_env import job_env  # noqa: E402  (env for running job scripts)
+from job_env import job_env, roomy_disk_dir  # noqa: E402  (env for running job scripts)
 import run_search  # noqa: E402
 
 FP_WORKFLOW = os.path.join(HERE, "fixtures", "fragpipe24_nonspecific_peptidome",
@@ -100,6 +100,7 @@ def search(d, engine, *extra, cfg=None, n_files=2, slurm=False, n_seq=None, sage
     env.update(PATH=os.pathsep.join(path), HPCCF_SLURM_BIN=os.path.join(d, "no_slurm"),
                UCD_HPC_CLUSTER_CONF=os.path.join(d, "no_cluster_file"))
     env.pop("FRAGPIPE_TOOLS_FOLDER", None)
+    env["PYTHONPATH"] = roomy_disk_dir(d)      # the stage's room is not the runner's disk (job_env.py)
     env.update(env_extra or {})
     out = os.path.join(d, "out")
     p = subprocess.run([sys.executable, os.path.join(SCRIPTS, "run_search.py"),
