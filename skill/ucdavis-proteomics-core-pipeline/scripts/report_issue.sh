@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# =============================================================================
+# report_issue.sh  --  Record a problem with THIS SKILL the moment it happens, so the
+# Core can fix it. Not for problems with the user's data (a bad run, a failed
+# injection) -- those belong in the analysis report.
+#
+# Why this exists: on 2026-09-23 a Core member (Windows laptop, hive_remote) hit ten
+# skill defects in one session -- a mapped T: drive nobody translated to its HIVE path
+# (7.1 GB uploaded that was already on HIVE), no rsync in Git Bash, ThermoRawFileParser
+# never found, .NET half-installed, FASTA metadata lost. The only reason any of it was
+# fixed is that the agent happened to write a notes file into the user's own folder and
+# the user happened to forward it. Most sessions end with nothing written down, and
+# whatever went wrong is lost with the conversation.
+#
+#   bash report_issue.sh --title 'ThermoRawFileParser not found' --what-file - \
+#        --impact 'two wasted srun jobs; search would have used the 380-980 fallback' \
+#        [--workaround 'set THERMORAWFILEPARSER to the Core copy by hand'] \
+#        [--fix 'setup.sh should find /quobyte/.../ThermoRawFileParser'] \
+#        [--kind bug|docs|missing|agent_mistake] [--severity high|medium|low] \
+#        [--step '2 detect acquisition'] [--mode hive_remote] [--session <name>] <<'EOF'
+#   detect_acquisition.py returned "not found" for all 15 .raw: <the exact error text>
+#   EOF
+#
+# The exact text goes in from a FILE, never inside "...": --what-file F, or --what-file - and
+# a heredoc quoted <<'EOF' (standard input; nothing in it is expanded). The same for
+# --title-file, --impact-file, --workaround-file and --fix-file; only one field can read
+# standard input. In --what "..." bash itself runs anything in backticks or $(...) -- on this
+# computer, and again on HIVE when the command goes through hive_exec.sh's `bash -l -c` (2.12
+# security review: a backtick in an error text ran a command). Short arguments: single quotes.
+# A file is read up to 64 KiB (mirrors board_client.py's --body-file).
+#   bash report_issue.sh --where        # where issues go from this machine, and nothing else
+#   bash report_issue.sh --list [N]     # the N newest issue files (default 20)
+#
+# Where it goes (first that works):
+#   1. On HIVE with the Core's group folder writable  -> $SKILL_ISSUES_DIR directly.
+#   2. Off HIVE with a HIVE login set up (hive.env / HIVE_USER + HIVE_KEY) -> the same
+#      folder over SSH, through hive_exec.sh. This is the Windows/Mac hive_remote case.
+#   3. Otherwise -> ~/.proteomics-pipeline/issues/ on this machine; the script says so and
+#      prints how to send the file to the Core. Never an error: recording a problem must not
+#      become a second problem.
+# One file per ENTRY: <date>_<user>[_<session>]+<HHMMSS>-<host>-<pid>-<random>.md. The part
+# before `+` is what readers match on (notify_slack.py counts a user's entries, record_run.py
+# finds a session's); `+` can never occur in it, because clean() maps it to `_`. Each file is
+# written under a dot-name and renamed into place, so a reader never sees half an entry.
+# Appending to one shared file per day lost entries: check-then-create raced (68 of 120 lost
+# with 3 writers, release review 2.8.0), and a cross-node `>>` on /quobyte is unlocked --
+# flock does not lock across HIVE nodes there (measured 2026-09-24: 578 of 800 writes lost).
+#
+# Never put secrets in a report: private keys, passwords, tokens, webhooks, API keys. The
+# script refuses text that looks like one rather than shipping it to a shared folder.
+# =============================================================================
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ISSUES_DIR="${SKILL_ISSUES_DIR:-/quobyte/proteomics-grp/skill_issues}"
+LOCAL_DIR="${SKILL_ISSUES_LOCAL_DIR:-$HOME/.proteomics-pipeline/issues}"
+HIVE_EXEC="${HIVE_EXEC:-$HERE/hive_exec.sh}"
+CFG="${HIVE_ENV_FILE:-$HOME/.config/ucdavis-proteomics/hive.env}"
+if [ -z "${HIVE_USER:-}" ] && [ -f "$CFG" ]; then . "$CFG"; fi
+
+die() { echo "report_issue.sh: $*" >&2; exit 2; }
+TITLE="" WHAT="" IMPACT="" WORKAROUND="" FIX="" KIND="bug" SEV="medium" STEP="" MODE="" SESSION=""
+TITLE_F="" WHAT_F="" IMPACT_F="" WORKAROUND_F="" FIX_F=""
+ACTION="record" LIST_N=20
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title) TITLE="${2:-}"; shift 2 ;;
+    --what) WHAT="${2:-}"; shift 2 ;;
+    --impact) IMPACT="${2:-}"; shift 2 ;;
+    --workaround) WORKAROUND="${2:-}"; shift 2 ;;
+    --fix) FIX="${2:-}"; shift 2 ;;
+    --title-file) TITLE_F="${2:-}"; shift 2 ;;
+    --what-file) WHAT_F="${2:-}"; shift 2 ;;
+    --impact-file) IMPACT_F="${2:-}"; shift 2 ;;
+    --workaround-file) WORKAROUND_F="${2:-}"; shift 2 ;;
+    --fix-file) FIX_F="${2:-}"; shift 2 ;;
+    --kind) KIND="${2:-}"; shift 2 ;;
+    --severity) SEV="${2:-}"; shift 2 ;;
+    --step) STEP="${2:-}"; shift 2 ;;
+    --mode) MODE="${2:-}"; shift 2 ;;
+    --session) SESSION="${2:-}"; shift 2 ;;
+    --where) ACTION="where"; shift ;;
+    --list) ACTION="list"; case "${2:-}" in ''|-*) shift ;; *) LIST_N="$2"; shift 2 ;; esac ;;
+    -h|--help) sed -n '2,/^# =====/p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+done
+case "$KIND" in bug|docs|missing|agent_mistake) ;; *) die "--kind must be bug, docs, missing or agent_mistake" ;; esac
+case "$SEV" in high|medium|low) ;; *) die "--severity must be high, medium or low" ;; esac
+
+# Which transport reaches the shared folder from here: "direct", "ssh", or "local".
+on_hive_with_folder() { [ -d "$ISSUES_DIR" ] && [ -w "$ISSUES_DIR" ]; }
+have_hive_login() { [ -n "${HIVE_USER:-}" ] && [ -n "${HIVE_KEY:-}" ] && [ -f "$HIVE_EXEC" ]; }
+route() {
+  if on_hive_with_folder; then echo direct
+  elif [ -d "$(dirname "$ISSUES_DIR")" ]; then echo local   # on HIVE, but not in the Core group
+  elif have_hive_login; then echo ssh
+  else echo local; fi
+}
+
+if [ "$ACTION" = "where" ]; then
+  case "$(route)" in
+    direct) echo "direct: $ISSUES_DIR" ;;
+    ssh)    echo "ssh: $HIVE_USER@hive:$ISSUES_DIR (via hive_exec.sh)" ;;
+    local)  echo "local: $LOCAL_DIR (send the file to the Core -- see the note it prints)" ;;
+  esac
+  exit 0
+fi
+if [ "$ACTION" = "list" ]; then
+  case "$LIST_N" in *[!0-9]*|'') die "--list takes a number" ;; esac
+  cmd="ls -1t '$ISSUES_DIR'/*.md 2>/dev/null | grep -v '/README.md\$' | head -n $LIST_N"
+  case "$(route)" in
+    direct) bash -c "$cmd" ;;
+    ssh)    bash "$HIVE_EXEC" "$cmd" ;;
+    local)  ls -1t "$LOCAL_DIR"/*.md 2>/dev/null | head -n "$LIST_N" ;;
+  esac
+  exit 0
+fi
+
+# The text fields given as files (--<field>-file F, or - for standard input): see the header
+TEXT_MAX=65536
+n_stdin=0
+for f in "$TITLE_F" "$WHAT_F" "$IMPACT_F" "$WORKAROUND_F" "$FIX_F"; do
+  if [ "$f" = "-" ]; then n_stdin=$((n_stdin + 1)); fi
+done
+[ "$n_stdin" -le 1 ] || die "only one --...-file can be - (standard input); put the others in files"
+text_from() {   # text_from VAR <option> <given on the command line> <file, or ->
+  local t
+  [ -n "$4" ] || return 0
+  [ -z "$3" ] || die "give ${2%-file} or $2, not both"
+  if [ "$4" = "-" ]; then t="$(head -c $((TEXT_MAX + 1)))" || die "$2 -: could not read standard input"
+  else
+    { [ -f "$4" ] && [ -r "$4" ]; } || die "$2 $4: not a readable file"
+    t="$(head -c $((TEXT_MAX + 1)) < "$4")" || die "$2 $4: could not be read"
+  fi
+  if [ "$(printf '%s' "$t" | wc -c | tr -d '[:space:]')" -gt "$TEXT_MAX" ]; then
+    t="$(printf '%s' "$t" | head -c "$TEXT_MAX") [... cut at 64 KiB]"
+  fi
+  printf -v "$1" '%s' "$t"
+}
+text_from TITLE --title-file "$TITLE" "$TITLE_F"
+text_from WHAT --what-file "$WHAT" "$WHAT_F"
+text_from IMPACT --impact-file "$IMPACT" "$IMPACT_F"
+text_from WORKAROUND --workaround-file "$WORKAROUND" "$WORKAROUND_F"
+text_from FIX --fix-file "$FIX" "$FIX_F"
+
+[ -n "$TITLE" ] && [ -n "$WHAT" ] || die "--title (or --title-file) and --what (or --what-file) are required"
+[ -n "$IMPACT" ] || IMPACT="(not stated)"
+
+# Secret-shaped text: the ERE mirror of notify_slack._SECRET_PATTERNS, the skill's one list.
+# This script must run with no Python (Git Bash on Windows), so it cannot import that list;
+# tests/test_secret_patterns.py runs every fake example of it through both and fails when they
+# disagree. It used to carry its own shorter list, which let Slack webhooks, xox tokens and
+# Google API keys through (release review, 2.8.0). One pattern per line: CS case-sensitive,
+# CI case-insensitive. \b and lookbehinds are spelled out as "(^|[^A-Za-z0-9_])" prefixes.
+read -r -d '' SECRET_CS <<'ERE'
+-----BEGIN [A-Z ]*PRIVATE KEY
+gh[pousr]_[A-Za-z0-9]{20,}
+github_pat_[A-Za-z0-9_]+
+hf_[A-Za-z0-9]{20,}
+AIza[0-9A-Za-z_-]{20,}
+(^|[^A-Za-z0-9_])AQ\.[0-9A-Za-z_-]{20,}
+xox[abeprs]-[A-Za-z0-9-]{10,}
+sk-ant-[A-Za-z0-9_-]{20,}
+sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}
+(^|[^A-Za-z0-9_])sk-[A-Za-z0-9]{32,}
+(^|[^A-Za-z0-9_])(AKIA|ASIA)[0-9A-Z]{16}([^A-Za-z0-9_]|$)
+(^|[^A-Za-z0-9_])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*
+(^|[^A-Za-z0-9_.])COREOMICS_TOKEN['"]?[[:space:]]*[:=][[:space:]]*['"]?[^/~.$<[:space:]"'<>][^[:space:]"'<>]{7,}
+ERE
+read -r -d '' SECRET_CI <<'ERE'
+authorization:[[:space:]]*(token|bearer)[[:space:]]+[^[:space:]]+
+password[[:space:]]*[:=][[:space:]]*[^[:space:]]+
+postgres(ql)?://[^[:space:]:/@]+:[^[:space:]@]+@
+https?://hooks\.slack\.com/services/[^[:space:]]+
+key=[A-Za-z0-9_.-]{20,}
+(^|[^A-Za-z0-9_])token=[^/~.$[:space:]&"'<>][^[:space:]&"'<>]{7,}
+--share-token[[:space:]=]+['"]?[^/~.$[:space:]"'<>-][^[:space:]"'<>]{7,}
+share_token=['"]?[^/~.$[:space:]"'<>][^[:space:]"'<>]{7,}
+--cookie[[:space:]=]+['"]?[^/~.$[:space:]"'<>-][^[:space:]"'<>]{7,}
+(^|[^A-Za-z0-9_])bearer[[:space:]]+[A-Za-z0-9_.=+/-]{20,}
+authorization['"][[:space:]]*:[[:space:]]*['"](token|bearer)[[:space:]]+[^<{[:space:]'"][^[:space:]'"]*
+ERE
+looks_secret() {
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] && printf '%s\n' "$1" | grep -Eq -- "$p" && return 0
+  done <<EOF
+$SECRET_CS
+EOF
+  while IFS= read -r p; do
+    [ -n "$p" ] && printf '%s\n' "$1" | grep -Eiq -- "$p" && return 0
+  done <<EOF
+$SECRET_CI
+EOF
+  return 1
+}
+# Secrets must never reach a folder 46 people can read. Refuse rather than redact: a
+# redacted report can still be wrong about what it hid, and the agent can rephrase.
+# Every free-text field that reaches the file -- --mode too (release verification, 2.8.0).
+ALL="$TITLE $WHAT $IMPACT $WORKAROUND $FIX $STEP $SESSION $MODE"
+if looks_secret "$ALL"; then
+  die "the text looks like it contains a key, token, password or webhook -- remove it and re-run"
+fi
+
+# ---- context captured automatically, so the agent never has to remember it ----------
+# The skill version: skill_version.sh, the bash mirror of skill_version.py (the one reader of
+# plugin.json) -- on Windows `python3` is often the Microsoft Store stub. Without its sibling
+# (a script copied up alone) the entry is still written, and says why the version is missing.
+VER="" VER_SHOWN=""
+if . "$HERE/skill_version.sh" 2>/dev/null; then
+  VER="$(skill_version "$HERE")"; VER_SHOWN="$(skill_label "$VER")"
+fi
+if [ -z "$VER" ]; then VER="(unknown -- skill_version.sh not found beside report_issue.sh)"; VER_SHOWN="$VER"; fi
+LOCAL_USER="$(id -un 2>/dev/null || echo "${USERNAME:-${USER:-unknown}}")"
+WHO="${HIVE_USER:-$LOCAL_USER}"
+OS="$(uname -sr 2>/dev/null || echo unknown)"
+DAY="$(date +%Y-%m-%d)"
+NOW="$(date '+%Y-%m-%d %H:%M %Z')"
+# Filenames: letters, digits, dot, dash, underscore only -- the name travels through a
+# remote shell and lands in a shared folder.
+clean() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-40; }
+NAME="${DAY}_$(clean "$WHO")"
+[ -n "$SESSION" ] && NAME="${NAME}_$(clean "$SESSION")"
+HOST="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo host)"
+FILE="${NAME}+$(date +%H%M%S)-$(clean "${HOST%%.*}")-$$-${RANDOM}${RANDOM}.md"
+if [ -z "$MODE" ]; then
+  case "$(route)" in direct) MODE="hive_local" ;; ssh) MODE="hive_remote" ;; *) MODE="local" ;; esac
+fi
+
+# A field read from a file can hold several lines: they stay under their bullet (the title,
+# a heading, on one line)
+nl=$'\n'
+for v in TITLE WHAT IMPACT WORKAROUND FIX; do
+  t="${!v}"; t="${t//$'\r'/}"
+  if [ "$v" = TITLE ]; then t="${t//$nl/ }"; else t="${t//$nl/$nl  }"; fi
+  printf -v "$v" '%s' "$t"
+done
+ENTRY="$(mktemp "${TMPDIR:-/tmp}/report_issue.XXXXXX")" || die "cannot create a temp file"
+trap 'rm -f "$ENTRY"' EXIT
+{
+  printf '# Skill issue -- %s -- %s%s\n\n' "$WHO" "$DAY" "${SESSION:+ -- $SESSION}"
+  printf -- '- **Skill version:** %s\n- **Mode:** %s\n- **OS:** %s\n- **Local user:** %s\n' \
+         "$VER" "$MODE" "$OS" "$LOCAL_USER"
+  printf -- '- **HIVE user:** %s\n' "${HIVE_USER:-(none)}"
+  printf '\n## %s  [%s, %s]\n\n' "$TITLE" "$KIND" "$SEV"
+  printf -- '- **When:** %s%s\n' "$NOW" "${STEP:+ -- step $STEP}"
+  printf -- '- **Skill:** %s, mode %s\n' "$VER_SHOWN" "$MODE"
+  printf -- '- **What happened:** %s\n' "$WHAT"
+  printf -- '- **Impact:** %s\n' "$IMPACT"
+  # `if`, not `[ ] &&`: a block's status is its last command's, and a false test there
+  # made every entry without --fix look like a failed write.
+  if [ -n "$WORKAROUND" ]; then printf -- '- **Workaround used:** %s\n' "$WORKAROUND"; fi
+  if [ -n "$FIX" ]; then printf -- '- **Proposed fix:** %s\n' "$FIX"; fi
+} > "$ENTRY" || die "cannot write $ENTRY"
+
+# The same write runs on either side of the SSH hop: the entry goes to a dot-name no reader
+# matches (*.md skips it), then is renamed -- one step, so a reader sees all of it or none.
+WRITE='t="$1/.$2.part"; if cat > "$t" && mv -f "$t" "$1/$2"; then exit 0; fi; rm -f "$t"; exit 1'
+
+deliver_local() {
+  mkdir -p "$LOCAL_DIR" 2>/dev/null || { echo "report_issue.sh: cannot create $LOCAL_DIR" >&2; return 1; }
+  bash -c "$WRITE" _ "$LOCAL_DIR" "$FILE" < "$ENTRY" || return 1
+  echo "recorded locally: $LOCAL_DIR/$FILE"
+  echo "  This machine cannot reach the Core's shared issue folder. Please send that file to the"
+  echo "  UC Davis Proteomics Core, or open an issue at https://github.com/bsphinney/UCD-Proteomics-AI-Skill/issues"
+}
+
+case "$(route)" in
+  direct)
+    if bash -c "$WRITE" _ "$ISSUES_DIR" "$FILE" < "$ENTRY"; then
+      chmod g+r "$ISSUES_DIR/$FILE" 2>/dev/null
+      echo "recorded: $ISSUES_DIR/$FILE"
+    else deliver_local; fi ;;
+  ssh)
+    # printf %q quoting: the path crosses a remote shell (hive_exec.sh runs `bash -l -c`).
+    remote="set -e; [ -d $(printf '%q' "$ISSUES_DIR") ] && [ -w $(printf '%q' "$ISSUES_DIR") ] || exit 7; bash -c $(printf '%q' "$WRITE") _ $(printf '%q' "$ISSUES_DIR") $(printf '%q' "$FILE"); chmod g+r $(printf '%q' "$ISSUES_DIR/$FILE") 2>/dev/null || true"
+    if bash "$HIVE_EXEC" "$remote" < "$ENTRY"; then
+      echo "recorded: $HIVE_USER@hive:$ISSUES_DIR/$FILE"
+    else
+      echo "report_issue.sh: could not write to HIVE ($ISSUES_DIR not writable, or SSH failed); keeping it locally" >&2
+      deliver_local
+    fi ;;
+  local) deliver_local ;;
+esac
+exit 0

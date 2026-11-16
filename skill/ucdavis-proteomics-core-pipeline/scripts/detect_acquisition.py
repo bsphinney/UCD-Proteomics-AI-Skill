@@ -1,0 +1,1982 @@
+#!/usr/bin/env python3
+"""
+detect_acquisition.py  --  Decide DDA vs DIA for each input file, so the
+pipeline can auto-route to the right engine (engine_choice.ROUTES, the one table: DIA ->
+DIA-NN; timsTOF DDA-PASEF -> FragPipe, else Sage; other DDA -> Sage, FragPipe on request).
+
+Detection per format (best-effort, with a confidence score):
+  Bruker .d   read analysis.tdf (SQLite). Presence of a DiaFrameMsMsInfo /
+              DiaFrameMsMsWindowGroups table, or Frames.MsMsType == 9,
+              => dia-PASEF. PasefFrameMsMsInfo / MsMsType == 8 => ddaPASEF.
+              (Mirrors DE-LIMP's helpers_instrument.R logic.)
+  mzML(.gz)   stream isolation windows of MS2 scans. Wide windows (median
+              >= 3 Da) over a small repeating set of centers => DIA; narrow
+              windows (<= 2 Da) with many distinct centers => DDA.
+  Thermo .raw not natively readable here; read through ThermoRawFileParser
+              (https://github.com/compomics/ThermoRawFileParser/releases, v1.4.0+).
+              Metadata JSON -> instrument model, scan counts and the creation date
+              (`acquired_at`, see acq_time.py); a `query` of a
+              mid-run slice of scans -> isolation windows + the filter string's
+              data-dependent flag -> DIA/DDA and the acquired bounds. Parser missing
+              or failing => 'unknown'/low, a stated reason, and a stderr WARNING.
+              The parser is $THERMORAWFILEPARSER, else found on PATH, in the pipeline's
+              conda env, or at a shared copy ($THERMORAWFILEPARSER_SHARED, by default the
+              UC Davis Core's). A framework-dependent build gets a DOTNET_ROOT that has
+              every framework its runtimeconfig lists; with none, nothing is read and the
+              reason (with the fix) is printed ONCE, up front.
+              The Orbitrap MS1/MS2 resolution is read from the scan trailer by
+              thermo_resolution.py (Thermo's RawFileReader DLLs, via pythonnet, in a
+              subprocess); top-level ms1_resolution/ms2_resolution when every Orbitrap
+              file agrees, `resolution_mixed` when they do not, and
+              `orbitrap_resolution_unknown` for files it could not read -- ask the user
+              for those.
+
+  The precursor m/z range (`precursor_mz_range`, with `precursor_mz_range_source` saying which)
+  is the isolation windows' span for DIA, and the MS1 SURVEY scan range for DDA -- a DDA run
+  picks its precursors from its survey scans: the Thermo scan filter's "Full ms [lo-hi]", the
+  mzML MS1 scan window, a timsTOF .d's GlobalMetadata MzAcqRange. It used to be null for DDA,
+  and a DIA-NN DDA search then ran on a 380-980 fallback (SET28: survey 350-1500).
+
+  A Thermo DIA run's `isolation_windows` (2.15, staggered_windows) says whether its windows are
+  staggered -- overlapping by about half a window from one cycle to the next -- which Skyline
+  demultiplexes; the peak check sizes its import jobs by it (skyline_peaks.demultiplexing).
+
+Every Bruker .d is also checked for a truncated or at-risk analysis.tdf
+(bruker_tdf.tdf_integrity): WAL-mode header, a non-empty -wal/-journal beside it,
+or a frame index that ends short of analysis.tdf_bin. Anything but `ok` becomes a
+line in that file's `warnings` and sets `needs_confirmation`.
+
+Output: JSON to stdout. The orchestrator MUST confirm with the user whenever
+confidence != "high" or any file has `warnings` (a Thermo .raw the parser could not read,
+a Bruker analysis.tdf that is not `ok`), before launching a multi-hour search. Each file's
+`warnings` and per-.raw progress also go to stderr.
+
+On a cluster login node (sbatch on PATH, SLURM_JOB_ID unset) more than LOGIN_NODE_MAX_RAW
+Thermo .raw files are refused before any is read: run it under srun, or pass
+--allow-login-node.
+
+Usage: python3 detect_acquisition.py [--allow-login-node] FILE [FILE ...]
+       THERMORAWFILEPARSER="dotnet /opt/trfp/ThermoRawFileParser.dll" \
+       python3 detect_acquisition.py run.raw        # parser not on PATH as one executable
+       python3 detect_acquisition.py --check-reader # setup.sh: which parser, does it start
+                                                    # (JSON; exit 0 = ready, 1 = not)
+"""
+import sys, os, json, glob, gzip, math, re, sqlite3, statistics, shutil, subprocess, shlex, tempfile, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Every analysis.tdf is opened through bruker_tdf.connect_tdf (read-only AND immutable):
+# a read-write open truncates a tdf with a stale -wal beside it (the state of 342 tdfs on
+# HIVE), and mode=ro alone reads through the stale -wal.
+from bruker_tdf import connect_tdf, tdf_integrity, integrity_warning  # noqa: E402
+# The Orbitrap keyword list lives there, once (DE-LIMP rule 3): see add_resolutions().
+from estimate_params import classify_instrument, DIANN_INSTRUMENT_PPM  # noqa: E402
+# What a precursor m/z range is, by acquisition -- the one vocabulary (DE-LIMP rule 3).
+from estimate_params import PR_MZ_RANGE_BASIS  # noqa: E402
+# A timsTOF run's MS1 acquisition range: the one reader of it, shared with the Methods text.
+from bruker_method import ms1_acq_range  # noqa: E402
+# The resolution reader runs as a subprocess; only its words are shared.
+from thermo_resolution import PYTHONNET_MISSING  # noqa: E402
+# When each run was acquired, and which time zone that is: the one reader (qc_bracket.py's too).
+import acq_time  # noqa: E402
+import faims  # noqa: E402
+# The name a run whose file name holds '--' is searched under: the one rule (run_search.py too).
+from check_report_runs import RENAME_DASHED_FLAG, dashed_file_names  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Instrument extraction (PLAN.md §7d) — mirrors DE-LIMP R/helpers_instrument.R.
+# resolve_defaults.py classifies the instrument (estimate_params.classify_instrument); null is
+# allowed and falls back to automatic calibration (the user confirms). Best-effort, never fatal.
+# ---------------------------------------------------------------------------
+def instrument_bruker_d(path):
+    tdf = os.path.join(path, "analysis.tdf")
+    if not os.path.exists(tdf):
+        return None
+    try:
+        con = connect_tdf(tdf)
+        cur = con.cursor()
+        # GlobalMetadata is a key/value table; InstrumentName holds e.g. "timsTOF Pro"
+        rows = dict(cur.execute("SELECT Key, Value FROM GlobalMetadata"))
+        con.close()
+        for k in ("InstrumentName", "InstrumentSourceType", "Instrument"):
+            if rows.get(k):
+                return rows[k]
+    except sqlite3.Error:
+        return None
+    return None
+
+def instrument_thermo_raw(path):
+    """Instrument model of a Thermo .raw, e.g. "Orbitrap Exploris 480", or None."""
+    meta, _err = trfp_metadata(path)
+    return _cv(meta, "InstrumentProperties", CV_MODEL) if meta else None
+
+def detect_instrument(path):
+    low = path.lower().rstrip("/")
+    if low.endswith(".d"):
+        return instrument_bruker_d(path)
+    if low.endswith(".raw") and not os.path.isdir(path):     # a .raw FOLDER is Waters
+        return instrument_thermo_raw(path)
+    return None
+
+def _dda_pasef_range(cur, tables):
+    """A ddaPASEF run's precursor m/z range: the MS1 acquisition range timsControl recorded
+    (GlobalMetadata MzAcqRangeLower/Upper, read by bruker_method.ms1_acq_range), or None."""
+    if "GlobalMetadata" not in tables:
+        return None
+    try:
+        return ms1_acq_range(dict(cur.execute("SELECT Key, Value FROM GlobalMetadata")))
+    except sqlite3.Error:
+        return None
+
+
+DDA_PASEF_RANGE_WHY = ("; precursor m/z range = the MS1 acquisition range "
+                       "(GlobalMetadata MzAcqRange)")
+
+
+def _has_rows(cur, table):
+    try:
+        return cur.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _dia_pasef_range(cur, tables):
+    """A dia-PASEF run's ACQUIRED precursor m/z range, from its isolation windows, or None.
+
+    The windows live in DiaFrameMsMsWindows (IsolationMz, IsolationWidth);
+    DiaFrameMsMsWindowGroups holds only an Id -- schema verified against a real analysis.tdf on
+    2026-08-17. Without this the caller falls back to a hardcoded 380-980, which on a
+    299.5-1200.5 dia-PASEF method silently discards both tails."""
+    if "DiaFrameMsMsWindows" not in tables:
+        return None
+    try:
+        lo, hi = cur.execute("SELECT MIN(IsolationMz - IsolationWidth/2.0), "
+                             "       MAX(IsolationMz + IsolationWidth/2.0) "
+                             "FROM DiaFrameMsMsWindows").fetchone()
+    except sqlite3.Error:
+        return None
+    return (float(lo), float(hi)) if lo is not None and hi is not None and hi > lo else None
+
+
+def detect_bruker_d(path):
+    """DIA vs DDA from what the run ACQUIRED, never from which tables exist.
+
+    Two kinds of evidence, both per FRAME: Frames.MsMsType (9 dia-PASEF, 8 ddaPASEF) and the
+    frame-level method table that has ROWS (DiaFrameMsMsInfo maps each dia-PASEF frame to its
+    window group; PasefFrameMsMsInfo lists each ddaPASEF precursor). Read on HIVE, 2026-09-29,
+    PI_Example/SET1-28 (timsTOF HT), immutable open:
+        ddaPASEF 09292026__30SPD_DDANS27  MsMsType {0: 4115, 8: 24686}; PasefFrameMsMsInfo
+                                          327,207 rows; DiaFrameMsMsInfo / -Windows /
+                                          -WindowGroups PRESENT with 0 rows
+        dia-PASEF 09112026__60SPD_DIA-NS10 MsMsType {0: 1146, 9: 12598}; DiaFrameMsMsInfo
+                                          12,598 rows, 36 windows; no Pasef tables
+    The detector used to key on the dia-PASEF tables EXISTING, so the first came back "DIA,
+    high confidence" (a Core member, 2026-09-29) -- a DDA run headed for a library-free DIA search
+    with nothing asking the user.
+
+    Evidence that disagrees -- frames of both types, or typed frames with the OTHER kind's
+    frame table populated -- is not guessed: `unknown`/low, which sets needs_confirmation. With
+    no typed frames at all, the tables' rows decide (DiaFrameMsMsWindows counts there too)."""
+    tdf = os.path.join(path, "analysis.tdf")
+    if not os.path.exists(tdf):
+        return ("unknown", "low", "no analysis.tdf in .d folder", None)
+    con = None
+    try:
+        con = connect_tdf(tdf)
+        cur = con.cursor()
+        tables = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        try:
+            types = (dict(cur.execute("SELECT MsMsType, COUNT(*) FROM Frames GROUP BY MsMsType"))
+                     if "Frames" in tables else {})
+        except sqlite3.Error:
+            types = {}
+        rows = {t: t in tables and _has_rows(cur, t)
+                for t in ("DiaFrameMsMsInfo", "DiaFrameMsMsWindows", "PasefFrameMsMsInfo")}
+        n_dia, n_dda = types.get(9, 0), types.get(8, 0)
+        dia_frames_table, dda_frames_table = rows["DiaFrameMsMsInfo"], rows["PasefFrameMsMsInfo"]
+        conflict = []
+        if n_dia and n_dda:
+            conflict.append(f"{n_dia} frames with Frames.MsMsType==9 (dia-PASEF) and {n_dda} "
+                            "with 8 (ddaPASEF)")
+        elif n_dia and dda_frames_table:
+            conflict.append(f"{n_dia} dia-PASEF frames (MsMsType==9), but PasefFrameMsMsInfo "
+                            "has rows (ddaPASEF precursors)")
+        elif n_dda and dia_frames_table:
+            conflict.append(f"{n_dda} ddaPASEF frames (MsMsType==8), but DiaFrameMsMsInfo has "
+                            "rows (dia-PASEF frames)")
+        elif not (n_dia or n_dda) and (dia_frames_table or rows["DiaFrameMsMsWindows"]) \
+                and dda_frames_table:
+            conflict.append("no frame is typed, and both the dia-PASEF and the ddaPASEF tables "
+                            "have rows")
+        if conflict:
+            return ("unknown", "low", "the run's DIA/DDA evidence disagrees: " + conflict[0]
+                    + " -- confirm the acquisition method with the user", None)
+        if n_dia:
+            return ("DIA", "high", f"{n_dia} dia-PASEF frames (Frames.MsMsType==9)",
+                    _dia_pasef_range(cur, tables))
+        if n_dda:
+            rng = _dda_pasef_range(cur, tables)
+            return ("DDA", "high" if dda_frames_table else "medium",
+                    f"{n_dda} ddaPASEF frames (Frames.MsMsType==8)"
+                    + ("; PasefFrameMsMsInfo has rows" if dda_frames_table else "")
+                    + (DDA_PASEF_RANGE_WHY if rng else ""), rng)
+        # No typed frames (a Frames table without MsMsType, or none): the tables, by rows.
+        dia_rows = [t for t in ("DiaFrameMsMsInfo", "DiaFrameMsMsWindows") if rows[t]]
+        if dia_rows:
+            return ("DIA", "high", f"dia-PASEF window tables have rows ({', '.join(dia_rows)})",
+                    _dia_pasef_range(cur, tables))
+        if dda_frames_table:
+            rng = _dda_pasef_range(cur, tables)
+            return ("DDA", "high", "PasefFrameMsMsInfo has rows (ddaPASEF)"
+                    + (DDA_PASEF_RANGE_WHY if rng else ""), rng)
+        return ("unknown", "low", "no DIA/DDA markers in tdf (no typed frames, and no method "
+                "table has rows)", None)
+    except sqlite3.Error as e:
+        return ("unknown", "low", f"tdf read error: {e}", None)
+    finally:
+        try: con.close()
+        except Exception: pass
+
+# What an mzML carries about the instrument (verified on 14 public Thermo mzML written by
+# msconvert, 2026-11-11: Orbitrap Fusion / Eclipse / Exploris 480, Q Exactive / Plus / HF, and
+# two SCIEX TripleTOF files): the model is a cvParam of the referenceableParamGroup (or
+# instrumentConfiguration) -- e.g. accession MS:1002634 name "Q Exactive Plus" -- beside the
+# serial number (MS:1000529); the MS2 analyser is the first word of each MS2 scan's
+# "filter string" (MS:1000512), "FTMS + c NSI d Full ms2 403.8@hcd30.00 [120-1257]" or "ITMS + ...".
+MZML_NOT_MODEL = {"MS:1000529"}                  # instrument serial number
+MZML_FILTER_STRING = "MS:1000512"
+MZML_ANALYZER_WORDS = {"FTMS", "ITMS"}           # Thermo's own scan-filter analyser words
+
+
+def mzml_instrument(path):
+    """The instrument model an mzML names in its header (the first cvParam of its
+    referenceableParamGroup / instrumentConfiguration that is not the serial number), or None.
+    Stops at the first spectrum: only the header is read."""
+    import xml.etree.ElementTree as ET
+    opn = gzip.open if path.endswith(".gz") else open
+    try:
+        with opn(path, "rb") as fh:
+            stack = []
+            for ev, el in ET.iterparse(fh, events=("start", "end")):
+                tag = el.tag.rsplit("}", 1)[-1]
+                if ev == "start":
+                    if tag in ("spectrumList", "chromatogramList"):
+                        return None
+                    stack.append(tag)
+                    continue
+                stack.pop()
+                if tag == "cvParam" and stack and stack[-1] in (
+                        "referenceableParamGroup", "instrumentConfiguration"):
+                    acc, name = el.get("accession") or "", (el.get("name") or "").strip()
+                    if acc.startswith("MS:") and acc not in MZML_NOT_MODEL and name \
+                            and "serial" not in name.lower():
+                        return name
+                if tag == "instrumentConfigurationList":
+                    return None
+    except Exception:
+        return None
+    return None
+
+
+def mzml_ms2_analyzer(words):
+    """The MS2 analyser of a run from the scan-filter words of its MS2 scans: "FTMS" (Orbitrap),
+    "ITMS" (ion trap) or "mixed" (both) -- detect_acquisition's own values for a Thermo .raw --
+    else None (no MS2 scan carried a filter string we know)."""
+    got = {w for w in words if w in MZML_ANALYZER_WORDS}
+    if not got:
+        return None
+    return "mixed" if len(got) > 1 else got.pop()
+
+
+def _iter_mzml(path, cap=3000, analyzers=None):
+    """Yield (ms_level, iso_target, iso_width, lo, hi) for spectra, streaming.
+
+    For an MS2, lo/hi are the ACQUIRED isolation bounds (target -/+ the CV offsets). They are
+    what a DIA precursor m/z search range should be derived from; previously only the width
+    was kept and the bounds were discarded.
+
+    For an MS1 (the survey scan), lo/hi are its scan window -- MS:1000501 "scan window lower
+    limit" / MS:1000500 "scan window upper limit", as msconvert writes them (350 / 1500 on a
+    Thermo DDA mzML, read 2026-09-29) -- yielded as (1, None, None, lo, hi), and only when both
+    are there. A DDA run's precursors are picked from these scans. `cap` counts MS2 spectra.
+    Every value is reset where a spectrum STARTS, so nothing outside one leaks into it.
+    `analyzers`, a set, collects the first word of each MS2 scan's filter string (MS:1000512)."""
+    import xml.etree.ElementTree as ET
+    opn = gzip.open if path.endswith(".gz") else open
+    ms_level = iso_target = lower = upper = win_lo = win_hi = None
+    filt = None
+    n = 0
+    with opn(path, "rb") as fh:
+        for ev, el in ET.iterparse(fh, events=("start", "end")):
+            tag = el.tag.rsplit("}", 1)[-1]
+            if ev == "start":
+                if tag == "spectrum":
+                    ms_level = iso_target = lower = upper = win_lo = win_hi = filt = None
+                continue
+            if tag == "cvParam":
+                acc = el.get("accession"); val = el.get("value")
+                if acc == MZML_FILTER_STRING and val: filt = val
+                if acc == "MS:1000511": ms_level = int(float(val))
+                elif acc == "MS:1000827" and val: iso_target = float(val)
+                elif acc == "MS:1000828" and val: lower = float(val)
+                elif acc == "MS:1000829" and val: upper = float(val)
+                # several scan windows: the span of all of them
+                elif acc == "MS:1000501" and val:
+                    win_lo = float(val) if win_lo is None else min(win_lo, float(val))
+                elif acc == "MS:1000500" and val:
+                    win_hi = float(val) if win_hi is None else max(win_hi, float(val))
+            elif tag == "spectrum":
+                if ms_level == 2 and analyzers is not None and filt:
+                    analyzers.add(filt.split(None, 1)[0].upper())
+                if ms_level == 2:
+                    w = (lower or 0) + (upper or 0)
+                    lo = hi = None
+                    if iso_target is not None:
+                        lo = iso_target - (lower or 0)
+                        hi = iso_target + (upper or 0)
+                    yield (2, iso_target, w if w else None, lo, hi)
+                    n += 1
+                elif ms_level == 1 and win_lo is not None and win_hi is not None \
+                        and win_hi > win_lo:
+                    yield (1, None, None, win_lo, win_hi)
+                ms_level = iso_target = lower = upper = win_lo = win_hi = None
+                el.clear()
+                if n >= cap: break
+
+def _cap_medium(conf):
+    """`high` is a claim about the READ as well as the verdict: downgrade it."""
+    return "medium" if conf == "high" else conf
+
+
+# A DIA method's MS2 windows, whatever their width (S2, T41): ONE fixed set that tiles the
+# precursor range, each window acquired again every cycle at exactly the same edges. A DDA run
+# isolates each precursor at its own measured m/z, so its windows do not recur at the same edges
+# (a precursor re-selected after its exclusion ends comes back a few ppm off); a PRM list recurs
+# but does not tile. The width rule alone called 2 m/z DIA (Orbitrap Astral, 300 windows over
+# 380-980) DDA, and 3-4 m/z DIA with more than 80 windows (Astral 4 m/z over 380-980: 150)
+# "unknown". TILED_SHARE: the share of windows that must recur, and of neighbours that must abut
+# (a read cut off mid-cycle leaves the last few once).
+TILED_MIN_WINDOWS, TILED_SHARE = 5, 0.9
+TILED_WHY = "a tiled set of {n} windows, each acquired again every cycle at the same edges"
+
+# Staggered (overlapping) DIA windows: each window overlaps its neighbours by about half its width,
+# the scheme offset by half a window from one cycle to the next (8 m/z windows offset by 4 m/z).
+# Skyline reads such a scheme from the raw file as "Overlap Multiplexed" and demultiplexes it,
+# which made one Thermo import about 26 times slower in the 2.15 peak-check test (1,658 s against
+# 63 s): the peak check sizes its import jobs by it (skyline_peaks.job_minutes). A tiled scheme's
+# windows abut or share a margin of a few percent of their width. STAGGER_SHARE: the median overlap
+# of neighbouring windows, as a share of the median width, above which they are staggered.
+STAGGER_SHARE = 0.25
+
+
+def staggered_windows(los, his):
+    """Whether the MS2 isolation windows (their ACQUIRED edges) overlap like a staggered scheme
+    -> {"staggered", "n_windows", "median_width", "median_overlap", "rule"}, or None when fewer
+    than TILED_MIN_WINDOWS distinct windows were read. The distinct windows are sorted by their
+    lower edge; a pair of neighbours overlaps by (upper edge of the first - lower edge of the
+    next), negative for a gap."""
+    edges = sorted({(round(lo, 3), round(hi, 3)) for lo, hi in zip(los, his) if hi > lo})
+    if len(edges) < TILED_MIN_WINDOWS:
+        return None
+    width = statistics.median(hi - lo for lo, hi in edges)
+    overlap = statistics.median(h0 - l1 for (_, h0), (l1, _) in zip(edges, edges[1:]))
+    return {"staggered": overlap > STAGGER_SHARE * width, "n_windows": len(edges),
+            "median_width": round(width, 3), "median_overlap": round(overlap, 3),
+            "rule": f"staggered when neighbouring windows overlap by more than "
+                    f"{STAGGER_SHARE:g} of the median width"}
+
+
+def tiled_window_set(los, his):
+    """The number of windows when the MS2 isolation windows (their ACQUIRED edges, in acquisition
+    order) are one fixed set that tiles the precursor range and repeats every cycle -- the DIA
+    shape, see TILED_WHY -- else None. Edges compared to 0.001 m/z; a window recurs a cycle later
+    (median gap >= half the set); neighbours abut when the next window starts no more than half a
+    median width after one ends (overlapping schemes start before)."""
+    import collections
+    edges = [(round(lo, 3), round(hi, 3)) for lo, hi in zip(los, his) if hi > lo]
+    seen = collections.Counter(edges)
+    k = len(seen)
+    if k < TILED_MIN_WINDOWS or len(edges) < 2 * k:
+        return None
+    if sum(1 for c in seen.values() if c >= 2) < TILED_SHARE * k:
+        return None
+    # ...once per CYCLE: a window comes back after the rest of the set (k scans, 2k for a staggered
+    # scheme), not straight after itself -- a DDA method that fragments each precursor twice (HCD
+    # then EThcD) repeats its edges in the next scan, and its dense windows abut as well
+    last, gaps = {}, []
+    for i, e in enumerate(edges):
+        if e in last:
+            gaps.append(i - last[e])
+        last[e] = i
+    if statistics.median(gaps) < k / 2:
+        return None
+    wins = sorted(seen)
+    half = statistics.median(hi - lo for lo, hi in wins) / 2
+    abut = sum(1 for (_, h0), (l1, _) in zip(wins, wins[1:]) if l1 - h0 <= half)
+    return k if abut >= TILED_SHARE * (k - 1) else None
+
+
+def classify_isolation_windows(widths, targets, los, his, flag_read=False):
+    """DIA vs DDA from MS2 isolation windows -> (kind, confidence, reason, range).
+
+    The one definition of the width/centre rule, shared by the mzML reader and the Thermo
+    .raw reader so the two formats cannot drift into classifying the same run differently.
+    `targets` are window centres, `los`/`his` the ACQUIRED window edges.
+
+    A width needs only the two offsets, while an EDGE PAIR also needs the window centre
+    (MS:1000827), so `los` can cover fewer windows than `widths`: a valid mzML whose upper
+    windows carry no isolation target, or a parser that answers with the first part of the
+    scans asked for. The range is then built from a SUBSET of the method and comes out
+    clipped -- 350.0-793.0 for an Exploris method that acquired 350.0-1201.0 -- and
+    estimate_params.py would emit that as `--max-pr-mz 793` tagged "measured from the
+    acquired isolation windows". A wrong number wearing the measured label is worse than the
+    FALLBACK tag it replaces, so a partial read never carries `high`, and the reason says how
+    much of the method it saw.
+
+    A tiled, repeated window set (tiled_window_set) is DIA past the 80-centre cap, and below
+    3 m/z too, where the width rule would call it DDA. Without the instrument's data-dependent
+    flag -- which this rule never sees; classify_thermo_windows reads it -- narrow (< 3 m/z)
+    and 3-4 m/z sets are "medium", >= 4 m/z "high" as before. `flag_read`: the caller reads that
+    flag and states it in the reason itself, so this rule does not say none was read (review F9).
+    """
+    if not widths:
+        return ("unknown", "low", "no MS2 isolation windows found", None)
+    targets = [round(t * 2) / 2 for t in targets]
+    med = statistics.median(widths)
+    distinct = len(set(targets))
+    n = len(widths)
+    rng = (min(los), max(his)) if los else None
+    partial = len(los) != n
+    gap = (f"; isolation window edges for only {len(los)} of {n} windows, so any range read "
+           f"from them may be clipped" if partial else "")
+    tiles = tiled_window_set(los, his)
+    shape = f"; {TILED_WHY.format(n=tiles)}" if tiles else ""
+    if med >= 3.0 and (distinct <= max(80, n // 50) or tiles):
+        conf = "high" if med >= 4 else "medium"
+        return ("DIA", _cap_medium(conf) if partial else conf,
+                f"median isolation width {med:.1f} Da over {distinct} distinct centers"
+                f"{shape}{gap}", rng)
+    if tiles:
+        return ("DIA", "medium",
+                f"median isolation width {med:.1f} Da{shape} -- narrow-window DIA by window "
+                f"shape" + ("" if flag_read else
+                            "; no data-dependent flag was read to confirm it") + gap, rng)
+    if med <= 2.0:
+        conf = "high" if distinct > n // 10 else "medium"
+        return ("DDA", _cap_medium(conf) if partial else conf,
+                f"median isolation width {med:.1f} Da, {distinct} distinct precursors{gap}",
+                None)
+    return ("unknown", "low",
+            f"ambiguous: median width {med:.1f} Da, {distinct} centers{gap}", None)
+
+def survey_scan_range(ranges, where):
+    """A DDA run's precursor m/z range from its MS1 survey scan ranges [(lo, hi)]: their span
+    (a run acquires one survey range; a method that alternates two is searched over both).
+    Returns (range or None, text for the reason). The one rule for all three formats."""
+    ranges = [r for r in ranges if r and r[1] > r[0]]
+    if not ranges:
+        return None, ""
+    rng = (min(r[0] for r in ranges), max(r[1] for r in ranges))
+    return rng, (f"; precursor m/z range = the MS1 survey scan range {rng[0]:g}-{rng[1]:g}, "
+                 f"from {where} of {len(ranges)} MS1 scan(s)")
+
+
+def detect_mzml(path, analyzers=None):
+    widths, targets, los, his, survey = [], [], [], [], []
+    try:
+        for lvl, tgt, w, lo, hi in _iter_mzml(path, analyzers=analyzers):
+            if lvl == 1:
+                survey.append((lo, hi))
+                continue
+            if w: widths.append(w)
+            if tgt is not None: targets.append(tgt)
+            if lo is not None and hi is not None and hi > lo:
+                los.append(lo); his.append(hi)
+    except Exception as e:
+        return ("unknown", "low", f"mzML parse error: {e}", None)
+    kind, conf, why, rng = classify_isolation_windows(widths, targets, los, his)
+    if kind == "DDA":
+        rng, how = survey_scan_range(survey, "the scan window (MS:1000501/MS:1000500)")
+        why += how
+    return kind, conf, why, rng
+
+
+# ---------------------------------------------------------------------------
+# Thermo .raw, read through ThermoRawFileParser (TRFP).
+#
+# Public source (golden rule 7): https://github.com/compomics/ThermoRawFileParser/releases
+# -- self-contained Linux/macOS/Windows builds, a .NET 8 framework-dependent DLL, and
+# `conda install -c bioconda thermorawfileparser`. Nothing here assumes HIVE.
+#
+# The command lines below are the only ones this parser accepts. The previous code called
+# `ThermoRawFileParser metadata -i <raw>` and `ThermoRawFileParser query -i <raw>`; on
+# TRFP 2.0.0.0 (measured on HIVE) both exit 255 -- "Unexpected extra arguments"
+# (there is no `metadata` subcommand) and "specify a valid scan range" (query needs -n).
+# The exit codes were ignored and the empty stdout grepped for "dia", so EVERY .raw came
+# back unknown / instrument null / range null and estimate_params.py searched 380-980 on
+# methods that acquired 350.0-1201.0 (Exploris 480) and 350.05-1200.95 (Fusion Lumos).
+#
+# Grammar read from MainClass.cs for every release v1.4.0 .. v.2.0.0-dev, and run for real on
+# 2.0.0.0 (the only build exercised on data -- 1.4.x needs Mono). The README states that
+# optional parameters "only work in the -option=value format", so every value is inlined.
+#   metadata:  -i=<raw> -m=0 -o=<dir>            -> <dir>/<stem>-metadata.json
+#              (-m alone writes no spectra: the indexed-mzML default applies only when
+#               neither -m nor -f is given. `-f=4` means the same but is documented only
+#               from 1.4.4, so it is left out rather than relied on.)
+#   spectra:   query -i=<raw> -n=<a>-<b> -b=<file>  -> JSON PROXI spectra with isolation
+#              target + lower/upper offsets and the filter string (see CV_FILTER_* below)
+# ---------------------------------------------------------------------------
+TRFP_RELEASES = "https://github.com/compomics/ThermoRawFileParser/releases"
+TRFP_ENV = "THERMORAWFILEPARSER"     # a full command, e.g. "dotnet /opt/trfp/ThermoRawFileParser.dll"
+TRFP_NAMES = ("ThermoRawFileParser", "thermorawfileparser")   # release binary / bioconda link
+# The last place looked: shared copies a site already keeps, as an os.pathsep list (empty =
+# none). A Core member, 2026-09-23 (15 Fusion Lumos .raw on HIVE): the Core has kept
+# TRFP 2.0.0.0 at the path below all along, but nothing looked there, so every file came back
+# "not found" -- acquisition unknown, and a search that would have run 380-980 on a method
+# that acquired 357-1105. Other sites set their own; the tests set it to mock the layout.
+# Never the only source: the not-found message names the public ones.
+TRFP_SHARED_ENV = "THERMORAWFILEPARSER_SHARED"
+TRFP_SHARED_DEFAULT = "/quobyte/proteomics-grp/tools/ThermoRawFileParser/ThermoRawFileParser"
+# setup.sh installs bioconda's self-contained build into the pipeline's conda env and records
+# the env in setup.json (`env_prefix`): found there even when activate.sh was not sourced.
+PIPELINE_HOME_ENV = "PROTEOMICS_PIPELINE_HOME"
+# Measured on HIVE for 3.5 GB raws: metadata 2.6-4.8 s; a query of 200-2000 scans 1.1-5.8 s
+# (10.8 s once, for the first 1000 scans of a DDA run). The metadata call walks every scan
+# header, so a slow network mount can take far longer -- but a parser that has not answered
+# in 5 min is stuck, and stuck must not look like done.
+TRFP_TIMEOUT_S = 300
+# JSON metadata terms, keyed by ACCESSION: TRFP's own `name` strings are not stable
+# (the source labels the MS2 count "Number of MS1 spectra").
+CV_MODEL = "MS:1000494"          # InstrumentProperties: Thermo Scientific instrument model
+CV_SCAN_RANGE = "PRIDE:0000479"  # ScanSettings: "first:last"
+CV_N_MS1 = "PRIDE:0000481"       # MsData
+CV_N_MS2 = "PRIDE:0000482"       # MsData
+# `query` spectrum attributes. The filter string carries the instrument's data-dependent
+# flag, and its accession depends on the build: every release v1.3.0-v1.4.4 writes it as
+# "MS:10000512" -- one zero too many -- and v1.4.5 corrected it to MS:1000512
+# (Query/ProxiSpectrumReader.cs at each tag). Bioconda still serves 1.3.2-1.4.4. Reading only
+# the correct spelling silently loses the flag on those builds, and with it the check that
+# stops narrow-window DIA being called DDA (300 x 2 m/z DIA came back DDA/high, no range, no
+# confirmation). ms level and the isolation offsets are spelled correctly in every release.
+CV_FILTER = "MS:1000512"
+CV_FILTER_PRE_1_4_5 = "MS:10000512"
+# NOT used, on purpose: MsData "MS min MZ"/"MS max MZ" (PRIDE:0000476/7) are the lowest and
+# highest isolation window CENTRES (367.5/1183.5 on the Exploris run above, whose windows
+# span 350.0-1201.0). Taking them as the range clips half a window off each end.
+
+# How many scans to query. A DIA cycle is one MS1 plus its MS2 windows, so the metadata's
+# MS2/MS1 count ratio is the cycle length (78352/3135 -> 26 scans on the Exploris). Four
+# cycles guarantees every window is seen, including staggered schemes that alternate
+# window sets between cycles; the floor covers methods with extra MS1 scans per cycle, the
+# ceiling bounds the output (TRFP writes every peak: 1000 mid-run Exploris DIA scans were
+# 43 MB of JSON, 200 are ~9 MB).
+QUERY_CYCLES, QUERY_MIN_SCANS, QUERY_MAX_SCANS = 4, 200, 1500
+QUERY_SCANS_WITHOUT_METADATA = 1000
+
+FALLBACK_CONSEQUENCE = ("precursor m/z range NOT measured, so estimate_params.py will search "
+                        "its 380-980 FALLBACK -- pass --precursor-mz-range if the method "
+                        "acquired wider")
+# A DDA file whose survey scan range could not be read. A NOTE, not a warning: a warning sets
+# needs_confirmation, and Sage -- the DDA default -- does not use the range at all. What gates
+# DIA-NN is estimate_params.py, which refuses a DDA cfg without a range (NoPrecursorRange). The
+# note goes into the file's `reason` and, once, into the top-level `dda_range_note`.
+DDA_NO_RANGE = ("DDA, but the MS1 survey scan range could not be read (Thermo: no 'Full ms "
+                "[lo-hi]' scan filter in the slice read; mzML: no MS1 scan window; timsTOF: no "
+                "GlobalMetadata MzAcqRange), so there is no precursor m/z range. A DIA-NN search "
+                "needs one -- estimate_params.py refuses a DDA cfg without --precursor-mz-range: "
+                "take the survey scan range from the instrument method (ask the user). A Sage "
+                "search does not use it.")
+
+
+def _pipeline_env_bin():
+    """<env_prefix>/bin of the conda env setup.sh built (read from its setup.json), or None."""
+    home = os.environ.get(PIPELINE_HOME_ENV) or os.path.expanduser("~/.proteomics-pipeline")
+    try:
+        with open(os.path.join(home, "setup.json"), encoding="utf-8") as fh:
+            prefix = json.load(fh).get("env_prefix")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return os.path.join(prefix, "bin") if isinstance(prefix, str) and prefix else None
+
+
+def _shared_trfp_paths():
+    raw = os.environ.get(TRFP_SHARED_ENV)
+    return [p for p in (TRFP_SHARED_DEFAULT if raw is None else raw).split(os.pathsep)
+            if p.strip()]
+
+
+def _is_exe(path):
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def locate_trfp():
+    """(argv prefix, where it was found) for ThermoRawFileParser, or (None, None).
+
+    Looked for in this order: $THERMORAWFILEPARSER, PATH, the pipeline's conda env, the
+    shared copies in $THERMORAWFILEPARSER_SHARED (by default the UC Davis Core's).
+    $THERMORAWFILEPARSER wins, because two public distributions are not one executable on
+    PATH: the framework-dependent release is `dotnet ThermoRawFileParser.dll`, and 1.4.x on
+    Linux/macOS is `mono ThermoRawFileParser.exe`.
+    """
+    env = os.environ.get(TRFP_ENV, "").strip()
+    if env:
+        toks = shlex.split(env, posix=(os.name != "nt"))
+        return ([t[1:-1] if len(t) > 1 and t[0] == t[-1] == '"' else t for t in toks],
+                f"${TRFP_ENV}")
+    for name in TRFP_NAMES:
+        hit = shutil.which(name)
+        if hit:
+            return [hit], "PATH"
+    env_bin = _pipeline_env_bin()
+    for name in (TRFP_NAMES if env_bin else ()):
+        if _is_exe(os.path.join(env_bin, name)):
+            return [os.path.join(env_bin, name)], "the pipeline's conda env"
+    for path in _shared_trfp_paths():
+        if _is_exe(path):
+            return [path], f"shared copy (${TRFP_SHARED_ENV})"
+    return None, None
+
+
+def find_trfp():
+    """The ThermoRawFileParser command as an argv prefix, or None (see locate_trfp)."""
+    return locate_trfp()[0]
+
+
+def _trfp_not_found():
+    shared = _shared_trfp_paths()
+    return (f"ThermoRawFileParser not found (${TRFP_ENV} is unset, neither "
+            f"{' nor '.join(TRFP_NAMES)} is on PATH or in the pipeline's conda env"
+            + (f", and there is no shared copy at {', '.join(shared)}" if shared else "")
+            + f"), so this .raw was not read: acquisition "
+            f"and instrument unknown, and {FALLBACK_CONSEQUENCE}. Install it from "
+            f"{TRFP_RELEASES} (self-contained Linux/macOS/Windows builds, or "
+            f"`conda install -c bioconda thermorawfileparser` -- `bash scripts/setup.sh` puts "
+            f"that one in the pipeline's env), or convert the .raw to mzML")
+
+
+# ---------------------------------------------------------------------------
+# The .NET a framework-dependent parser runs on.
+#
+# TRFP 2.x ships self-contained builds (bioconda's is one: no .NET needed) AND a
+# framework-dependent one: the `-net8` zip run as `dotnet ThermoRawFileParser.dll`, or an
+# apphost beside a ThermoRawFileParser.runtimeconfig.json -- the Core's shared copy on HIVE,
+# whose runtimeconfig lists Microsoft.NETCore.App 8.0.0 AND Microsoft.AspNetCore.App 8.0.0.
+# A Core member, 2026-09-23, 15 Fusion Lumos .raw: with no .NET the apphost exits 131 "You must install
+# .NET to run this application."; with ensure_dotnet8.sh's old NETCore-only install as
+# DOTNET_ROOT it exits 150 "You must install or update .NET to run this application." Both
+# came back as 15 identical per-file read failures, one srun after another.
+#
+# So the frameworks the runtimeconfig lists are checked BEFORE any file is read, against each
+# place a .NET may be (dotnet_root_candidates), by directory: <root>/shared/<name>/<x.y.z>/.
+# The first root with all of them becomes DOTNET_ROOT for the parser's own processes only.
+# With none, the parser is not started at all and the reason is given once, with the fix.
+# How the host itself resolves them (dotnet/runtime docs/design/features/sharedfx-lookup.md,
+# .NET 7+): an apphost uses $DOTNET_ROOT, else the registered/default install location; the
+# `dotnet` muxer uses ONLY its own directory and ignores DOTNET_ROOT.
+# ---------------------------------------------------------------------------
+DOTNET_DIR_ENV = "PROTEOMICS_DOTNET_DIR"          # ensure_dotnet8.sh's install location
+DOTNET_DIR_DEFAULT = "~/.proteomics-pipeline/dotnet8"
+# The host's own default locations, as an os.pathsep list. Only the tests set it (so a .NET
+# on the machine running them cannot change the answer); nobody else needs to.
+DOTNET_SYSTEM_ROOTS_ENV = "PROTEOMICS_DOTNET_SYSTEM_ROOTS"
+# `--version` exit codes that are the .NET HOST refusing to start, not the parser answering
+# (dotnet/runtime docs/design/features/host-error-codes.md)
+HOST_START_FAILURES = {131: "CoreHostLibMissingFailure: no .NET found",
+                       150: "FrameworkMissingFailure: a framework it needs is not installed"}
+_EXE = ".exe" if os.name == "nt" else ""
+
+
+def _host_default_roots():
+    """Where an apphost looks when DOTNET_ROOT is unset: the registered install location
+    (/etc/dotnet/install_location_<arch>, else install_location), then the platform default."""
+    override = os.environ.get(DOTNET_SYSTEM_ROOTS_ENV)
+    if override is not None:
+        return [p for p in override.split(os.pathsep) if p.strip()]
+    if os.name == "nt":
+        pf = os.environ.get("ProgramFiles")
+        return [os.path.join(pf, "dotnet")] if pf else []
+    import platform
+    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64",
+            "arm64": "arm64"}.get(platform.machine().lower())
+    roots = []
+    # the arch-specific file wins: on an arm64 Mac the plain one can name an x64 install
+    for reg in ([f"/etc/dotnet/install_location_{arch}"] if arch else []) + [
+            "/etc/dotnet/install_location"]:
+        try:
+            with open(reg, encoding="utf-8") as fh:
+                line = fh.readline().strip()
+        except OSError:
+            continue
+        if line:
+            roots.append(line)
+            break
+    roots.append("/usr/local/share/dotnet" if sys.platform == "darwin" else "/usr/share/dotnet")
+    return roots
+
+
+def dotnet_root_candidates():
+    """[(where, root)], in the order they are tried."""
+    found = []
+
+    def add(where, root):
+        if root and root not in (r for _, r in found):
+            found.append((where, root))
+
+    add("$DOTNET_ROOT", os.environ.get("DOTNET_ROOT"))
+    add(f"${DOTNET_DIR_ENV}" if os.environ.get(DOTNET_DIR_ENV) else "ensure_dotnet8.sh's install",
+        os.environ.get(DOTNET_DIR_ENV) or os.path.expanduser(DOTNET_DIR_DEFAULT))
+    # set by `module load dotnet-core-sdk/<v>` on HIVE (spack's <PACKAGE>_ROOT)
+    add("$DOTNET_CORE_SDK_ROOT", os.environ.get("DOTNET_CORE_SDK_ROOT"))
+    on_path = shutil.which("dotnet")
+    if on_path:
+        add("`dotnet` on PATH", os.path.dirname(os.path.realpath(on_path)))
+    for root in _host_default_roots():
+        add(".NET's default install location", root)
+    return found
+
+
+def _version_tuple(text):
+    try:
+        return tuple(int(x) for x in str(text).split("-", 1)[0].split(".")[:3])
+    except ValueError:
+        return None
+
+
+def dotnet_frameworks_needed(cmd):
+    """(needs, muxer, runtimeconfig path) for starting `cmd`.
+
+    needs: [(framework name, minimum version tuple, any higher major allowed)], [] when the
+    parser brings its own runtime (self-contained: `includedFrameworks`), is not a .NET app we
+    can see (mono, a wrapper script), or its runtimeconfig cannot be read -- then nothing is
+    checked and the parser's own calls say what is wrong. muxer: cmd is `dotnet <app>.dll`.
+    """
+    base = os.path.basename(cmd[0]).lower()
+    muxer = base in ("dotnet", "dotnet.exe")
+    if muxer:
+        dll = next((a for a in cmd[1:] if a.lower().endswith(".dll")), None)
+        if not dll:
+            return [], muxer, None
+        rc = dll[:-4] + ".runtimeconfig.json"
+    else:
+        real = os.path.realpath(shutil.which(cmd[0]) or cmd[0])
+        rc = (real[:-4] if real.lower().endswith(".exe") else real) + ".runtimeconfig.json"
+    try:
+        with open(rc, encoding="utf-8-sig") as fh:
+            opts = json.load(fh).get("runtimeOptions") or {}
+    except (OSError, ValueError, AttributeError):
+        return [], muxer, None
+    fws = opts.get("frameworks") or ([opts["framework"]] if opts.get("framework") else [])
+    needs = []
+    for fw in fws if isinstance(fws, list) else []:
+        want = _version_tuple(fw.get("version")) if isinstance(fw, dict) else None
+        if not (want and fw.get("name")):
+            continue
+        roll = fw.get("rollForward") or opts.get("rollForward") or ""
+        needs.append((fw["name"], want, roll in ("Major", "LatestMajor")))
+    return needs, muxer, rc
+
+
+def _need_text(need):
+    name, want, _any_major = need
+    return f"{name} {'.'.join(map(str, want))}+"
+
+
+def dotnet_root_lacks(root, needs, muxer=False):
+    """Why `root` cannot start a parser with these needs, in words; [] when it can."""
+    if not root or not os.path.isdir(root):
+        return ["nothing installed there"]
+    lacks = []
+    fxr = os.path.join(root, "host", "fxr")
+    try:
+        has_fxr = os.path.isdir(fxr) and bool(os.listdir(fxr))
+    except OSError as e:        # an unreadable root is one that cannot start anything
+        return [f"unreadable ({type(e).__name__}: {e.strerror or e})"]
+    if not has_fxr:
+        lacks.append("no host/fxr (not a .NET install)")
+    if muxer and not _is_exe(os.path.join(root, "dotnet" + _EXE)):
+        lacks.append("no dotnet executable")
+    for need in needs:
+        name, want, any_major = need
+        try:
+            have = sorted(v for v in (_version_tuple(d) for d in
+                                      os.listdir(os.path.join(root, "shared", name))) if v)
+        except OSError:
+            have = []
+        if not any(v >= want and (v[0] == want[0] or any_major) for v in have):
+            lacks.append(f"no {_need_text(need)}"
+                         + (f" (has {', '.join('.'.join(map(str, v)) for v in have)})"
+                            if have else ""))
+    return lacks
+
+
+def _dotnet_fix():
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ensure_dotnet8.sh")
+    dest = os.environ.get(DOTNET_DIR_ENV) or DOTNET_DIR_DEFAULT
+    return (f"Fix, then re-run: `bash {helper}` (installs Microsoft.NETCore.App and "
+            f"Microsoft.AspNetCore.App 8.0 into {dest}, which is checked here; "
+            f"needs internet; on a cluster login node its download runs itself on a compute "
+            f"node), or on UC Davis HIVE put `module load dotnet-core-sdk/8.0.4 && ` in front "
+            f"of this command inside its job (hive_exec.sh --job '...'; a module loaded in "
+            f"another shell never reaches the job); or use a self-contained parser, "
+            f"which needs no .NET (bioconda's `thermorawfileparser`, which `bash "
+            f"scripts/setup.sh` installs, or a Linux/macOS/Windows zip from {TRFP_RELEASES})")
+
+
+def trfp_launch(cmd):
+    """How to start this parser: {"cmd", "dotnet_root", "needs", "problem"}.
+
+    Directory checks only -- nothing is started, so it is safe before the login-node refusal.
+    `dotnet_root` goes into the parser's environment as DOTNET_ROOT (None: leave it alone). For
+    `dotnet <app>.dll`, `cmd` names the dotnet of the chosen root, because the muxer resolves
+    frameworks from its own directory whatever DOTNET_ROOT says. `problem` is the one message
+    for a parser that cannot start: every .raw gets it verbatim and none is attempted.
+    """
+    needs, muxer, rc = dotnet_frameworks_needed(cmd)
+    out = {"cmd": list(cmd), "dotnet_root": None, "needs": [_need_text(n) for n in needs],
+           "problem": None}
+    if not needs:
+        return out
+    cands = dotnet_root_candidates()
+    if muxer:
+        own = os.path.dirname(os.path.realpath(shutil.which(cmd[0]) or cmd[0]))
+        cands = [(f"the {cmd[0]} it runs under", own)] + [c for c in cands if c[1] != own]
+    tried = []
+    for where, root in cands:
+        lacks = dotnet_root_lacks(root, needs, muxer)
+        if not lacks:
+            out["dotnet_root"] = root
+            if muxer:
+                out["cmd"] = [os.path.join(root, "dotnet" + _EXE)] + list(cmd[1:])
+            return out
+        tried.append(f"{root} ({where}): {', '.join(lacks)}")
+    out["problem"] = (
+        f"ThermoRawFileParser [{' '.join(cmd)}] cannot start: it is a framework-dependent .NET "
+        f"build that needs {' and '.join(out['needs'])} ({os.path.basename(rc)}), and no .NET "
+        f"install checked has all of them -- {'; '.join(tried) or 'none found'}. Started "
+        f"anyway it exits 150 \"You must install or update .NET to run this application.\" "
+        f"(131 \"You must install .NET\" with no .NET at all), so no .raw was read: acquisition "
+        f"and instrument unknown, and {FALLBACK_CONSEQUENCE}. {_dotnet_fix()}")
+    return out
+
+
+def _child_env(dotnet_root):
+    """The parser's environment: ours, with DOTNET_ROOT set to the root that was checked."""
+    if not dotnet_root:
+        return None
+    env = dict(os.environ, DOTNET_ROOT=dotnet_root)
+    for k in ("DOTNET_ROOT_X64", "DOTNET_ROOT_ARM64", "DOTNET_ROOT_X86", "DOTNET_ROOT(x86)"):
+        env.pop(k, None)        # an arch-specific root outranks DOTNET_ROOT in the host
+    return env
+
+
+def _trfp_error_lines(stdout):
+    """log4net `ERROR` lines from the parser's console appender (stdout)."""
+    return [ln.strip() for ln in (stdout or "").splitlines() if " ERROR " in f" {ln} "]
+
+
+def _trfp_message(stdout, stderr):
+    """The parser's own words. Usage errors go to stderr; processing errors are log4net
+    `ERROR` lines on stdout (its console appender), so look in both."""
+    usage = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    msg = " | ".join(_trfp_error_lines(stdout)[:2] + usage[:1]) or "no message"
+    return msg if len(msg) <= 400 else msg[:400] + "..."
+
+
+def _run_trfp(cmd, args, dotnet_root=None):
+    """(True, None, stdout) or (False, "exit N: <parser message>", stdout). Never raises.
+
+    stdout comes back on SUCCESS too, because exit 0 is not proof the parser did the work:
+    a processing error is a log4net `ERROR` line on the console appender and need not move
+    the exit code (see _trfp_message). A caller that reads only the exit code accepts a
+    partial answer as a complete one.
+    """
+    try:
+        p = subprocess.run(cmd + args, capture_output=True, text=True, errors="replace",
+                           timeout=TRFP_TIMEOUT_S, env=_child_env(dotnet_root))
+    except subprocess.TimeoutExpired:
+        return False, f"no answer after {TRFP_TIMEOUT_S} s", ""
+    except OSError as e:                       # includes FileNotFoundError / PermissionError
+        return False, f"could not run {' '.join(cmd)!r}: {e}", ""
+    if p.returncode != 0:
+        return False, f"exit {p.returncode}: {_trfp_message(p.stdout, p.stderr)}", p.stdout
+    return True, None, p.stdout
+
+
+_TRFP_STARTS = {}
+
+def trfp_start(launch):
+    """(version or None, problem or None): `--version` run the way the reads will be, cached per
+    command + DOTNET_ROOT.
+
+    `problem` only when the parser cannot start at all -- the command cannot be executed, or the
+    .NET host refuses (HOST_START_FAILURES) where the directory check saw nothing wrong. Any
+    other failure to say a version is not a reason to skip the reads: they report for
+    themselves.
+    """
+    cmd, root = launch["cmd"], launch["dotnet_root"]
+    key = (tuple(cmd), root)
+    if key not in _TRFP_STARTS:
+        version = problem = None
+        try:
+            p = subprocess.run(cmd + ["--version"], capture_output=True, text=True,
+                               errors="replace", timeout=60, env=_child_env(root))
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError as e:
+            problem = f"could not run {' '.join(cmd)!r}: {e}"
+        else:
+            lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+            if p.returncode in HOST_START_FAILURES:
+                problem = (f"`--version` exit {p.returncode} ({HOST_START_FAILURES[p.returncode]}"
+                           f"): {_trfp_message(p.stdout, p.stderr)}")
+            elif p.returncode == 0 and lines:
+                version = lines[-1]
+        if problem:
+            problem = (f"ThermoRawFileParser [{' '.join(cmd)}] cannot start"
+                       + (f" with DOTNET_ROOT={root}" if root else "")
+                       + f": {problem}. So no .raw was read: acquisition and instrument unknown, "
+                       f"and {FALLBACK_CONSEQUENCE}. {_dotnet_fix()}")
+        _TRFP_STARTS[key] = (version, problem)
+    return _TRFP_STARTS[key]
+
+
+def trfp_ready(cmd):
+    """(launch, version, problem) -- the one "can this parser start here" answer, for step 2's
+    up-front check, each .raw's read and setup.sh's readiness report alike."""
+    launch = trfp_launch(cmd)
+    if launch["problem"]:
+        return launch, None, launch["problem"]
+    version, problem = trfp_start(launch)
+    return launch, version, problem
+
+
+def reader_status():
+    """setup.sh's Thermo .raw readiness (setup.json `thermo_raw_reader`): the parser step 2 would
+    use, where it was found, and whether it starts; and `resolution_reader`, whether the
+    Orbitrap resolution can be read. Runs `--version` and the reader's `--check` only; reads no
+    .raw. `ready` is the parser's alone: without the resolution the user is asked for it."""
+    cmd, source = locate_trfp()
+    st = {"ready": False, "command": None, "source": source, "version": None,
+          "dotnet_needs": [], "dotnet_root": None, "note": ""}
+    if not cmd:
+        st["note"] = _trfp_not_found().replace("so this .raw was not read",
+                                               "so no .raw can be read")
+        st["resolution_reader"] = resolution_reader_status(None)
+        return st
+    launch, version, problem = trfp_ready(cmd)
+    st["resolution_reader"] = resolution_reader_status(launch)
+    st.update(command=" ".join(launch["cmd"]), version=version,
+              dotnet_needs=launch["needs"], dotnet_root=launch["dotnet_root"])
+    if problem:
+        st["note"] = problem
+    elif not version:
+        st["note"] = (f"ThermoRawFileParser [{st['command']}] did not report a version "
+                      f"(`--version` failed or timed out), so it may not start; step 2 "
+                      f"(detect_acquisition.py) will say why for each .raw")
+    else:
+        st["ready"] = True
+        st["note"] = (f"ThermoRawFileParser {version} starts ({source}"
+                      + (f"; DOTNET_ROOT={launch['dotnet_root']}" if launch["dotnet_root"]
+                         else "") + ")")
+    return st
+
+
+def resolution_reader_status(launch):
+    """{"ready", "python", "dll_dir", "dotnet_root", "reader", "note"}: thermo_resolution.py
+    --check, run exactly as step 2 would run the reader."""
+    st = {"ready": False, "python": None, "dll_dir": None, "dotnet_root": None, "reader": None,
+          "note": ""}
+    st["python"] = py = resolution_python()
+    if not py:
+        st["note"] = PYTHONNET_MISSING
+        return st
+    st["dll_dir"], why = rawfilereader_dir(launch["cmd"] if launch else None)
+    if not why:
+        st["dotnet_root"], why = resolution_dotnet_root(launch)
+    if why:
+        st["note"] = why
+        return st
+    try:
+        p = subprocess.run([py, RES_READER, "--dll-dir", st["dll_dir"], "--check"],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=RES_TIMEOUT_BASE_S, env=_child_env(st["dotnet_root"]))
+        chk = json.loads(p.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as e:
+        st["note"] = f"the reader's --check did not answer ({type(e).__name__}: {e})"
+        return st
+    st.update(ready=bool(chk.get("ok")), reader=chk.get("reader"),
+              note=chk.get("note") or f"reads the Orbitrap resolution with {chk.get('reader')}")
+    return st
+
+
+def _cv(meta, section, accession):
+    for term in (meta or {}).get(section) or []:
+        if isinstance(term, dict) and term.get("accession") == accession:
+            v = term.get("value")
+            return v.strip() if isinstance(v, str) and v.strip() else None
+    return None
+
+
+def trfp_metadata(path, cmd=None, dotnet_root=None):
+    """(metadata dict, None) or (None, why). With no `cmd`, finds the parser and its .NET."""
+    if not cmd:
+        cmd = find_trfp()
+        if not cmd:
+            return None, _trfp_not_found()
+        launch, _version, problem = trfp_ready(cmd)
+        if problem:
+            return None, problem
+        cmd, dotnet_root = launch["cmd"], launch["dotnet_root"]
+    with tempfile.TemporaryDirectory(prefix="trfp_meta_") as tmp:
+        ok, why, stdout = _run_trfp(cmd, [f"-i={path}", "-m=0", f"-o={tmp}"], dotnet_root)
+        if not ok:
+            return None, f"ThermoRawFileParser metadata call failed ({why})"
+        if _trfp_error_lines(stdout):
+            return None, ("ThermoRawFileParser metadata call reported an error and still "
+                          f"exited 0 ({_trfp_message(stdout, None)})")
+        hits = [f for f in os.listdir(tmp) if f.endswith("-metadata.json")]
+        if not hits:
+            return None, "ThermoRawFileParser metadata call wrote no *-metadata.json"
+        try:
+            with open(os.path.join(tmp, hits[0]), encoding="utf-8-sig") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError) as e:
+            return None, f"ThermoRawFileParser metadata JSON unreadable ({e})"
+    if not isinstance(meta, dict):
+        return None, "ThermoRawFileParser metadata JSON is not an object"
+    return meta, None
+
+
+def trfp_query(path, first, last, cmd, dotnet_root=None):
+    """(list of PROXI spectra, None, [notes]) or (None, why, [notes]).
+
+    `notes` are what did not stop the read but must reach the user, because they change what
+    the answer is worth: chiefly an answer SHORTER than the scans asked for. The scan range
+    is clamped to the run's own (query_scan_range), so a short answer means the parser
+    stopped early -- the first 13 of an Exploris method's 25 windows read as a complete
+    350.0-793.0 method. The caller refuses `high` on any note.
+    """
+    notes = []
+    with tempfile.TemporaryDirectory(prefix="trfp_query_") as tmp:
+        dest = os.path.join(tmp, "query.json")
+        ok, why, stdout = _run_trfp(cmd, ["query", f"-i={path}", f"-n={first}-{last}",
+                                          f"-b={dest}"], dotnet_root)
+        if not ok:
+            return None, f"ThermoRawFileParser query of scans {first}-{last} failed ({why})", notes
+        if _trfp_error_lines(stdout):
+            # exit 0 with an ERROR line: the parser hit a problem, wrote what it had, and
+            # said so only on stdout. Whatever is in that file is not the slice we asked for.
+            return None, (f"ThermoRawFileParser query of scans {first}-{last} reported an "
+                          f"error and still exited 0 ({_trfp_message(stdout, None)})"), notes
+        try:
+            with open(dest, encoding="utf-8-sig") as fh:
+                spectra = json.load(fh)
+        except (OSError, ValueError) as e:
+            return None, f"ThermoRawFileParser query output for scans {first}-{last} unreadable ({e})", notes
+    if not isinstance(spectra, list):
+        return None, "ThermoRawFileParser query output is not a JSON list of spectra", notes
+    asked = last - first + 1
+    if len(spectra) < asked:
+        notes.append(
+            f"ThermoRawFileParser answered the query of scans {first}-{last} with "
+            f"{len(spectra)} of the {asked} scans asked for, so only part of the requested "
+            f"slice was read: the acquisition and any precursor m/z range below come from "
+            f"that part and may miss windows the method also acquired")
+    return spectra, None, notes
+
+
+def query_scan_range(meta):
+    """(first, last, note) scans to query: several acquisition cycles from the middle of the
+    run, where the method is at steady state -- not the loading/wash start.
+
+    `note` is None, or says that the slice is NOT mid-run after all. Without the run's own
+    scan range there is nothing to take a middle of, so the fallback reads from scan 1 --
+    the void volume -- and no other message says so: "instrument unknown" is about the
+    instrument, not about which part of the run was classified.
+    """
+    not_mid_run = (
+        f"the run's scan range was not readable from the ThermoRawFileParser metadata, so "
+        f"scans 1-{QUERY_SCANS_WITHOUT_METADATA} were read -- the START of the run (void "
+        f"volume and equilibration), not a mid-run slice at steady state. A method segment "
+        f"that differs there, or a start with no MS2 at all, is classified as the whole run")
+    try:
+        first, last = (int(v) for v in _cv(meta, "ScanSettings", CV_SCAN_RANGE).split(":"))
+    except (AttributeError, ValueError):
+        return 1, QUERY_SCANS_WITHOUT_METADATA, not_mid_run
+    if last < first:
+        return 1, QUERY_SCANS_WITHOUT_METADATA, not_mid_run
+    try:
+        cycle = int(_cv(meta, "MsData", CV_N_MS2)) / int(_cv(meta, "MsData", CV_N_MS1)) + 1
+        want = min(QUERY_MAX_SCANS, max(QUERY_MIN_SCANS, math.ceil(QUERY_CYCLES * cycle)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        want = QUERY_SCANS_WITHOUT_METADATA      # still mid-run, just a fixed-width slice
+    a = max(first, (first + last) // 2 - want // 2)
+    return a, min(last, a + want - 1), None
+
+
+# An MS1 survey scan's filter string names the m/z range it was acquired over -- "FTMS + p NSI
+# Full ms [350.0000-1500.0000]" in the Exploris 480 DDA fixture (real TRFP 2.0.0.0 output, HIVE
+# test run), the range a Core member confirmed for SET28. "Full ms" then the bracket: "Full ms2
+# 572.3181@hcd30.00 [...]" is an MS2 and never matches; SIM scans are not survey scans.
+FULL_MS1_RE = re.compile(r"\bFull\s+ms\s+\[([^\]]+)\]")
+MZ_PAIR_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*-\s*([0-9]+(?:\.[0-9]+)?)")
+
+
+def ms1_filter_range(filt):
+    """(lo, hi) of a Thermo MS1 filter string's "Full ms [lo-hi]" (the span of every range in
+    the brackets), or None."""
+    m = FULL_MS1_RE.search(filt) if isinstance(filt, str) else None
+    pairs = [(float(a), float(b)) for a, b in MZ_PAIR_RE.findall(m.group(1))] if m else []
+    pairs = [p for p in pairs if p[1] > p[0]]
+    return (min(p[0] for p in pairs), max(p[1] for p in pairs)) if pairs else None
+
+
+def thermo_isolation_windows(spectra):
+    """MS2 isolation windows + data-dependent evidence from TRFP `query` JSON, and the MS1 survey
+    scan ranges (`ms1_ranges`, from their filter strings) that are a DDA run's precursor range.
+
+    Edges are target -/+ the lower/upper offsets TRFP reports, which already fold in the
+    instrument's isolation-width offset -- the same values it writes to mzML, so the two
+    readers agree: detect_mzml() on the full TRFP 2.0.0.0 mzML of the runs above gave
+    350.0-1201.0 and 350.04999389648435-1200.9499755859374 (two test runs on HIVE),
+    this reader 350.0-1201.0 and 350.05-1200.95 after rounding (a test run on HIVE).
+    """
+    w = {"widths": [], "centres": [], "los": [], "his": [],
+         "n_ms2": 0, "n_filter": 0, "n_dependent": 0, "n_ms1": 0, "ms1_ranges": [],
+         # FAIMS compensation voltages from the scan filters' "cv=-55.00" (faims.py), and how
+         # many filters were read: none read = status unknown, not "no FAIMS"
+         "faims_cvs": set(), "n_filters_seen": 0}
+    for s in spectra:
+        attrs = {}
+        for a in (s.get("attributes") or []) if isinstance(s, dict) else []:
+            if isinstance(a, dict) and a.get("accession"):
+                attrs.setdefault(a["accession"], a.get("value"))
+        try:
+            level = int(float(attrs.get("MS:1000511")))
+        except (TypeError, ValueError):
+            continue
+        filt_any = attrs.get(CV_FILTER) or attrs.get(CV_FILTER_PRE_1_4_5)
+        if isinstance(filt_any, str) and filt_any.strip():
+            w["n_filters_seen"] += 1
+            w["faims_cvs"].update(faims.cvs_from_filter(filt_any))
+        if level == 1:
+            w["n_ms1"] += 1
+            rng = ms1_filter_range(attrs.get(CV_FILTER) or attrs.get(CV_FILTER_PRE_1_4_5))
+            if rng:
+                w["ms1_ranges"].append(rng)
+            continue
+        if level != 2:
+            continue
+        w["n_ms2"] += 1
+        filt = attrs.get(CV_FILTER) or attrs.get(CV_FILTER_PRE_1_4_5)
+        if isinstance(filt, str) and filt.strip():
+            w["n_filter"] += 1
+            # Thermo filter grammar: a standalone `d` token before the mass list means
+            # "data-dependent scan" ("FTMS + c NSI d Full ms2 572.3181@hcd30.00 [...]");
+            # DIA windows carry none ("FTMS + p NSI Full ms2 367.5000@hcd30.00 [...]").
+            if "d" in filt.split("[", 1)[0].split():
+                w["n_dependent"] += 1
+        try:
+            tgt = float(attrs["MS:1000827"])
+            lo_off = float(attrs.get("MS:1000828") or 0)
+            hi_off = float(attrs.get("MS:1000829") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lo_off + hi_off <= 0:
+            continue
+        w["widths"].append(lo_off + hi_off)
+        w["centres"].append(tgt)
+        w["los"].append(tgt - lo_off)
+        w["his"].append(tgt + hi_off)
+    return w
+
+
+def classify_thermo_windows(w):
+    """(kind, confidence, reason, range) from thermo_isolation_windows() output.
+
+    The width/centre rule first (the same one mzML gets), then the instrument's own
+    data-dependent flag, which outranks window shape whenever the parser reports it.
+    """
+    kind, conf, why, rng = classify_isolation_windows(w["widths"], w["centres"],
+                                                      w["los"], w["his"],
+                                                      flag_read=w["n_filter"] > 0)
+    # Every MS2 scan the parser answered with, against the ones a window could be read from.
+    # A shortfall is the same defect classify_isolation_windows guards against for mzML --
+    # a method judged, and a range measured, from part of its windows.
+    unread = w["n_ms2"] - len(w["widths"])
+    capped = unread > 0          # things about the READ that forbid `high`, applied last so
+    if unread > 0:               # no later branch can promote a partial read back to high
+        why += (f"; {unread} of {w['n_ms2']} MS2 scans in the slice had no readable "
+                f"isolation window")
+    if w["n_filter"] == 0:
+        # No filter string, so the instrument's own flag is unavailable and
+        # references/search-engines.md's "none flagged -> never DDA" cannot be applied: the
+        # width rule decided alone, and a 300 x 2 m/z DIA method looks exactly like DDA to
+        # it. Every shipping release writes the string (v1.3.0-v1.4.4 under the misspelled
+        # MS:10000512, v1.4.5+ correctly), so a parser that does not is one this code has
+        # never been run against. That is not a `high` answer.
+        dep = ("data-dependent flag not available (the parser reported no filter string, "
+               f"{CV_FILTER} or {CV_FILTER_PRE_1_4_5}), so the window widths decided alone")
+        return kind, _cap_medium(conf), f"{why}; {dep}", rng
+    dep = f"{w['n_dependent']}/{w['n_filter']} MS2 scans flagged data-dependent"
+    tiles = tiled_window_set(w["los"], w["his"])
+    if w["n_dependent"] == 0 and tiles:
+        # A tiled set repeated every cycle (TILED_WHY) and the instrument says nothing was
+        # data-dependent: DIA, whatever the width or the number of windows (S2, T41) -- the
+        # Astral's 2 m/z x 300 and 4 m/z x 150 read as "medium" and "unknown" by width.
+        kind, conf = "DIA", "high"
+        rng = (min(w["los"]), max(w["his"]))
+        dep += " -- so DIA: the window set tiles and repeats, and nothing is data-dependent"
+    elif w["n_dependent"] == 0 and kind != "DIA" and w["widths"]:
+        # Nothing was data-dependent, so this is not DDA whatever the widths look like:
+        # narrow-window DIA (2-3 m/z isolation, Astral-style) or targeted PRM. Medium, so
+        # the user confirms which.
+        kind, conf = "DIA", "medium"
+        rng = (min(w["los"]), max(w["his"])) if w["los"] else None
+        dep += " -- so not DDA despite the window widths (narrow-window DIA or PRM?)"
+    elif w["n_dependent"] == w["n_filter"]:
+        if kind == "DDA":
+            conf = "high"                      # instrument flag and window shape agree
+        else:
+            kind, conf, rng = "DDA", "medium", None
+            # There is no "despite the widths" to talk about when there were no widths.
+            dep += (" -- so DDA despite the window widths" if w["widths"] else
+                    " -- so DDA on the flag alone: no isolation windows were readable")
+    elif w["n_dependent"]:
+        conf = "medium" if conf == "high" else conf
+        dep += " -- mixed dependent and independent MS2 scans (hybrid method?)"
+    return kind, (_cap_medium(conf) if capped else conf), f"{why}; {dep}", rng
+
+
+def read_thermo_raw(path):
+    """Everything detect_acquisition reports for one Thermo .raw, from at most two TRFP calls.
+
+    Returns a dict: acquisition, confidence, reason, precursor_mz_range, instrument,
+    warnings (every read failure, in words), reader, and acq_time.result()'s acquired_at,
+    acquired_at_source, acquired_at_note (from the same metadata call).
+    """
+    out = {"acquisition": "unknown", "confidence": "low", "reason": "",
+           "precursor_mz_range": None, "instrument": None, "warnings": [], "reader": None,
+           "isolation_windows": None, "faims_cvs": None}
+    out.update(acq_time.result(note="not read: ThermoRawFileParser did not run (see warnings)"))
+    cmd = find_trfp()
+    if not cmd:
+        out["reason"] = _trfp_not_found()
+        out["warnings"].append(out["reason"])
+        return out
+    launch, version, problem = trfp_ready(cmd)
+    cmd, root = launch["cmd"], launch["dotnet_root"]
+    if problem:
+        # the same words main() printed once up front; the parser is not started for this file
+        out["reader"] = f"ThermoRawFileParser (cannot start) [{' '.join(cmd)}]"
+        out["reason"] = problem
+        out["warnings"].append(problem)
+        return out
+    # which .NET ran it is part of which reader it was
+    out["reader"] = (f"ThermoRawFileParser {version or '(version unknown)'} [{' '.join(cmd)}]"
+                     + (f" DOTNET_ROOT={root}" if root else ""))
+
+    meta, meta_err = trfp_metadata(path, cmd, root)
+    if meta is None:
+        # Not fatal for DIA/DDA, but the instrument decides mass accuracy downstream.
+        out["warnings"].append(f"instrument unknown: {meta_err}")
+        out.update(acq_time.result(note=f"not read: {meta_err}"))
+    else:
+        out.update(thermo_acquired_at(meta, path))
+        out["instrument"] = _cv(meta, "InstrumentProperties", CV_MODEL)
+        if not out["instrument"]:
+            out["warnings"].append("instrument unknown: ThermoRawFileParser metadata has no "
+                                   f"instrument model ({CV_MODEL})")
+
+    first, last, slice_note = query_scan_range(meta)
+    if slice_note:
+        out["warnings"].append(slice_note)
+    spectra, q_err, q_notes = trfp_query(path, first, last, cmd, root)
+    if spectra is None:
+        out["reason"] = f"{q_err}: acquisition unknown and {FALLBACK_CONSEQUENCE}"
+        out["warnings"].append(out["reason"])
+        return out
+    out["warnings"].extend(q_notes)
+
+    w = thermo_isolation_windows(spectra)
+    out["faims_cvs"] = sorted(w["faims_cvs"]) if w["n_filters_seen"] else None
+    kind, conf, why, rng = classify_thermo_windows(w)
+    if kind == "DDA":
+        # DDA has no window scheme to take a range from: its precursors come from the survey
+        # scans. classify() warns when there is none (DDA_NO_RANGE).
+        rng, how = survey_scan_range(w.get("ms1_ranges") or [],
+                                     "the scan filter ('Full ms [lo-hi]')")
+        why += how
+    if q_notes:
+        conf = _cap_medium(conf)     # a partial answer is not a high-confidence read
+    if w["n_filter"] == 0:
+        out["warnings"].append(
+            f"ThermoRawFileParser reported no filter string ({CV_FILTER} or "
+            f"{CV_FILTER_PRE_1_4_5}) for any MS2 scan, so the instrument's own "
+            f"data-dependent flag could not be read and the isolation widths decided DIA vs "
+            f"DDA alone -- confidence is capped at medium: confirm the acquisition before "
+            f"searching, and note that a narrow-window (2-3 m/z) DIA method is "
+            f"indistinguishable from DDA on widths alone")
+    if rng:
+        # TRFP serialises the isolation target as a float32 -- 372.8999938964844 for the
+        # Lumos method's 372.9 -- so the raw edge comes out 350.0499938964844. Near m/z 1200
+        # a float32 is only good to ~1e-4, so three decimals is all the precision there is,
+        # and it returns the method's own 350.05 / 1200.95.
+        rng = (round(rng[0], 3), round(rng[1], 3))
+    out.update(acquisition=kind, confidence=conf, precursor_mz_range=rng,
+               reason=f"ThermoRawFileParser query of scans {first}-{last}: {why}",
+               # a DDA run has no window scheme; for the rest, whether its windows are staggered
+               isolation_windows=(None if kind == "DDA" else
+                                  staggered_windows(w["los"], w["his"])))
+    if kind == "DIA" and not rng:
+        out["warnings"].append(f"DIA, but no isolation window edges were readable: "
+                               f"{FALLBACK_CONSEQUENCE}")
+    elif kind == "unknown":
+        out["warnings"].append(f"{out['reason']}: {FALLBACK_CONSEQUENCE}")
+    return out
+
+
+def thermo_acquired_at(meta, path):
+    """acq_time.result() for a .raw from its TRFP metadata, with the sanity check against the
+    file's modification time folded into the note (not a `warning`: the acquisition decision
+    stands either way, and qc_bracket.py is the step that uses the time)."""
+    rec = acq_time.from_thermo_value(acq_time.thermo_creation_text(meta))
+    bad = acq_time.check_against_mtime(rec, path)
+    if bad:
+        rec["acquired_at_note"] = "; ".join(x for x in (rec["acquired_at_note"], bad) if x)
+    return rec
+
+
+def detect_thermo_raw(path):
+    """(kind, confidence, reason, precursor m/z range) -- the shape every detector returns."""
+    t = read_thermo_raw(path)
+    return (t["acquisition"], t["confidence"], t["reason"], t["precursor_mz_range"])
+
+
+def classify(path):
+    p = path.rstrip("/")
+    low = p.lower()
+    mz_range = None
+    warnings, reader, instrument, windows = [], None, None, None
+    mzml_analyzer = None
+    faims_cvs = None            # [] none / [cv, ...] FAIMS / None not read or not applicable
+    acquired = acq_time.result(note="not read for this format (only a Bruker .d and a Thermo "
+                                    ".raw are)")
+    if low.endswith(".d"):
+        kind, conf, why, mz_range = detect_bruker_d(p); vendor = "Bruker"
+    elif low.endswith((".mzml", ".mzml.gz")):
+        mz_words = set()
+        kind, conf, why, mz_range = detect_mzml(p, mz_words); vendor = "mzML"
+        faims_cvs = faims.run_cvs(p)
+        instrument = mzml_instrument(p)
+        mzml_analyzer = mzml_ms2_analyzer(mz_words)
+    elif low.endswith(".raw") and os.path.isdir(p):
+        # Waters .raw is a FOLDER; handing it to a Thermo reader only produces a confusing
+        # "not a valid RAW file" from the wrong vendor's tool.
+        kind, conf, why, vendor = ("unknown", "low",
+                                   "Waters .raw folder: convert to mzML to classify", "Waters")
+    elif low.endswith(".raw"):
+        t = read_thermo_raw(p); vendor = "Thermo"
+        kind, conf, why, mz_range = (t["acquisition"], t["confidence"], t["reason"],
+                                     t["precursor_mz_range"])
+        # instrument comes from the same metadata call -- do not run the parser twice
+        instrument, warnings, reader = t["instrument"], t["warnings"], t["reader"]
+        windows = t.get("isolation_windows")
+        faims_cvs = t.get("faims_cvs")
+        acquired = {k: t[k] for k in ("acquired_at", "acquired_at_source", "acquired_at_note")}
+    elif low.endswith((".wiff", ".wiff2")):
+        kind, conf, why, vendor = "unknown", "low", "SCIEX .wiff: convert to mzML to classify", "SCIEX"
+    else:
+        kind, conf, why, vendor = "unknown", "low", "unrecognized extension", "?"
+    if vendor not in ("Thermo", "mzML"):
+        instrument = detect_instrument(p)
+    if vendor == "Bruker":
+        acquired = acq_time.read_bruker(p)
+    # A .d whose analysis.tdf indexes only part of its tdf_bin is searched without an
+    # error -- DIA-NN reads what the index points at. Nothing downstream can tell, so it
+    # is checked here, before the engine is chosen. None for anything but a Bruker .d.
+    integrity = (tdf_integrity(p) if vendor == "Bruker"
+                 and os.path.exists(os.path.join(p, "analysis.tdf")) else None)
+    if integrity and integrity["status"] != "ok":
+        # the same per-file list the Thermo reader fills: one place to look, one gate
+        warnings = warnings + [integrity_warning(integrity)]
+    if kind == "DDA" and not mz_range:
+        why = f"{why}; NOTE: {DDA_NO_RANGE}"
+    return {"file": p, "vendor": vendor, "acquisition": kind,
+            "confidence": conf, "reason": why, "instrument": instrument,
+            # ACQUIRED precursor m/z bounds, or null when the format cannot tell
+            # us. estimate_params.py searches this range instead of a hardcoded
+            # 380-980 -- see its --precursor-mz-range flag.
+            "precursor_mz_range": (list(mz_range) if mz_range else None),
+            # what that range is: "isolation_windows" (DIA) or "ms1_survey_scan" (DDA), from
+            # estimate_params.PR_MZ_RANGE_BASIS; null with no range
+            "precursor_mz_range_source": (PR_MZ_RANGE_BASIS.get(kind) if mz_range else None),
+            # Bruker .d only (None otherwise): bruker_tdf.tdf_integrity() of its analysis.tdf
+            "tdf_integrity": integrity,
+            # every problem with this file the user must hear before a search starts, in
+            # words: a Thermo .raw read failure or a Bruker analysis.tdf that is not ok
+            # (also printed to stderr; any one sets needs_confirmation)
+            "warnings": warnings,
+            # the external reader and its version, when one was needed (Thermo .raw)
+            "reader": reader,
+            # Thermo .raw only (else null; null too for DDA, or too few windows read):
+            # staggered_windows() -- whether Skyline will demultiplex the run's DIA windows
+            "isolation_windows": windows,
+            # FAIMS compensation voltages of the run (faims.py, the one definition): [] = read,
+            # none; [-50.0, ...] = FAIMS; null = not read here or not applicable (a Bruker .d).
+            # run_search.py refuses a FragPipe quantification that mixes the two.
+            "faims_cvs": faims_cvs,
+            # When the run was acquired (start), as UTC ISO 8601 "...Z" -- or null, with
+            # acquired_at_note saying why. acquired_at_source names the field; for a .raw the
+            # note also states the time-zone assumption (acq_time.py). qc_bracket.py reads these.
+            **acquired,
+            # Thermo Orbitrap only (else null): read from the scan trailer by main() in
+            # batches -- see add_resolutions(). resolution_note says where from, or why not;
+            # ms2_analyzer is "FTMS" (Orbitrap), "ITMS" (ion trap: no Orbitrap resolution) or
+            # "mixed" (both: see MS2_MIXED_NOTE)
+            "ms1_resolution": None, "ms2_resolution": None,
+            # an mzML: read from its MS2 scans' filter strings (mzml_ms2_analyzer); else null
+            "ms2_analyzer": mzml_analyzer if vendor == "mzML" else None,
+            "resolution_note": (f"MS2 analyser read from the MS2 scan filter strings of the "
+                                f"mzML ({mzml_analyzer})" if vendor == "mzML" and mzml_analyzer
+                                else None)}
+
+# ---------------------------------------------------------------------------
+# A cohort of .raw on a cluster login node.
+#
+# Reading a .raw is two parser processes that read the raw. Measured on HIVE compute nodes
+# (four test runs; TRFP 2.0.0.0, 3.5 GB raws): 3.1-7.0 s
+# per file, ~1 core (68-98% CPU), 286-354 MB peak RSS, a 1.2-8.8 MB query JSON in $TMPDIR
+# (deleted per file); 6 files in one call took 27-33 s. With the old command line the calls died at
+# argument parsing, so step 2 cost nothing -- and SKILL.md 0a drives step 2 over SSH, i.e.
+# on the login node. A 200-file cohort there is ~20 min of parser I/O on a shared host,
+# which golden rule #3 forbids. The limit is a choice, not a measurement: 5 files keeps the
+# login-node work to about half a minute. The login-node test is run_search.py's own
+# (sbatch present, not inside a SLURM job), so the two refuse on the same hosts. No
+# scheduler => no refusal: a laptop is not a shared login node, and gets progress lines
+# instead. No parser => no refusal either: each .raw fails at once with the not-found
+# warning, and a detour through srun would only delay that message. The same for a parser
+# that cannot start (trfp_launch: its .NET is missing) -- a Core member's 15 .raw went through two
+# srun jobs to learn what a directory check on the login node already knew.
+# ---------------------------------------------------------------------------
+LOGIN_NODE_MAX_RAW = 5
+RAW_SECONDS_EACH = 7            # upper end of the per-file measurement above
+ALLOW_LOGIN_NODE = "--allow-login-node"
+CHECK_READER = "--check-reader"
+# Per-file stderr line for a parser that cannot start: the full reason is printed ONCE, up
+# front, and is each file's `reason` and `warnings` entry in the JSON.
+CANNOT_START_SEE_ABOVE = ("not read -- ThermoRawFileParser cannot start on this machine (the "
+                          "ERROR above says why and how to fix it)")
+
+# ---------------------------------------------------------------------------
+# Orbitrap resolution. estimate_params.py pins DIA-NN's documented Orbitrap tolerances from the
+# MS1/MS2 RESOLUTION; without it an Orbitrap classes as `orbitrap_generic`, DIA-NN calibrates
+# mass accuracy per run, and the 5-step parallel chain declines the cfg (a Core member, 2026-09-23,
+# 15 Fusion Lumos .raw). ThermoRawFileParser never outputs it (TRFP master cf548e4: nothing in
+# metadata, mzML, MGF or `query`; its "mass resolution" MS:1000011 is a generic 0.5), but every
+# scan's trailer has it -- 'Orbitrap Resolution:' on a Fusion Lumos, 'FT Resolution:' on an
+# Exploris 480. thermo_resolution.py reads it with the RawFileReader DLLs TRFP ships, through
+# pythonnet, in ONE subprocess for all files (a CoreCLR load or crash cannot take this script
+# down). Measured on HIVE (a test job): three Lumos DIA runs 60000/15000, an Exploris 480 DIA
+# run 120000/15000 and a DDA run 60000/15000 -- 5 files in 18 s including the runtime start.
+# Read only for `orbitrap_generic`: an Astral's documented tolerances do not use it.
+# A file it cannot read stays in `orbitrap_resolution_unknown`, and the user is asked. Not a
+# per-file `warning`: those mean "this read is suspect" and set needs_confirmation, and a clean
+# read of acquisition and range stands whether or not the resolution came with it.
+# ---------------------------------------------------------------------------
+RES_READER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thermo_resolution.py")
+RAWFILEREADER_DIR_ENV = "THERMO_RAWFILEREADER_DIR"     # a folder holding the two DLLs below
+RAWFILEREADER_DLLS = ("ThermoFisher.CommonCore.RawFileReader.dll",
+                      "ThermoFisher.CommonCore.Data.dll")
+# The interpreter that runs the reader: must have pythonnet. Unset = this one if it does, else
+# the pipeline env's python (setup.sh installs pythonnet there). The tests point it at a
+# `python -S` wrapper so the machine's own pythonnet cannot change the answer.
+RES_PYTHON_ENV = "THERMO_RESOLUTION_PYTHON"
+# The RawFileReader DLLs target .NETCoreApp 8.0, and a SELF-CONTAINED parser's bundled runtime
+# cannot host pythonnet (hostfxr: "Initialization for self-contained components is not
+# supported", in that test job) -- so a separate root with Microsoft.NETCore.App 8+ is needed.
+RES_DOTNET_NEEDS = [("Microsoft.NETCore.App", (8, 0, 0), True)]
+# Batches, each with its own timeout: one timeout for a whole cohort let a stall inside a .NET
+# call (where the reader's own walk budget is never checked) block for 120 + 90 s x N -- ~5 h
+# for 200 files -- and then lose every answer. A hang now costs its batch; two batches in a row
+# that hang (a stalled mount, not one bad file) stop the rest, which say so.
+RES_BATCH = 10
+RES_TIMEOUT_BASE_S = 60       # starting .NET: ~3 s measured (two test jobs on HIVE)
+RES_TIMEOUT_EACH_S = 30       # per file: ~3 s measured; the reader's own walk stops at 20 s
+RES_HUNG_BATCHES_STOP = 2
+RESOLUTION_ASK = (
+    "ASK the user for the Orbitrap resolution of the levels `levels` names for each of these "
+    "runs (it is in the instrument method, e.g. 120,000 MS1 / 30,000 MS2) and pass it to "
+    "estimate_params.py as --ms1-resolution/--ms2-resolution: the scan trailer could not be "
+    "read for them (`reasons`; `read_in_other_files` is what the rest of the cohort read). An "
+    "ion-trap MS2 is never asked for (see ms2_ion_trap). Without it estimate_params.py "
+    "classes the instrument orbitrap_generic: no documented DIA-NN mass tolerance, so DIA-NN "
+    "calibrates mass accuracy per run (results then depend on file order) and the 5-step "
+    "parallel chain declines the cfg -- a large cohort runs as one single-node search. This "
+    "does not set needs_confirmation; everything else above stands.")
+MS2_ION_TRAP_NOTE = (
+    "MS2 is read in the ion trap (ITMS) in these runs: only the MS1 Orbitrap resolution "
+    "applies. There is no MS2 Orbitrap resolution to ask the user for, and the MS2 mass "
+    "tolerance cannot come from DIA-NN's Orbitrap resolution table -- do not pass "
+    "--ms2-resolution for them. Pass --ms1-resolution <MS1> --ms2-analyzer ITMS "
+    "--resolution-source detected to resolve_defaults.py / estimate_params.py instead: Sage "
+    "then uses its documented low-res fragment window (+/-0.4 Da), and DIA-NN leaves both "
+    "mass-accuracy levels to its own calibration (the 5-step chain declines that). A cohort "
+    "mixing ion-trap and Orbitrap MS2 runs needs separate searches.")
+# A Tribrid decision-tree method (HCD-OT for high charge states, CID-IT for 2+) reads MS2 in
+# BOTH analyzers inside one run. Called FTMS, Sage would match the ion-trap spectra at +/-10 ppm
+# and lose them without a word; the ion-trap setting's window is the one that holds both.
+MS2_MIXED_NOTE = (
+    "MS2 is MIXED within these runs: some MS2 scans were read in the Orbitrap and some in the "
+    "ion trap (a decision-tree or dual-analyzer method; each file's resolution_note gives the "
+    "counts). One Orbitrap MS2 tolerance would lose the ion-trap spectra, so CONFIRM the method "
+    "with the user, then pass --ms1-resolution <MS1> --ms2-analyzer mixed --resolution-source "
+    "detected and no --ms2-resolution: Sage's +/-0.4 Da ion-trap window also covers the "
+    "Orbitrap fragments, and DIA-NN leaves mass accuracy to its own calibration.")
+
+
+def _needs_resolution(r):
+    return (r.get("vendor") == "Thermo" and bool(r.get("instrument"))
+            and classify_instrument(r["instrument"])[0] == "orbitrap_generic")
+
+
+_RES_PYTHON = []
+
+def resolution_python():
+    """The interpreter to run thermo_resolution.py with, or None (no pythonnet anywhere)."""
+    if RES_PYTHON_ENV in os.environ:
+        return os.environ[RES_PYTHON_ENV] or None
+    if not _RES_PYTHON:
+        import importlib.util
+        found = sys.executable if importlib.util.find_spec("pythonnet") else None
+        env_bin = None if found else _pipeline_env_bin()
+        cand = os.path.join(env_bin, "python") if env_bin else None
+        if cand and _is_exe(cand) and os.path.realpath(cand) != os.path.realpath(sys.executable):
+            try:
+                ok = subprocess.run([cand, "-c", "import importlib.util, sys; sys.exit("
+                                     "importlib.util.find_spec('pythonnet') is None)"],
+                                    capture_output=True, timeout=60).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+            found = cand if ok else None
+        _RES_PYTHON.append(found)
+    return _RES_PYTHON[0]
+
+
+def rawfilereader_dir(cmd):
+    """(folder with the RawFileReader DLLs, None) or (None, why): $THERMO_RAWFILEREADER_DIR,
+    else the folder ThermoRawFileParser runs from (every release ships the DLLs beside it --
+    the Core's copy and bioconda's bin/ alike)."""
+    cands = []
+    if os.environ.get(RAWFILEREADER_DIR_ENV):
+        cands.append(os.environ[RAWFILEREADER_DIR_ENV])
+    if cmd:
+        app = next((a for a in cmd[1:] if a.lower().endswith((".dll", ".exe"))), None)
+        cands.append(os.path.dirname(os.path.realpath(
+            app or shutil.which(cmd[0]) or cmd[0])))
+    for d in cands:
+        if all(os.path.isfile(os.path.join(d, n)) for n in RAWFILEREADER_DLLS):
+            return d, None
+    return None, (f"no {' + '.join(RAWFILEREADER_DLLS)} in "
+                  f"{' or '.join(cands) or '(nowhere to look)'}; set ${RAWFILEREADER_DIR_ENV} "
+                  f"to a folder that has them (every ThermoRawFileParser release ships them "
+                  f"beside its executable)")
+
+
+def resolution_dotnet_root(launch):
+    """(root, None) or (None, why): the parser's own root when it has one, else the first
+    candidate with Microsoft.NETCore.App 8+."""
+    if launch and launch.get("dotnet_root"):
+        return launch["dotnet_root"], None
+    tried = []
+    for where, root in dotnet_root_candidates():
+        lacks = dotnet_root_lacks(root, RES_DOTNET_NEEDS)
+        if not lacks:
+            return root, None
+        tried.append(f"{root} ({where}): {', '.join(lacks)}")
+    return None, (f"no .NET with Microsoft.NETCore.App 8+ for pythonnet to run the RawFileReader "
+                  f"DLLs on ({'; '.join(tried) or 'none found'}); a self-contained "
+                  f"ThermoRawFileParser's bundled runtime cannot host it. {_dotnet_fix()}")
+
+
+def _null_resolution(path, note):
+    return {"file": path, "ms1_resolution": None, "ms2_resolution": None,
+            "ms2_analyzer": None, "reader": None, "note": note}
+
+
+def _read_batch(py, dll_dir, root, paths):
+    """(answers by path, failure or None, timed out) for one reader subprocess."""
+    timeout = RES_TIMEOUT_BASE_S + RES_TIMEOUT_EACH_S * len(paths)
+    failure, stdout, hung = None, "", False
+    try:
+        p = subprocess.run([py, RES_READER, "--dll-dir", dll_dir, *paths], capture_output=True,
+                           text=True, errors="replace", timeout=timeout, env=_child_env(root))
+        stdout = p.stdout
+        if p.returncode not in (0, 1):
+            tail = [ln.strip() for ln in (p.stderr or "").splitlines() if ln.strip()][-1:]
+            failure = f"the reader exited {p.returncode}" + (f": {tail[0][:300]}" if tail else "")
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or ""
+        stdout = out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+        failure, hung = f"the reader gave no answer within {timeout} s", True
+    except OSError as e:
+        failure = f"could not run {py} {RES_READER}: {e}"
+    got = {}
+    for line in stdout.splitlines():        # lines already answered survive a hang or a crash
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("file") in paths:
+            got[rec["file"]] = rec
+    return got, failure, hung
+
+
+def read_resolutions(paths, launch):
+    """{path: thermo_resolution.py's object}, RES_BATCH files per subprocess. Never raises:
+    whatever stops a read becomes the `note` of the files it cost."""
+    py = resolution_python()
+    if not py:
+        return {p: _null_resolution(p, PYTHONNET_MISSING) for p in paths}
+    dll_dir, why = rawfilereader_dir(launch["cmd"] if launch else None)
+    if dll_dir:
+        root, why = resolution_dotnet_root(launch)
+    if why:
+        return {p: _null_resolution(p, why) for p in paths}
+    got, hung_in_a_row = {}, 0
+    for i in range(0, len(paths), RES_BATCH):
+        batch = paths[i:i + RES_BATCH]
+        if hung_in_a_row >= RES_HUNG_BATCHES_STOP:
+            for p in batch:
+                got[p] = _null_resolution(p, (
+                    f"not attempted: the reader hung on {hung_in_a_row} batches in a row "
+                    f"(slow or stalled storage?)"))
+            continue
+        answers, failure, hung = _read_batch(py, dll_dir, root, batch)
+        hung_in_a_row = hung_in_a_row + 1 if hung else 0
+        for p in batch:
+            got[p] = answers.get(p) or _null_resolution(
+                p, f"{failure or 'the reader did not answer'} for this file")
+    return got
+
+
+def add_resolutions(results, launch):
+    """Fill each Thermo record's ms1_resolution / ms2_resolution / resolution_note, in place."""
+    targets = []
+    for r in results:
+        if r.get("vendor") != "Thermo":
+            continue
+        if _needs_resolution(r):
+            targets.append(r)
+        elif not r.get("instrument"):
+            r["resolution_note"] = "not read: the instrument is unknown"
+        else:
+            cls = classify_instrument(r["instrument"])[0]
+            ppm = DIANN_INSTRUMENT_PPM.get(cls)
+            r["resolution_note"] = (f"not read: {r['instrument']} is {cls}"
+                                    + (f", whose documented DIA-NN tolerances (MS1 {ppm[0]} / "
+                                       f"MS2 {ppm[1]} ppm) do not use it" if ppm else ""))
+    if not targets:
+        return
+    got = read_resolutions([r["file"] for r in targets], launch)
+    for r in targets:
+        rec = got[r["file"]]
+        r["ms1_resolution"] = rec.get("ms1_resolution")
+        r["ms2_resolution"] = rec.get("ms2_resolution")
+        r["ms2_analyzer"] = rec.get("ms2_analyzer")
+        parts = []
+        if r["ms1_resolution"] or r["ms2_resolution"]:
+            parts.append(f"read from the scan trailer (MS1 {rec.get('ms1_key')} scan "
+                         f"{rec.get('ms1_scan')}, MS2 {rec.get('ms2_key')} scan "
+                         f"{rec.get('ms2_scan')}) by {rec.get('reader')}")
+        if rec.get("note"):
+            parts.append(rec["note"])
+        r["resolution_note"] = "; ".join(parts) or None
+
+
+def resolution_failed(results, why):
+    """resolution_summary()'s shape when reading failed outright: every Orbitrap file unknown,
+    with `why` as its reason. Nothing in here may raise."""
+    orbi = []
+    for r in results:
+        try:
+            is_orbi = _needs_resolution(r)
+        except Exception:
+            is_orbi = r.get("vendor") == "Thermo"
+        if is_orbi:
+            r.update(ms1_resolution=None, ms2_resolution=None, ms2_analyzer=None,
+                     resolution_note=why)
+            orbi.append(r)
+    return {"ms1_resolution": None, "ms2_resolution": None, "resolution_mixed": [],
+            "ms2_ion_trap": None,
+            "orbitrap_resolution_unknown": {
+                "files": [r["file"] for r in orbi],
+                "levels": {r["file"]: ["MS1", "MS2"] for r in orbi},
+                "instruments": sorted({str(r.get("instrument")) for r in orbi}),
+                "reasons": [why], "read_in_other_files": [], "ask": RESOLUTION_ASK}
+            if orbi else None}
+
+
+IT_MS2 = ("ITMS", "mixed")     # ms2_analyzer values with ion-trap MS2 in them
+
+
+def _ms2_value(r):
+    """MS2 as methods are compared: the resolution, or "ITMS"/"mixed" when the ion trap read
+    any of it."""
+    return r["ms2_analyzer"] if r.get("ms2_analyzer") in IT_MS2 else r.get("ms2_resolution")
+
+
+def _asked_levels(r):
+    """The levels the user must be asked for: an ion-trap MS2 has no Orbitrap resolution."""
+    return ([] if r.get("ms1_resolution") else ["MS1"]) + (
+        [] if r.get("ms2_resolution") or r.get("ms2_analyzer") in IT_MS2 else ["MS2"])
+
+
+def resolution_summary(results):
+    """The cohort's top-level resolution fields (see main())."""
+    orbi = [r for r in results if _needs_resolution(r)]
+    top = {"ms1_resolution": None, "ms2_resolution": None, "resolution_mixed": [],
+           "ms2_ion_trap": None, "orbitrap_resolution_unknown": None}
+    if not orbi:
+        return top
+    level_value = {"ms1_resolution": lambda r: r.get("ms1_resolution"),
+                   "ms2_resolution": _ms2_value}
+    for lvl, value in level_value.items():
+        vals = {value(r) for r in orbi}
+        if len(vals) == 1 and not vals & {None, *IT_MS2}:     # every Orbitrap file, one value
+            top[lvl] = vals.pop()
+    if any(len({value(r) for r in orbi} - {None}) > 1 for value in level_value.values()):
+        # Two methods in one cohort: one tolerance would be wrong for part of it. Say which
+        # files read what -- never pick one.
+        groups = {}
+        for r in orbi:
+            groups.setdefault((r.get("ms1_resolution"), r.get("ms2_resolution"),
+                               r.get("ms2_analyzer")), []).append(r["file"])
+        top["resolution_mixed"] = [
+            {"ms1_resolution": a, "ms2_resolution": b, "ms2_analyzer": c, "files": f}
+            for (a, b, c), f in sorted(groups.items(), key=lambda g: str(g[0]))]
+    itms = [r for r in orbi if r.get("ms2_analyzer") in IT_MS2]
+    if itms:
+        ms1 = {r.get("ms1_resolution") for r in itms}
+        mixed = [r["file"] for r in itms if r["ms2_analyzer"] == "mixed"]
+        top["ms2_ion_trap"] = {"files": [r["file"] for r in itms],
+                               "ms2_analyzer": {r["file"]: r["ms2_analyzer"] for r in itms},
+                               "ms1_resolution": ms1.pop() if len(ms1) == 1 else None,
+                               "note": MS2_ION_TRAP_NOTE,
+                               "mixed_files": mixed,
+                               "mixed_note": MS2_MIXED_NOTE if mixed else None}
+    unknown = [r for r in orbi if _asked_levels(r)]
+    if unknown:
+        top["orbitrap_resolution_unknown"] = {
+            "files": [r["file"] for r in unknown],
+            "levels": {r["file"]: _asked_levels(r) for r in unknown},
+            "instruments": sorted({r["instrument"] for r in unknown}),
+            "reasons": sorted({r["resolution_note"] for r in unknown if r.get("resolution_note")}),
+            "read_in_other_files": sorted({(r["ms1_resolution"], r["ms2_resolution"])
+                                           for r in orbi if not _asked_levels(r)
+                                           and r.get("ms2_analyzer") not in IT_MS2}),
+            "ask": RESOLUTION_ASK}
+    return top
+
+
+def is_thermo_raw(path):
+    p = path.rstrip("/")
+    return p.lower().endswith(".raw") and not os.path.isdir(p)     # a .raw FOLDER is Waters
+
+
+def on_cluster_login_node():
+    """sbatch present + no SLURM_JOB_ID == a submit host, not a compute node (on_compute.py's
+    definition; this copy only for a partial scripts/ without it)."""
+    try:
+        import on_compute
+    except ImportError:
+        return shutil.which("sbatch") is not None and not os.environ.get("SLURM_JOB_ID")
+    return on_compute.on_login_node()
+
+
+def login_node_refusal(n_raw):
+    secs = n_raw * RAW_SECONDS_EACH
+    est = f"{secs} s" if secs < 120 else f"{math.ceil(secs / 60)} min"
+    minutes = max(10, math.ceil(2 * secs / 60))
+    return (
+        f"REFUSING to read {n_raw} Thermo .raw files on what looks like a cluster login/submit "
+        f"node (sbatch is on PATH and SLURM_JOB_ID is unset).\n"
+        f"  Each .raw is two ThermoRawFileParser processes reading the raw -- measured ~1 core, "
+        f"~350 MB and 3-7 s per file -- so up to ~{est} of I/O here, on a shared host "
+        f"(SKILL.md golden rule #3).\n"
+        f"  Run it on a compute node instead -- one blocking srun with the queue spelled out "
+        f"(on_compute.py):\n"
+        f"    python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'on_compute.py')} "
+        f"--time {minutes} --mem 2G --preemptible -- python3 {os.path.abspath(__file__)} "
+        f"<the same files>\n"
+        f"{_srun_shown(minutes)}"
+        f"  or re-run with {ALLOW_LOGIN_NODE} to read them here anyway "
+        f"({LOGIN_NODE_MAX_RAW} or fewer need no flag).")
+
+
+def _srun_shown(minutes):
+    """The srun line on_compute.py would run, for the refusal; nothing when it cannot be built."""
+    try:
+        import on_compute
+        line = on_compute.srun_argv(["python3", os.path.abspath(__file__), "<the same files>"],
+                                    minutes=minutes, mem="2G", preemptible_ok=True)
+        return f"  which is: {on_compute.shown(line)}\n"
+    except Exception:
+        return ("  (or srun --cpus-per-task=1 --mem=2G with the --account/--partition/--qos your "
+                "cluster requires: `sacctmgr show assoc user=$USER` lists yours)\n")
+
+
+def dashed_warning(rec):
+    """The warning for an input whose file name holds '--' (check_report_runs.dashed_file_names)."""
+    return (f"its file name holds '--', which DIA-NN reads as the start of an option (quoted or "
+            f"not), so DIA-NN -- and FragPipe's DIA-NN step -- cannot search it under its own "
+            f"name: run_search.py {RENAME_DASHED_FLAG} searches it as "
+            f"'{rec['renamed_run_name']}' (Sage is not affected). Decide it now with the user or "
+            f"Core staff, build conditions.csv with that name (collect_conditions.py "
+            f"{RENAME_DASHED_FLAG}), and pass {RENAME_DASHED_FLAG} to run_search.py at step 7")
+
+
+def main(argv):
+    usage = (f"usage: detect_acquisition.py [{ALLOW_LOGIN_NODE}] FILE [FILE ...]\n"
+             f"       detect_acquisition.py {CHECK_READER}")
+    if argv == [CHECK_READER]:
+        # setup.sh's readiness report: which parser, and does it start. Exit 0 = ready.
+        st = reader_status()
+        print(json.dumps(st))
+        sys.exit(0 if st["ready"] else 1)
+    allow_login_node = ALLOW_LOGIN_NODE in argv
+    argv = [a for a in argv if a != ALLOW_LOGIN_NODE]
+    if not argv:
+        print(usage, file=sys.stderr)
+        sys.exit(2)
+    # Anything dash-led that is not that one flag used to fall through to the glob, match
+    # nothing, and enter files[] as itself: `--allow_login_node` and `--allow-login-node=1`
+    # came back as an "unrecognized extension" file, which turned `overall` into "mixed" and
+    # asked the user to confirm a phantom input -- while the login-node guard they were
+    # trying to lift stayed on. A typo must not look like another input file.
+    unknown = [a for a in argv if a.startswith("-")]
+    if unknown:
+        print(f"detect_acquisition.py: unknown option(s): {' '.join(unknown)} "
+              f"(the only option with files is {ALLOW_LOGIN_NODE}; {CHECK_READER} goes alone; "
+              f"a file whose name starts with '-' can be passed as ./{unknown[0]})",
+              file=sys.stderr)
+        print(usage, file=sys.stderr)
+        sys.exit(2)
+    files = []
+    for a in argv:
+        files.extend(sorted(glob.glob(a)) or [a])
+    n_raw = sum(1 for f in files if is_thermo_raw(f))
+    # Can the parser start here at all? The directory check first -- it starts nothing, so it
+    # may run before the login-node refusal -- then, if the refusal lets us through, one
+    # `--version`. Either failure is the same message for every .raw: say it ONCE, now.
+    cmd = find_trfp() if n_raw else None
+    launch = trfp_launch(cmd) if cmd else None
+    cannot_start = launch["problem"] if launch else None
+    # Refuse BEFORE reading anything: a refusal after the first 100 files is no refusal.
+    if (n_raw > LOGIN_NODE_MAX_RAW and on_cluster_login_node() and not allow_login_node
+            and cmd and not cannot_start):
+        sys.exit(login_node_refusal(n_raw))
+    if launch and not cannot_start:
+        cannot_start = trfp_start(launch)[1]
+    if cannot_start:
+        print(f"[detect_acquisition] ERROR: {cannot_start}", file=sys.stderr, flush=True)
+    results, k = [], 0
+    for f in files:
+        if not is_thermo_raw(f):
+            results.append(classify(f))
+            continue
+        k += 1
+        t0 = time.monotonic()
+        results.append(classify(f))
+        # Seconds per file, as it happens: minutes of parser work in silence looks like a hang.
+        print(f"[detect_acquisition] Thermo .raw {k}/{n_raw} "
+              f"{'skipped' if cannot_start else 'read'} in "
+              f"{time.monotonic() - t0:.1f} s: {f}", file=sys.stderr, flush=True)
+    # stdout is JSON for the caller; problems also go to stderr, where a person sees them
+    # even when a script only keeps the JSON.
+    # Resolution for the Orbitrap files, in batches, after every file has its instrument. It is
+    # an extra: whatever goes wrong in it (an unreadable .NET root raised PermissionError here and
+    # took the JSON with it) becomes a reason on the Orbitrap files, never a failed detection.
+    try:
+        if not cannot_start:
+            add_resolutions(results, launch)
+        res = resolution_summary(results)
+    except Exception as e:
+        res = resolution_failed(results, f"the resolution reader failed ({type(e).__name__}: "
+                                         f"{e}), so it was not read")
+    # A '--' in a file name, said now, at step 2: the run is searched under another name, and
+    # conditions.csv (step 3) has to carry that name, not the one on disk.
+    dashed_runs = dashed_file_names([r["file"] for r in results])
+    by_file = {d["file"]: d for d in dashed_runs}
+    for r in results:
+        if r["file"] in by_file:
+            r.setdefault("warnings", []).append(dashed_warning(by_file[r["file"]]))
+    for r in results:
+        for w in r.get("warnings") or []:
+            w = CANNOT_START_SEE_ABOVE if cannot_start and w == cannot_start else w
+            print(f"[detect_acquisition] WARNING: {r['file']}: {w}", file=sys.stderr)
+    kinds = {r["acquisition"] for r in results}
+    overall = (next(iter(kinds)) if len(kinds) == 1 else "mixed")
+    low_conf = [r["file"] for r in results if r["confidence"] != "high"]
+    instruments = sorted({r["instrument"] for r in results if r.get("instrument")})
+    # one instrument string for the matcher: unambiguous only if all files agree
+    instrument = instruments[0] if len(instruments) == 1 else ""
+    # Union the per-file acquired ranges: search everything any run acquired.
+    # A narrower intersection would silently drop data from the wider methods,
+    # which is the failure this whole field exists to prevent.
+    ranges = [r["precursor_mz_range"] for r in results if r.get("precursor_mz_range")]
+    mz_range = [min(x[0] for x in ranges), max(x[1] for x in ranges)] if ranges else None
+    mixed_ranges = len({tuple(x) for x in ranges}) > 1
+    range_sources = sorted({r["precursor_mz_range_source"] for r in results
+                            if r.get("precursor_mz_range_source")})
+    print(json.dumps({
+        "overall": overall,
+        "instrument": instrument,
+        "instruments_seen": instruments,
+        # Feed straight to estimate_params.py --precursor-mz-range LO HI.
+        "precursor_mz_range": mz_range,
+        "precursor_mz_range_mixed": mixed_ranges,
+        # isolation_windows (DIA) / ms1_survey_scan (DDA); "mixed" when the files differ
+        "precursor_mz_range_source": (range_sources[0] if len(range_sources) == 1 else
+                                      "mixed" if range_sources else None),
+        "precursor_mz_range_files_without": [
+            r["file"] for r in results if not r.get("precursor_mz_range")],
+        # a note, not a warning (it does not set needs_confirmation): DDA files with no survey
+        # range, which a DIA-NN search needs and a Sage search does not
+        "dda_range_note": ({"files": [r["file"] for r in results if r["acquisition"] == "DDA"
+                                      and not r.get("precursor_mz_range")], "note": DDA_NO_RANGE}
+                           if any(r["acquisition"] == "DDA" and not r.get("precursor_mz_range")
+                                  for r in results) else None),
+        # Feed straight to resolve_defaults.py / estimate_params.py as --ms1-resolution /
+        # --ms2-resolution WITH --resolution-source detected (so the manifest says the numbers
+        # came from the raw file): set when every Orbitrap .raw read the same value from its
+        # scan trailer, else null.
+        "ms1_resolution": res["ms1_resolution"],
+        "ms2_resolution": res["ms2_resolution"],
+        # [] or, when the Orbitrap files disagree, who read what -- one tolerance would be wrong
+        # for part of the cohort, so it sets needs_confirmation
+        "resolution_mixed": res["resolution_mixed"],
+        # null, or the Orbitrap files whose MS2 is ion trap -- only MS1 applies -- or MIXED
+        # Orbitrap + ion trap (mixed_files: the user confirms the method; see MS2_MIXED_NOTE)
+        "ms2_ion_trap": res["ms2_ion_trap"],
+        "needs_confirmation": (bool(low_conf) or overall in ("mixed", "unknown")
+                               or len(instruments) > 1
+                               or any(r.get("warnings") for r in results)
+                               or bool(res["resolution_mixed"])
+                               or bool((res["ms2_ion_trap"] or {}).get("mixed_files"))),
+        "low_confidence_files": low_conf,
+        # null, or the Orbitrap files whose resolution could not be read: ASK the user before
+        # step 6b (see RESOLUTION_ASK) -- an instruction, not a problem with the read
+        "orbitrap_resolution_unknown": res["orbitrap_resolution_unknown"],
+        # [{file, run_name, renamed_run_name}]: inputs whose FILE NAME holds '--', which DIA-NN
+        # can search only under renamed_run_name (run_search.py --rename-dashed-runs); each also
+        # has a warning in files[]. Build conditions.csv with these names (step 3).
+        "dashed_run_names": dashed_runs,
+        # No top-level list of problem files: files[].warnings is the one place a problem is
+        # reported, whichever reader found it (a vendor-specific list reads "nothing wrong"
+        # whenever the problem is another vendor's). tdf status: files[].tdf_integrity.
+        "files": results,
+    }, indent=2))
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

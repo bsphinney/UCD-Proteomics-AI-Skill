@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""
+checkpoint.py -- crash/disconnect recovery for cluster runs.
+
+A search is submitted to SLURM and then takes hours. The jobs survive the user
+closing their laptop; the *conversation* does not. This records what was
+submitted and what still has to happen, so a fresh session can pick the run back
+up instead of starting over or, worse, silently re-running a finished search.
+
+Writes two files in the session directory:
+  RECOVERY.md    human-readable: what stage, which jobs, what to do next
+  .recovery.json machine-readable: the same, for `status` to re-query
+
+Usage
+  # after submitting jobs
+  checkpoint.py record --session <dir> --stage search \
+      --jobs 9900009,9900010 --desc "DIA-NN 5-step chain" \
+      --watch-job 9900011 --watch-log <path> \
+      --next "Rscript run_de.R --input <report> --metadata <conditions> --outdir <tables>"
+
+  # on reconnect — queries SLURM live and says what is left
+  checkpoint.py status --session <dir>
+
+  # find interrupted runs under a directory: a project folder, never a whole share. It walks
+  # at most --max-depth (default 6) folders down, looks 2 levels into a folder linked in from
+  # outside it, skips a search's per-run, temp and hidden folders and Bruker .d runs, and on a
+  # cluster login node runs itself on a compute node (on_compute.py)
+  checkpoint.py find --base <project dir> [--max-depth N]
+"""
+import argparse, json, os, re, subprocess, sys, glob, datetime
+
+REC_JSON = ".recovery.json"
+REC_MD = "RECOVERY.md"
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# What a Slurm state means: slurm_states.py, the skill's one list (watch_run.sh reads the same)
+from slurm_states import OK_STATES as TERMINAL_OK, BAD_STATES as TERMINAL_BAD  # noqa: E402
+
+
+def _load(session):
+    p = os.path.join(session, REC_JSON)
+    if not os.path.exists(p):
+        return None
+    with open(p) as fh:
+        return json.load(fh)
+
+
+def _save(session, data):
+    with open(os.path.join(session, REC_JSON), "w") as fh:
+        json.dump(data, fh, indent=2)
+    _write_md(session, data)
+
+
+def sacct_states(job_ids):
+    """Map job id -> state. Tolerates sacct being absent (returns UNKNOWN)."""
+    if not job_ids:
+        return {}
+    try:
+        out = subprocess.run(
+            ["sacct", "-j", ",".join(str(j) for j in job_ids), "-n", "-P",
+             "--format=JobID,State"],
+            capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return {str(j): "UNKNOWN" for j in job_ids}
+    states = {}
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        jid, st = line.split("|")[:2]
+        if "." in jid:                      # skip .batch / .extern steps
+            continue
+        base = jid.split("_")[0]
+        st = st.split()[0]
+        # for an array, roll the tasks up: bad beats running beats completed
+        prev = states.get(base)
+        if prev is None:
+            states[base] = st
+        elif prev in TERMINAL_OK and st not in TERMINAL_OK:
+            states[base] = st
+        elif st in TERMINAL_BAD:
+            states[base] = st
+    return states
+
+
+def _rollup(states):
+    vals = list(states.values())
+    if not vals:
+        return "UNKNOWN"
+    if any(v in TERMINAL_BAD for v in vals):
+        return "FAILED"
+    if any(v not in TERMINAL_OK for v in vals):
+        return "RUNNING"
+    return "COMPLETED"
+
+
+def _write_md(session, data):
+    L = []
+    L.append("# Recovery — how to pick this analysis back up\n")
+    L.append("You can close your terminal. **Cluster jobs keep running without you.**")
+    L.append("When you come back, start Claude Code again in this folder and say:\n")
+    L.append("> *resume this analysis*\n")
+    L.append("Claude will read this file, check the jobs, and carry on from wherever it got to.")
+    L.append("To check by hand instead:\n")
+    L.append("```\npython3 checkpoint.py status --session %s\n```\n" % session)
+    L.append("| field | value |")
+    L.append("|---|---|")
+    L.append("| session | `%s` |" % session)
+    L.append("| last updated | %s |" % data.get("updated", "?"))
+    if data.get("report"):
+        L.append("| expected search output | `%s` |" % data["report"])
+    L.append("")
+    L.append("## Stages\n")
+    L.append("| stage | jobs | recorded state | description |")
+    L.append("|---|---|---|---|")
+    for s in data.get("stages", []):
+        L.append("| %s | %s | %s | %s |" % (
+            s["stage"], ", ".join(str(j) for j in s.get("jobs", [])) or "—",
+            s.get("state", "submitted"), s.get("desc", "")))
+    L.append("")
+    nxt = [s for s in data.get("stages", []) if s.get("next")]
+    if nxt:
+        L.append("## What still has to happen\n")
+        L.append("Once the jobs above show COMPLETED, run:\n")
+        L.append("```bash")
+        for s in nxt:
+            L.append(s["next"])
+        L.append("```")
+    L.append("")
+    L.append("## If a job failed or hung\n")
+    L.append("- A task still RUNNING while its siblings finished long ago is **hung**, not slow.")
+    L.append("  Cancel just that one (`scancel <jobid>_<task>`) and resubmit that array index.")
+    L.append("- The 5-step chain resumes from the earliest incomplete step; finished `.quant`")
+    L.append("  files and the predicted library are reused, so you never redo the whole cohort.")
+    L.append("- If one file hangs twice, drop it and continue with the rest — note it in the report.")
+    with open(os.path.join(session, REC_MD), "w") as fh:
+        fh.write("\n".join(L) + "\n")
+
+
+def cmd_record(a):
+    os.makedirs(a.session, exist_ok=True)
+    data = _load(a.session) or {"session": a.session, "stages": []}
+    jobs = [j for j in (a.jobs or "").split(",") if j]
+    entry = {"stage": a.stage, "jobs": jobs, "desc": a.desc or "",
+             "state": "submitted", "next": a.next,
+             "watch_job": a.watch_job, "watch_log": a.watch_log}
+    data["stages"] = [s for s in data["stages"] if s["stage"] != a.stage] + [entry]
+    if a.report:
+        data["report"] = a.report
+    data["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+    _save(a.session, data)
+    print(json.dumps({"recorded": a.stage, "jobs": jobs,
+                      "recovery_md": os.path.join(a.session, REC_MD)}, indent=2))
+
+
+def cmd_status(a):
+    # The transcript hook: --resume says this conversation now works on this analysis. Without
+    # it, a status query is a peek -- it records only a conversation that runs no analysis yet,
+    # and never moves one that runs another (save_transcript.remember).
+    # Whether it was recorded is in the JSON (`transcript`), as for session.py init: a refusal
+    # (subagents at work, no or an unmatched --call-id) must reach the agent.
+    try:
+        import save_transcript
+        transcript = save_transcript.remember_result(*save_transcript.remember(
+            a.session, switch=a.resume, call_id=getattr(a, "call_id", None)))
+    except Exception as e:      # never a reason to fail a status query
+        transcript = {"recorded": False, "reason": f"{type(e).__name__}: {e}"}
+    data = _load(a.session)
+    if not data:
+        print(json.dumps({"error": "no %s in %s" % (REC_JSON, a.session)}))
+        sys.exit(1)
+    all_jobs = [j for s in data["stages"] for j in s.get("jobs", [])]
+    states = sacct_states(all_jobs)
+    out = {"session": a.session, "stages": [], "done": True, "any_failed": False}
+    for s in data["stages"]:
+        st = _rollup({j: states.get(j, "UNKNOWN") for j in s.get("jobs", [])}) \
+             if s.get("jobs") else s.get("state", "submitted")
+        s["state"] = st
+        if st != "COMPLETED":
+            out["done"] = False
+        if st == "FAILED":
+            out["any_failed"] = True
+        out["stages"].append({"stage": s["stage"], "jobs": s.get("jobs", []),
+                              "state": st, "next": s.get("next")})
+    rep = data.get("report")
+    out["report_exists"] = bool(rep and os.path.exists(rep))
+    out["report"] = rep
+    # the search is only really done when the output file exists — SLURM State
+    # alone has lied before (a segfault masked by a trailing echo)
+    if rep and not out["report_exists"]:
+        out["done"] = False
+    # A Sage search can finish with quantities it could not measure (sage_lfq_check.py, beside
+    # its report): said here too, so a resumed session sees it before the DE runs on them.
+    if rep:
+        try:
+            import sage_lfq_check
+            lfq = sage_lfq_check.load(os.path.dirname(os.path.abspath(rep)))
+        except Exception:
+            lfq = None
+        if lfq and lfq.get("status") in ("warn", "unchecked") and lfq.get("message"):
+            out.setdefault("warnings", []).append(f"Sage LFQ: {lfq['message']}")
+        # A DIA-NN search that fell back instead of measuring its scan window / mass accuracy
+        # (probe_fallback.py): said here, where a resumed session looks first.
+        try:
+            import probe_fallback
+            fell_back = probe_fallback.caution_for(os.path.dirname(os.path.abspath(rep)))
+        except Exception as e:                          # noqa: BLE001 -- said, never dropped
+            fell_back = (f"could not check for a probe fallback ({type(e).__name__}: {e}); "
+                         "look for probe_fallback.json beside the report")
+        if fell_back:
+            out.setdefault("warnings", []).append(fell_back)
+        # A --dda search quantified from its first pass, its second pass failed (dda_first_pass)
+        try:
+            import dda_first_pass
+            first_pass = dda_first_pass.caution_for(os.path.dirname(os.path.abspath(rep)))
+        except Exception as e:                          # noqa: BLE001 -- said, never dropped
+            first_pass = (f"could not check whether the search used its first-pass report "
+                          f"({type(e).__name__}: {e}); look for report_used in "
+                          "search_provenance.json beside the report")
+        if first_pass:
+            out.setdefault("warnings", []).append(first_pass)
+    # Core staff: the submission(s) or internal work the analysis is for (session.py init), so a
+    # resume finds its Core Project Board thread without asking again (SKILL.md step 0c). Never
+    # a reason to fail a status query -- but a session.json that exists and cannot be read is
+    # said, not dropped: the resume would lose which submission it is for (2.12 review).
+    try:
+        import session as session_py
+        work, unread = session_py.read_analysis_for(a.session)
+    except Exception as e:                              # noqa: BLE001 -- said, never dropped
+        work, unread = None, None
+        if os.path.exists(os.path.join(a.session, "session.json")):
+            unread = f"session.json could not be checked ({type(e).__name__}: {e})"
+    if work:
+        out["analysis_for"] = work
+    if unread:
+        out.setdefault("warnings", []).append(
+            f"Which CoreOmics submission or Core Project Board thread this analysis is for is "
+            f"NOT KNOWN: {unread}. Do not guess it: ask staff, repair the file by hand (or move "
+            f"it aside), then record the answer again with session.py init ... --submission "
+            f"<PROT number> | --internal \"<its title on the board>\"")
+    data["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+    _save(a.session, data)
+    out["next_commands"] = [s["next"] for s in data["stages"]
+                            if s.get("next") and s["state"] == "COMPLETED"]
+    out["transcript"] = transcript
+    print(json.dumps(out, indent=2))
+
+
+# Folders the pipeline itself fills with thousands of entries and never puts a session in: a
+# search's per-run files (quant, quant_step2/4, *_xic, xic), DIA-NN's temp folders, a Bruker
+# run (*.d), and hidden folders (.cache, a conda root -- the recursive glob this replaced skipped
+# those too). Never a folder by the user's naming (raw/, Quant_study/): session.py init's default
+# session sits beside the raw data, and a resume that cannot find it may resubmit the search.
+_PIPELINE_DIR = re.compile(r"^(quant(_step\d+)?|xic|.*_xic|temp|tmp)$", re.I)
+
+
+def _never_a_session(name):
+    return name.startswith(".") or name.lower().endswith(".d") or bool(_PIPELINE_DIR.match(name))
+
+
+LINK_LEVELS = 2           # how far below a link out of --base is looked: a login node's -maxdepth 2
+
+
+def _under(path, top):
+    return path == top or path.startswith(top.rstrip(os.sep) + os.sep)
+
+
+def _linked_sessions(link, real, seen):
+    """The .recovery.json files in the folder a link out of --base points at, and at most
+    LINK_LEVELS below it, reported under the link's own path. Each real folder once."""
+    if real in seen:
+        return
+    seen.add(real)
+    level = [(link, real)]
+    for depth in range(LINK_LEVELS + 1):
+        nxt = []
+        for shown, actual in level:
+            if os.path.isfile(os.path.join(actual, REC_JSON)):
+                yield os.path.join(shown, REC_JSON)
+            if depth == LINK_LEVELS:
+                continue
+            try:
+                names = sorted(os.listdir(actual))
+            except OSError:
+                continue
+            for n in names:
+                a = os.path.join(actual, n)
+                if not _never_a_session(n) and os.path.isdir(a) and not os.path.islink(a):
+                    nxt.append((os.path.join(shown, n), a))
+        level = nxt
+
+
+def _recovery_files(base, max_depth):
+    """Every .recovery.json at most `max_depth` folders below `base` (base itself is depth 0). A
+    folder that is skipped is still checked for its own .recovery.json. Links: one that stays
+    inside --base is not followed (its folder is walked where it is, so a deep link can hide
+    nothing and nothing loops); one out of --base is looked into LINK_LEVELS deep only (a session
+    folder linked in from elsewhere is found; a link to a whole share is never walked)."""
+    base = os.path.abspath(os.path.expanduser(base))
+    real_base = os.path.realpath(base)
+    top = base.rstrip(os.sep).count(os.sep)
+    seen = set()
+    for root, dirs, files in os.walk(base):              # followlinks=False
+        if REC_JSON in files:
+            yield os.path.join(root, REC_JSON)
+        links = [d for d in dirs if os.path.islink(os.path.join(root, d))]
+        skipped = [d for d in dirs if d not in links and _never_a_session(d)]
+        for d in skipped:
+            if os.path.isfile(os.path.join(root, d, REC_JSON)):
+                yield os.path.join(root, d, REC_JSON)
+        if root.rstrip(os.sep).count(os.sep) - top >= max_depth:
+            dirs[:] = []
+            continue
+        for d in sorted(links):
+            real = os.path.realpath(os.path.join(root, d))
+            if os.path.isdir(real) and not _under(real, real_base) and not _never_a_session(d):
+                yield from _linked_sessions(os.path.join(root, d), real, seen)
+        dirs[:] = sorted(d for d in dirs if d not in skipped and d not in links)
+
+
+def _unique_recovery_files(base, max_depth):
+    """_recovery_files, one per real file: a link out of --base can point back at an ancestor
+    (proj/up -> ..) and reach a session the walk also finds. The shortest path -- the direct
+    one -- is kept."""
+    best = {}
+    for p in _recovery_files(base, max_depth):
+        real = os.path.realpath(p)
+        if real not in best or len(p) < len(best[real]):
+            best[real] = p
+    return sorted(best.values())
+
+
+def cmd_find(a):
+    hits = []
+    for p in _unique_recovery_files(a.base, a.max_depth):
+        try:
+            with open(p) as fh:
+                d = json.load(fh)
+            hits.append({"session": os.path.dirname(p),
+                         "updated": d.get("updated"),
+                         "stages": [s["stage"] for s in d.get("stages", [])]})
+        except Exception:
+            continue
+    hits.sort(key=lambda h: h.get("updated") or "", reverse=True)
+    print(json.dumps({"found": len(hits), "sessions": hits}, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("record", help="record a submitted stage")
+    r.add_argument("--session", required=True)
+    r.add_argument("--stage", required=True)
+    r.add_argument("--jobs", help="comma-separated SLURM job ids")
+    r.add_argument("--desc", default="")
+    r.add_argument("--next", help="command to run once this stage completes")
+    r.add_argument("--report", help="output file that must exist for the stage to count as done")
+    r.add_argument("--watch-job"), r.add_argument("--watch-log")
+    r.set_defaults(func=cmd_record)
+
+    s = sub.add_parser("status", help="re-query SLURM and report what is left")
+    s.add_argument("--session", required=True)
+    s.add_argument("--call-id", metavar="TOKEN",
+                   help="a fresh token (8+ letters and digits) written into this command line, "
+                        "for the transcript hook's record (save_transcript.py): it tells which "
+                        "conversation is running it while subagents are at work")
+    s.add_argument("--resume", action="store_true",
+                   help="this conversation now resumes this analysis (its transcript is saved "
+                        "there); without it, a status query changes nothing")
+    s.set_defaults(func=cmd_status)
+
+    f = sub.add_parser("find", help="find interrupted runs under a directory")
+    f.add_argument("--base", required=True, help="a project folder, never a whole share")
+    f.add_argument("--max-depth", type=int, default=6,
+                   help="how many folders below --base to look (default 6)")
+    f.set_defaults(func=cmd_find)
+
+    a = ap.parse_args()
+    if a.cmd == "find":
+        # a walk: on a cluster login node, run it on a compute node (HPC@UCD's ucd-hpc rules)
+        try:
+            import on_compute
+            on_compute.ensure_compute_node("checkpoint.py find walks " + a.base, minutes=15,
+                                           mem="2G", preemptible_ok=True, script=__file__)
+        except ImportError:
+            pass                          # a partial scripts/ without on_compute.py: as before
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()

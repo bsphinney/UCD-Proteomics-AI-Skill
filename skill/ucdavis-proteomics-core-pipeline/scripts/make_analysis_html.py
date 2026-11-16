@@ -1,0 +1,2250 @@
+#!/usr/bin/env python3
+"""
+make_analysis_html.py -- one self-contained HTML file with the QC panels, the
+figures and the analysis text, openable on any machine with no network.
+
+WHY THIS IS THE DEFAULT DELIVERABLE
+-----------------------------------
+The .docx needs Word and drops you into a document you have to scroll; a folder of
+PNGs needs the reader to already know which panel matters. Most people receiving
+one of these runs open it on a laptop that has never had a proteomics tool
+installed, often after copying the results off a cluster. A single HTML file
+double-clicks open in whatever browser is already there, on Windows, macOS and
+Linux alike -- and because every image is inlined as a data URI there is nothing
+to lose in transit and nothing to fetch at read time.
+
+That last property is the one that matters operationally: ONE file to copy. A
+report that references ./figures/pca.png silently loses every figure the moment
+someone copies just the report, which is exactly what people do.
+
+FIGURES SIT WHERE THE TEXT DISCUSSES THEM
+-----------------------------------------
+Each `![alt](figures/x.png)` in AI_Analysis_Report.md becomes an embedded, numbered
+figure AT THAT POSITION -- the alt text is its title, figures.json's caption (when
+there is one) its caption. The report used to print those references as literal
+Markdown (28 of them on a mouse-brain IP cohort, 2026-09-24) while dumping every image in
+figures/ into galleries at the top, a stale pca_original_labels.png included.
+  * an image the report does not reference is NOT embedded; one warning line names it;
+  * a referenced image that is missing becomes a visible "figure missing: <file>" note
+    (and a warning) -- never raw Markdown;
+  * only paths inside the session are embedded -- no URLs, no ../ escapes;
+  * the galleries appear only when there is no report at all (the quick pre-analysis
+    page), and then list figures.json's figures only.
+The tool's own "Sample quality notes" / "Audit & caveats" sections are left out when
+the report already has that section, so no heading appears twice.
+
+Usage
+  python3 make_analysis_html.py --session <session dir> --out report.html
+  python3 make_analysis_html.py --report AI_Analysis_Report.md --figures ./figures \\
+      --tables ./tables --out report.html [--title "..."] [--quality SAMPLE_QUALITY.md]
+"""
+import argparse, base64, csv, datetime, html, io, json, mimetypes, os, re, sys, urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report_style as rs  # noqa: E402  -- the ONE look shared by the skill's HTML pages
+import html_to_pdf  # noqa: E402  -- the PDF: the same page printed by a headless browser
+import make_podcast       # noqa: E402  -- an optional audio discussion keeps its Listen card
+from client_text import draft_history, draft_history_loose  # noqa: E402  -- the ONE list (podcast too)
+from client_text import peak_check_overclaims, peak_check_overclaims_loose  # noqa: E402  -- "confirmed by Skyline"
+import skyline_peaks      # noqa: E402  -- the peak check's section (step 8f), from its own record
+import audit_results      # noqa: E402  -- the audit's plain words: the client's Audit & caveats
+from session import database_organisms  # noqa: E402  -- the one organism line (every species)
+from session_docs import IP_CONTROL_NAME  # noqa: E402  -- which groups are pull-down controls
+from fetch_fasta import CONTAMINANT_TAGS  # noqa: E402  -- Cont_ and FragPipe's contam_: one definition
+
+# Galleries (no report only): QC first, then overview, then per-contrast results, and the
+# p-value calibration check last, as an appendix.
+APPENDIX = "Appendix: p-value calibration"
+FIGURE_ORDER = [
+    ("qc_detected_vs_inferred", "Quality control"),
+    ("qc_protein_counts", "Quality control"),
+    ("silac_channel_composition", "Quality control"),   # run_silac.R's channel QC
+    ("silac_channel_detections", "Quality control"),
+    ("pca", "Overview"),
+    ("heatmap_top", "Overview"),
+    ("volcano", "Differential expression"),
+    ("violin_top", "Differential expression"),     # make_figures.R's top-protein plots
+    ("silac_scatter", "Differential expression"),  # run_silac.R: one comparison against another
+    ("qc_pvalue_panel", APPENDIX),                 # every contrast's p-values, one panel (2.8.0)
+    ("pvalue", APPENDIX),                          # one per contrast (sessions before 2.8.0)
+]
+SECTION_ORDER = ["Quality control", "Overview", "Differential expression", "Other figures",
+                 APPENDIX]
+# Figures the page adds as the appendix itself when the report does not embed them: a
+# calibration check, not a finding, so the narrative never has to interleave it.
+APPENDIX_FIGURES = ("qc_pvalue_panel",)
+
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".svg", ".webp")
+# Markdown images ![alt](path "title") -> groups 1 (alt), 2 (path); inline <img src="path">
+# -> group 3 (path).
+IMG_REF = re.compile(r"""!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+["'][^)]*["'])?\s*\)"""
+                     r"""|<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["'][^>]*>""", re.I)
+_ALT_ATTR = re.compile(r"""\balt\s*=\s*["']([^"']*)["']""", re.I)
+# The tool's own sections, and the report headings that already cover them.
+SUPERSEDED_BY = {"quality": {"sample quality notes", "sample quality", "data quality notes"},
+                 "audit": {"audit & caveats", "audit and caveats", "audit"}}
+
+
+def _ref(m):
+    """(alt, path) of an IMG_REF match."""
+    if m.group(2) is not None:
+        return m.group(1), m.group(2)
+    a = _ALT_ATTR.search(m.group(0))
+    return (a.group(1) if a else ""), m.group(3)
+
+
+def _clean(ref):
+    return urllib.parse.unquote(ref).split("?")[0].split("#")[0]
+
+
+def _external(ref):
+    return "://" in ref or ref.startswith(("data:", "//", "mailto:"))
+
+
+def report_figures(md_text):
+    """Basenames of the images a Markdown report references, in order of first mention."""
+    out = []
+    for m in IMG_REF.finditer(md_text or ""):
+        ref = _ref(m)[1]
+        if _external(ref):
+            continue                      # remote or inline: not a file in figures/
+        name = os.path.basename(_clean(ref))
+        if name.lower().endswith(IMAGE_EXT) and name not in out:
+            out.append(name)
+    return out
+
+
+def data_uri(path):
+    mime = mimetypes.guess_type(path)[0] or "image/png"
+    with open(path, "rb") as fh:
+        return f"data:{mime};base64,{base64.b64encode(fh.read()).decode('ascii')}"
+
+
+def read_figures_json(figures_dir):
+    """make_figures.R's figures.json -> {"figures": [{file, type, caption}], "failed": [{file,
+    type, reason}], "found", "error"}. Two shapes: the object {"figures": [...], "failed":
+    [...]} (2.8.0+) and the bare list of figures older sessions wrote. The ONE reader, for this
+    page and for analysis_prompt.py's brief: a schema change cannot leave one of them silently
+    figure-less. `error` says why a figures.json present could not be used."""
+    out = {"figures": [], "failed": [], "found": False, "error": None}
+    path = os.path.join(figures_dir or "", "figures.json")
+    if not (figures_dir and os.path.exists(path)):
+        return out
+    out["found"] = True
+    try:
+        fj = json.loads(read_text(path))
+    except (OSError, ValueError) as e:
+        out["error"] = f"unreadable ({e})"
+        return out
+    if isinstance(fj, list):
+        figs, failed = fj, []
+    elif isinstance(fj, dict) and isinstance(fj.get("figures"), list):
+        figs, failed = fj.get("figures", []), fj.get("failed") or []
+    else:
+        out["error"] = ("neither a list of figures nor an object with a \"figures\" list "
+                        f"(got {type(fj).__name__})")
+        return out
+    for e in figs:
+        if not isinstance(e, dict):
+            continue
+        k = e.get("file") or e.get("filename") or e.get("name")
+        if k:
+            out["figures"].append({"file": os.path.basename(k), "type": e.get("type") or "",
+                                   "caption": e.get("caption") or e.get("title") or ""})
+    for e in failed if isinstance(failed, list) else []:
+        if isinstance(e, str):
+            e = {"file": e}
+        if not isinstance(e, dict):
+            continue
+        k = e.get("file") or e.get("name")
+        if k:
+            out["failed"].append({"file": os.path.basename(k), "type": e.get("type") or "",
+                                  "reason": str(e.get("reason") or e.get("error") or "")})
+    return out
+
+
+def classify(name):
+    stem = os.path.splitext(os.path.basename(name))[0]
+    for key, section in FIGURE_ORDER:
+        if stem.startswith(key):
+            return section, FIGURE_ORDER.index((key, section))
+    return "Other figures", len(FIGURE_ORDER)
+
+
+def _inside(path, root):
+    root = os.path.realpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+class Figures:
+    """Turns image references into numbered figures and keeps the ledger the warnings are
+    written from. ONE instance per page, shared by both renderers: the HTML and the Markdown
+    twin resolve every reference through it, so they give the same figure the same number,
+    caption and data summary, and report the same missing / rejected files."""
+
+    def __init__(self, base_dir, root, figures_dir=None, captions=None, summarize=None,
+                 suppress=(), current=None, failed=None):
+        self.base, self.root, self.figdir = base_dir, root, figures_dir
+        self.caps = captions or {}
+        self.summarize = summarize or (lambda name: None)
+        self.suppress = tuple(suppress)          # figure-name prefixes that say nothing here
+        # This run's figures.json: only a figure it lists is embedded. None = no figures.json
+        # (nothing to check against). `failed`: name -> why make_figures.R could not draw it.
+        self.current = None if current is None else set(current)
+        self.failed = dict(failed or {})
+        self.n, self.entries = 0, {}
+        self.embedded, self.missing, self.rejected, self.suppressed = [], [], [], []
+        self.stale = []
+
+    def _locate(self, ref):
+        rel = _clean(ref)
+        cand = [os.path.realpath(rel if os.path.isabs(rel) else os.path.join(self.base, rel))]
+        if self.figdir:           # --figures given apart from --report: look there by name
+            cand.append(os.path.realpath(os.path.join(self.figdir, os.path.basename(rel))))
+        inside = [c for c in cand if _inside(c, self.root) or
+                  (self.figdir and _inside(c, self.figdir))]
+        return next((c for c in inside if os.path.isfile(c) and os.access(c, os.R_OK)), None), \
+            bool(inside)
+
+    def resolve(self, alt, ref):
+        """-> entry dict. The first sight of a file numbers it; later sights return it."""
+        name = os.path.basename(_clean(ref)) or ref
+        if self.suppress and name.startswith(self.suppress):
+            if name not in self.suppressed:
+                self.suppressed.append(name)
+            return {"status": "suppressed", "name": name}
+        if _external(ref):
+            key, e = ("x", ref), {"status": "rejected", "name": name,
+                                  "text": f"figure not embedded (not a file in this session): {ref}"}
+        else:
+            path, allowed = self._locate(ref)
+            if not allowed:
+                key, e = ("x", ref), {"status": "rejected", "name": name,
+                                      "text": f"figure not embedded (outside the session folder): {ref}"}
+            elif name in self.failed:
+                key, e = ("m", name), {"status": "missing", "name": name,
+                                       "text": f"figure could not be drawn in this run: {name}"
+                                               + (f" ({self.failed[name]})" if self.failed[name]
+                                                  else "")}
+            elif path is None:
+                # A report written for the per-contrast p-value histograms, rendered against a
+                # run that draws them as one panel: say where they went.
+                moved = (name.startswith("pvalue_") and self.current is not None and
+                         any(c.startswith(APPENDIX_FIGURES) for c in self.current))
+                key, e = ("m", name), {"status": "missing", "name": name,
+                                       "text": f"figure missing: {name}"
+                                               + (f" (this run draws every contrast's p-values "
+                                                  f"in one panel: see {APPENDIX})" if moved
+                                                  else "")}
+            elif self.current is not None and os.path.basename(path) not in self.current:
+                # On disk but not in this run's figures.json: left over from an earlier run,
+                # so it may show data this report no longer describes.
+                key, e = ("s", name), {"status": "stale", "name": name,
+                                       "text": f"figure not shown: {name} is not in this run's "
+                                               f"figures.json (a file left from an earlier run)"}
+            else:
+                key = ("f", path)
+                if key not in self.entries:
+                    self.n += 1
+                    nm = os.path.basename(path)
+                    e = {"status": "ok", "n": self.n, "path": path, "name": nm, "alt": alt,
+                         "caption": self.caps.get(nm) or "", "summary": self.summarize(nm)}
+                    self.embedded.append(nm)
+        if key not in self.entries:
+            self.entries[key] = e
+            if e["status"] == "missing":
+                self.missing.append(name)
+            elif e["status"] == "rejected":
+                self.rejected.append(ref)
+            elif e["status"] == "stale":
+                self.stale.append(name)
+        return self.entries[key]
+
+    def html(self, alt, ref, emitted):
+        e = self.resolve(alt, ref)
+        if e["status"] == "suppressed":
+            return ""
+        if e["status"] != "ok":
+            return rs.note(e["text"])
+        n = e["n"]
+        if n in emitted:
+            return f'<p class="figref">(See <a href="#fig-{n}">Figure {n}</a>.)</p>'
+        emitted.add(n)
+        return rs.figure_card(n, data_uri(e["path"]), alt or e["caption"],
+                              md_inline(alt) if alt else "",
+                              md_inline(e["caption"]) if e["caption"] else "",
+                              summary_html=md_inline(e["summary"]) if e["summary"] else "")
+
+    def md(self, alt, ref, emitted, md_dir):
+        """The Markdown twin of a figure: NotebookLM and the like read text, not images, so
+        the caption and a data summary taken from the tables travel with the reference."""
+        e = self.resolve(alt, ref)
+        if e["status"] == "suppressed":
+            return ""
+        if e["status"] != "ok":
+            return f"> **Note:** {e['text']}"
+        n = e["n"]
+        if n in emitted:
+            return f"(See Figure {n}.)"
+        emitted.add(n)
+        title = (alt or e["caption"] or e["name"]).strip().rstrip(".")
+        # realpath on both sides: macOS /var and /tmp are symlinks into /private
+        rel = os.path.relpath(e["path"], os.path.realpath(md_dir)).replace(os.sep, "/")
+        out = [f"![Figure {n}. {title}]({rel})", "", f"**Figure {n}. {title}.**"
+               + (f" {e['caption']}" if e["caption"] and e["caption"] != alt else "")]
+        if e["summary"]:
+            out += ["", f"*Data in this figure:* {e['summary']}"]
+        return "\n".join(out)
+
+
+class _HtmlFigs:
+    """Adapter for md_to_html: one render pass, so repeats become "See Figure N"."""
+
+    def __init__(self, figs, emitted):
+        self.figs, self.emitted = figs, emitted
+
+    def render(self, alt, ref, section=None):
+        return self.figs.html(alt, ref, self.emitted)
+
+
+def md_inline(t, figs=None):
+    """Inline Markdown. Image references become figures (via `figs`) and never reach the
+    page as text; without `figs` they are dropped to their alt text."""
+    out, last = [], 0
+    for m in IMG_REF.finditer(t or ""):
+        out.append(_inline_text(t[last:m.start()]))
+        alt, ref = _ref(m)
+        out.append(figs.render(alt, ref) if figs else html.escape(alt))
+        last = m.end()
+    out.append(_inline_text((t or "")[last:]))
+    return "".join(out)
+
+
+def _inline_text(t):
+    t = html.escape(t)
+    t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", t)
+    t = re.sub(r"(?<![*\w])\*([^*]+)\*(?!\w)", r"<em>\1</em>", t)
+    return t
+
+
+def _para(text, figs):
+    """A paragraph, split around its images: text runs stay <p>, each image becomes a
+    block figure at its position."""
+    out, buf, last = [], [], 0
+    for m in IMG_REF.finditer(text):
+        buf.append(text[last:m.start()])
+        chunk = "".join(buf).strip()
+        if chunk:
+            out.append(f"<p>{md_inline(chunk)}</p>")
+        buf = []
+        out.append(figs.render(*_ref(m)) if figs else html.escape(_ref(m)[0]))
+        last = m.end()
+    rest = ("".join(buf) + text[last:]).strip()
+    if rest:
+        out.append(f"<p>{md_inline(rest)}</p>")
+    return "\n".join(out)
+
+
+def anchor(title, used):
+    base = re.sub(r"[^a-z0-9]+", "-", html.unescape(re.sub(r"<[^>]+>", "", title)).lower()).strip("-") or "section"
+    a, i = base, 2
+    while a in used:
+        a, i = f"{base}-{i}", i + 1
+    used.add(a)
+    return a
+
+
+def md_to_html(md, figs=None, used=None, drop_h1=False):
+    """Enough Markdown for the report the model writes: headings, lists, tables,
+    fenced code, blockquotes, images. Not a general converter -- deliberately small so it
+    has no dependencies to install on a cluster.
+    -> (html, [(level, id, text)], h1 text or None). With drop_h1 the first level-1
+    heading is returned as the title instead of rendered."""
+    used = used if used is not None else set()
+    out, heads, h1 = [], [], None
+    lines = md.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        if ln.startswith("```"):
+            block = []
+            i += 1
+            while i < n and not lines[i].startswith("```"):
+                block.append(lines[i]); i += 1
+            i += 1
+            out.append("<pre><code>" + html.escape("\n".join(block)) + "</code></pre>")
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)", ln)
+        if m:
+            lvl, text = len(m.group(1)), m.group(2).strip()
+            i += 1
+            if lvl == 1 and drop_h1 and h1 is None:
+                h1 = text
+                continue
+            aid = anchor(text, used)
+            heads.append((lvl, aid, text))
+            out.append(f'<h{lvl} id="{aid}">{md_inline(text)}</h{lvl}>')
+            continue
+        # table: header row, separator, body
+        if ln.strip().startswith("|") and i + 1 < n and re.match(r"^\s*\|[\s:|-]+\|\s*$", lines[i + 1]):
+            def cells(r):
+                return [c.strip() for c in r.strip().strip("|").split("|")]
+            head = cells(ln)
+            i += 2
+            body = []
+            while i < n and lines[i].strip().startswith("|"):
+                body.append(cells(lines[i])); i += 1
+            out.append(table_html(head, body, figs))
+            continue
+        if re.match(r"^\s*[-*+]\s+", ln):
+            items = []
+            while i < n and re.match(r"^\s*[-*+]\s+", lines[i]):
+                items.append(re.sub(r"^\s*[-*+]\s+", "", lines[i])); i += 1
+            out.append("<ul>" + "".join(f"<li>{md_inline(x, figs)}</li>" for x in items) + "</ul>")
+            continue
+        if re.match(r"^\s*\d+[.)]\s+", ln):
+            # keep the Markdown's own number: a list broken up by nested bullets must go on
+            # 2, 3, ... instead of restarting at 1 after every break
+            start = int(re.match(r"^\s*(\d+)", ln).group(1))
+            items = []
+            while i < n and re.match(r"^\s*\d+[.)]\s+", lines[i]):
+                items.append(re.sub(r"^\s*\d+[.)]\s+", "", lines[i])); i += 1
+            out.append((f'<ol start="{start}">' if start != 1 else "<ol>")
+                       + "".join(f"<li>{md_inline(x, figs)}</li>" for x in items) + "</ol>")
+            continue
+        if ln.strip().startswith(">"):
+            q = []
+            while i < n and lines[i].strip().startswith(">"):
+                q.append(re.sub(r"^\s*>\s?", "", lines[i])); i += 1
+            out.append(rs.callout("info", f"<p>{md_inline(' '.join(q), figs)}</p>"))
+            continue
+        if not ln.strip():
+            i += 1
+            continue
+        para = []
+        while i < n and lines[i].strip() and not re.match(r"^(#{1,6}\s|```|\s*[-*+]\s|\s*\d+[.)]\s|\s*>)", lines[i]) \
+                and not lines[i].strip().startswith("|"):
+            para.append(lines[i]); i += 1
+        out.append(_para(" ".join(para), figs))
+    return "\n".join(out), heads, h1
+
+
+def table_html(head, body, figs=None):
+    return rs.table([md_inline(c) for c in head], [[md_inline(c, figs) for c in r] for r in body])
+
+
+def significance_rule(tables_dir, default_adjp=0.05):
+    """-> (adjp, source). The cutoff the DE actually applied, from de_provenance.json --
+    significance is the adjusted p-value alone there (run_de.R: "adj.P.Val < adjp (BH); no
+    fold-change filter"), so it is here too. Source "--adjp" means NOTHING recorded it: the
+    page then says so and tags the value (architectural rule 2), never "the rule the DE
+    applied"."""
+    adjp = load_record(os.path.join(tables_dir or "", "de_provenance.json")).get("adjp")
+    if isinstance(adjp, (int, float)) and not isinstance(adjp, bool):
+        return float(adjp), "de_provenance.json"
+    return default_adjp, "--adjp"
+
+
+DEFAULT_TAG = "(DEFAULT — not user-confirmed)"
+
+
+def rule_text(adjp, src):
+    """The significance sentence, as recorded -- or tagged when nothing recorded it."""
+    if src == "de_provenance.json":
+        return (f"Significant = adjusted p < {adjp:g} (Benjamini–Hochberg within each contrast; "
+                f"de_provenance.json), the only rule the DE applied — no fold-change filter. "
+                f"Up / down = sign of the fold change. {LOGFC_DIRECTION}")
+    return (f"Significant here = adjusted p < {adjp:g} {DEFAULT_TAG}: no de_provenance.json "
+            f"records the rule the DE applied, so this page cannot say which cutoff — or whether "
+            f"a fold-change filter — it used. Up / down = sign of the fold change. "
+            f"{LOGFC_DIRECTION}")
+
+
+ENGINE_LABEL = {"diann": "DIA-NN", "sage": "Sage", "fragpipe": "FragPipe", "radiant": "Radiant",
+                "alphadia": "AlphaDIA"}
+
+
+# A leading section number ("9.", "10.2", "9)", "IV.") -- a report's "## 9. Data Quality Notes"
+# covers the tool's Sample-quality block exactly as "## Data Quality Notes" does (I12: the
+# number kept the raw z-score table and run file names on a client's page). A Roman
+# numeral needs its "." or ")": "CV analysis" and "LC MS" keep their first word.
+_SECTION_NUMBER = re.compile(r"^\s*(?:\d+(?:\.\d+)*[.)]?|[ivxlc]+[.)])\s+", re.I)
+
+
+def norm_title(t):
+    t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", t or ""))).strip()
+    return _SECTION_NUMBER.sub("", t).lower()
+
+
+# Records that exist but could not be read, {path: why}: said on stderr when it happens and on
+# the page (Results at a glance) -- never a silent {}. A de_provenance.json the platform's
+# locale could not decode once dropped the contaminant-database warning without a word.
+_UNREADABLE = {}
+
+
+def _unreadable(path, why):
+    if path not in _UNREADABLE:
+        _UNREADABLE[path] = why
+        print(f"[{os.path.basename(sys.argv[0] or 'make_analysis_html.py')}] WARNING: {path} "
+              f"{why}", file=sys.stderr)
+
+
+def read_text(path):
+    """A record's text, decoded as UTF-8 (a BOM dropped) whatever the platform's locale: the
+    skill writes UTF-8, which Windows' cp1252 default mis-decodes or rejects. A file that is not
+    valid UTF-8 is still read, bad bytes replaced, and recorded as unreadable."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        _unreadable(path, f"is not UTF-8 (byte {e.start}): read with the bad bytes replaced")
+        return raw.decode("utf-8-sig", errors="replace")
+
+
+def csv_text(path):
+    """read_text() as a file for csv.reader / csv.DictReader."""
+    return io.StringIO(read_text(path), newline="")
+
+
+def load_record(path):
+    """A JSON record -> dict. {} when there is no such file (nothing was recorded); a file that
+    exists but cannot be read, parsed, or is not a JSON object gives {} AND is recorded as
+    unreadable (stderr + the page), so what it holds is said to be missing, not absent."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        v = json.loads(read_text(path))
+    except (OSError, ValueError) as e:
+        _unreadable(path, f"could not be read ({type(e).__name__}: {e})")
+        return {}
+    if not isinstance(v, dict):
+        _unreadable(path, f"is not a JSON object ({type(v).__name__})")
+        return {}
+    return v
+
+
+def unreadable_note():
+    """The fixed callout for records that could not be read, or None."""
+    if not _UNREADABLE:
+        return None
+    return {"kind": "warning",
+            "title": f"{len(_UNREADABLE)} record{'' if len(_UNREADABLE) == 1 else 's'} of this "
+                     f"run could not be read",
+            "text": "; ".join(f"`{os.path.basename(p)}` {why}" for p, why in _UNREADABLE.items())
+                    + ". What this page would show from them (a recorded cutoff, a contaminant "
+                      "warning, a study fact) may be missing here — missing from the page, not "
+                      "from the run. Re-save the file as UTF-8 and render again."}
+
+
+def session_facts(a, prov, submission=None):
+    """The header band's study facts, each read from a record of the run -- a fact no record
+    holds is left out, never filled in (architectural rule 2). `submission` is the attached
+    CoreOmics record's label (submission_report.label)."""
+    s = os.path.abspath(a.session) if a.session else None
+    man = load_record(os.path.join(s, "input", "wf", "workflow.manifest.json")) if s else {}
+    fmeta = load_record(os.path.join(s, "input", "search.fasta.meta.json")) if s else {}
+    eng, ver = search_engine(a.session, prov)
+    unchosen = search_not_recorded_text(a.session, prov)
+    pinned = search_engine_pinned(a.session, prov)
+    return [("Submission", submission),
+            ("Organism", database_organisms(fmeta, man.get("organism"),
+                                            man.get("organism_taxid"))),
+            ("Instrument", ", ".join(man.get("instruments") or []) or None),
+            ("Search", (" ".join(x for x in (eng, ver) if x)
+                        + (" (workflow manifest pin)" if eng and pinned else ""))
+             or (f"not recorded ({unchosen})" if unchosen else None)),
+            ("DE", prov.get("display_label")),
+            ("Report generated", datetime.date.today().isoformat())]
+
+
+def _engine_facts(session, prov=None):
+    """session.search_engine for the page's session (the one engine/version rule), with the
+    record beside the DE's input as the chosen record when there is one (search_record's first
+    step) -> its dict, or {} without a session."""
+    if not session:
+        return {}
+    import session as sess                      # one definition of which search, and its engine
+    s = os.path.abspath(session)
+    beside = _beside_record((prov or {}).get("input"))
+    return sess.search_engine(sess.paths_for(s), (prov or {}).get("input"),
+                              record=load_record(beside) if beside else None)
+
+
+def search_engine(session, prov=None):
+    """(engine, version) of the search the DE read, as the run recorded it (session.search_engine:
+    its search_provenance.json, wherever the search is; the workflow manifest's pin only when the
+    session has no search record at all) -- each None when no record names it: ("DIA-NN",
+    "2.7.0"). A record's null version stays None. The header's Search fact and "How this report
+    was made" both read it here."""
+    e = _engine_facts(session, prov)
+    eng = e.get("engine") or ""
+    return ENGINE_LABEL.get(eng, eng) or None, e.get("version")
+
+
+def search_quantity_clause(session, prov=None):
+    """For a page with no DE: who made a FragPipe DDA search's protein amounts, from the search
+    record's fragpipe_quantity (fragpipe_quant.plan, through run_search's one declaration path):
+    directLFQ from FragPipe's ion intensities, IonQuant's MaxLFQ, or IonQuant's protein intensity.
+    None for any other search, a refused quantity, or no record."""
+    if not session:
+        return None
+    import session as sess
+    c = sess.search_choice(sess.paths_for(os.path.abspath(session)), (prov or {}).get("input"))
+    rec = load_record(c["path"]) if c.get("path") else None
+    q = (rec or {}).get("fragpipe_quantity") if isinstance(rec, dict) else None
+    if not isinstance(q, dict) or q.get("status") not in (None, "ok"):
+        return None
+    import fragpipe_quant as fq
+    why = fq.reason_phrase(q) if q.get("quantity") == fq.QUANTITY_DIRECTLFQ else None
+    return {fq.QUANTITY_DIRECTLFQ: "directLFQ estimated the protein amounts from FragPipe's ion "
+                                   "intensities" + (f" ({why})" if why else ""),
+            fq.QUANTITY_MAXLFQ: "IonQuant (in FragPipe) estimated the protein amounts by MaxLFQ",
+            fq.QUANTITY_INTENSITY: "IonQuant (in FragPipe) measured the protein intensities "
+                                   f"({fq.NOT_NORMALISED})"
+            }.get(q.get("quantity"))
+
+
+def search_faims_sentence(session, prov=None):
+    """For a search that was split by FAIMS group (run_search --faims-split): the record's own
+    sentence -- searched and quantified separately, quantities not comparable across the groups
+    (faims.methods_sentence). None for any other search or no record."""
+    if not session:
+        return None
+    import session as sess
+    c = sess.search_choice(sess.paths_for(os.path.abspath(session)), (prov or {}).get("input"))
+    rec = load_record(c["path"]) if c.get("path") else None
+    z = (rec or {}).get("faims") if isinstance(rec, dict) else None
+    return z.get("sentence") if isinstance(z, dict) and z.get("group") else None
+
+
+def search_engine_pinned(session, prov=None):
+    """True when the engine the page names is the workflow manifest's pin, not a search record's
+    (the session holds no search record): the header and "How this report was made" tag it, as
+    the README, Slack and the Methods do (rule 2; Ruling 80 N2). session.search_engine decides."""
+    import session as sess
+    return _engine_facts(session, prov).get("source") == sess.ENGINE_PIN_SOURCE
+
+
+def search_not_recorded_text(session, prov=None):
+    """A few words when the page has a session and no engine to name: its records leave the
+    choice open ("2 search records, none chosen": T44 review F5), or it holds no search record
+    and no workflow manifest -- a working copy pulled without them (Ruling 80 N4). The header
+    and "How this report was made" say so: "not recorded (...)", never a missing line. None when
+    an engine is named, or there is no session."""
+    e = _engine_facts(session, prov)
+    if not e or e.get("engine"):
+        return None
+    return (e.get("choice") or {}).get("short") or "the search record names no engine"
+
+
+def contrast_label(c):
+    """THE display form of a contrast, used everywhere a contrast is named (tiles, tables,
+    figure data, the analysis brief): "Old_JPH3-Old_IgG" -> "Old JPH3 vs Old IgG"."""
+    return c.replace("-", " vs ").replace("_", " ")
+
+
+# Which way a fold change points, said once and shown wherever log2FC values are.
+LOGFC_DIRECTION = "Positive log2FC = higher in the first-named group of the contrast."
+
+
+def _make_names(c):
+    """R's make.names -- how run_de.R turned a contrast into its DE_<method>_<name>.csv."""
+    n = re.sub(r"[^A-Za-z0-9._]", ".", c)
+    return n if re.match(r"^([A-Za-z]|\.(?!\d))", n) else "X" + n
+
+
+class Tables:
+    """The DE tables, read once and shared by every place that quotes a number from them --
+    the glance, the figure summaries, the top-protein tables -- so all agree."""
+
+    def __init__(self, tables_dir, prov, adjp, src):
+        self.dir, self.prov, self.adjp, self.src = tables_dir, prov, adjp, src
+        self._rows = {}
+        self.label = {_make_names(c): c for c in prov.get("contrasts") or []}
+        self.files = {}                        # make.names contrast -> DE csv
+        if tables_dir and os.path.isdir(tables_dir):
+            for fn in sorted(os.listdir(tables_dir)):
+                m = re.match(r"^DE_([a-z0-9]+)_(.+)\.csv$", fn)
+                if m:
+                    self.files[m.group(2)] = fn
+        order = list(self.label)
+        self.contrasts = sorted(self.files, key=lambda c: (order.index(c) if c in order
+                                                           else len(order), c))
+
+    def display(self, c):
+        return contrast_label(self.label.get(c, c.replace(".", "-")))
+
+    def rows(self, c):
+        if c not in self._rows:
+            out = []
+            for r in csv.DictReader(csv_text(os.path.join(self.dir, self.files[c]))):
+                try:
+                    r["_p"] = float(r.get("adj.P.Val") or r.get("padj") or r.get("FDR"))
+                    r["_lfc"] = float(r.get("logFC") or r.get("log2FoldChange"))
+                except (TypeError, ValueError):
+                    r["_p"], r["_lfc"] = None, None
+                try:
+                    r["_raw_p"] = float(r.get("P.Value") or r.get("pvalue"))
+                except (TypeError, ValueError):
+                    r["_raw_p"] = None
+                out.append(r)
+            self._rows[c] = out
+        return self._rows[c]
+
+    def counts(self, c):
+        """(tested, up, down) at adj.P < adjp ONLY -- the only significance rule the DE applied.
+        The page used to also require |log2FC| >= 1, the volcano reference line, re-imposing a
+        fold-change filter the DE never applied. Tested = the rows with an adjusted p-value: a
+        row without one (Evidence "not measured in either group", run_de.R 2.12.0; a maxlfq
+        group with no value) is listed in the table but was not tested."""
+        tested = [r for r in self.rows(c) if r["_p"] is not None]
+        sig = [r for r in tested if r["_p"] < self.adjp]
+        return len(tested), sum(r["_lfc"] > 0 for r in sig), sum(r["_lfc"] < 0 for r in sig)
+
+    def top(self, c, k):
+        """The k best by adj.P, ties broken by the raw p-value (topTable's order, as the brief
+        and make_figures.R rank them) -- never by |log2FC|: BH ties are common, and the largest
+        fold changes there are presence calls, not the strongest evidence. A row without a raw
+        p-value keeps its place in the table among its ties (sorted() is stable)."""
+        rows = [r for r in self.rows(c) if r["_p"] is not None]
+        return sorted(rows, key=lambda r: (r["_p"], r["_raw_p"] if r["_raw_p"] is not None
+                                           else float("inf")))[:k]
+
+
+def gene_label(r, describe=True):
+    """THE name a DE row is shown by (top tables, figure summaries, the brief): its first gene,
+    else its first UniProt entry name (DIA-NN's Protein.Names, e.g. HVM51_MOUSE for a gene-less
+    Ig V region), else -- with describe -- its FASTA Description, shortened (a SILAC table on an
+    NCBI database has no gene names: run_silac.R blanks DIA-NN's first-word guess), else its
+    accession -- never the accession where a name exists."""
+    g = (r.get("Genes") or "").split(";")[0].strip()
+    n = (r.get("Protein.Names") or "").split(";")[0].strip()
+    d = short_description(r.get("Description")) if describe else ""
+    return g or n or d or (r.get("Protein.Group") or "?").split(";")[0]
+
+
+def short_description(text, width=60):
+    """A FASTA description as a table cell: one line, at most `width` characters."""
+    t = " ".join(str(text or "").split())
+    if t.upper() in ("NA", "NAN"):
+        return ""
+    return t if len(t) <= width else t[:width - 1].rstrip() + "…"
+
+
+def fmt_p(p):
+    return f"{p:.3g}" if p >= 1e-3 else f"{p:.2e}"
+
+
+# Figures that say nothing when the expression matrix is complete by construction: every
+# bar of "proteins quantified per sample" is the same number (a mouse-brain IP cohort: 30 bars of
+# 6,112). make_figures.R no longer draws it then, but an older figures/ folder -- and the
+# narrative written against it -- still can; Brett flagged it twice (2026-09-25).
+SUPPRESS_WHEN_COMPLETE = ("qc_protein_counts",)
+_COUNTS_PARAGRAPH = re.compile(r"^\s*\*\*\s*Proteins?\s+(?:quantified\s+)?per\s+sample\b", re.I)
+
+
+def matrix_complete(tables_dir, prov):
+    """-> (complete, why). make_figures.R's test -- every sample has the same number of
+    non-missing proteins in Expression_Matrix.csv -- and, when that file is not at hand,
+    the pipeline itself: a DPC-Quant (limpa) matrix is complete by construction."""
+    em = os.path.join(tables_dir or "", "Expression_Matrix.csv")
+    if os.path.exists(em):
+        try:
+            with csv_text(em) as fh:
+                rd = csv.reader(fh)
+                head = next(rd)
+                cols = [i for i, h in enumerate(head)
+                        if h not in ("Protein.Group", "Genes", "Protein.Names")]
+                n = [0] * len(cols)
+                for rec in rd:
+                    for k, i in enumerate(cols):
+                        if i < len(rec) and rec[i] not in ("", "NA", "NaN"):
+                            n[k] += 1
+            if n:
+                return (len(set(n)) == 1,
+                        f"every sample has {n[0]:,} proteins in Expression_Matrix.csv"
+                        if len(set(n)) == 1 else None)
+        except (OSError, StopIteration, csv.Error):
+            pass
+    if (prov.get("pipeline_id") or prov.get("method")) == "dpc":
+        return True, "a DPC-Quant (limpa) matrix gives every protein a value in every sample"
+    return False, None
+
+
+def drop_suppressed(md, prefixes):
+    """The report text without references to suppressed figures, and without a paragraph
+    right after one that only describes that plot (it opens "**Proteins per sample.**" or
+    "**Proteins quantified per sample**"). Anything else is left exactly as written.
+    -> (text, [suppressed figure names], paragraphs dropped)."""
+    if not prefixes:
+        return md, [], 0
+    out, after, dropping, names, n_par = [], False, False, [], 0
+    for ln in md.splitlines():
+        if dropping:
+            if ln.strip():
+                continue
+            dropping = False
+        hits = [m for m in IMG_REF.finditer(ln)
+                if os.path.basename(_clean(_ref(m)[1])).startswith(prefixes)]
+        if hits:
+            for m in reversed(hits):
+                nm = os.path.basename(_clean(_ref(m)[1]))
+                if nm not in names:
+                    names.append(nm)
+                ln = ln[:m.start()] + ln[m.end():]
+            after = True
+            if not ln.strip():
+                continue
+        elif after and ln.strip():
+            after = False
+            if _COUNTS_PARAGRAPH.match(ln):
+                dropping, n_par = True, n_par + 1
+                continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if md.endswith("\n") else ""), names, n_par
+
+
+def raw_pvalues(tables, c):
+    out = []
+    for r in tables.rows(c):
+        try:
+            out.append(float(r.get("P.Value")))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def figure_summary(name, tables, qc_path, em_path):
+    """A short factual summary of the data a figure draws, taken from the tables -- never a
+    number that is not in them. None for figures without one (PCA, heatmap)."""
+    stem = os.path.splitext(name)[0]
+    if stem.startswith(APPENDIX_FIGURES) and tables and tables.contrasts:
+        parts = []
+        for c in tables.contrasts:
+            raw = raw_pvalues(tables, c)
+            if raw:
+                parts.append(f"{tables.display(c)} {100 * sum(x < 0.05 for x in raw) / len(raw):.0f}%")
+        if parts:
+            return ("Share of raw p-values below 0.05 per contrast (about 5% when nothing "
+                    "changed): " + ", ".join(parts) + ".")
+    for prefix in ("volcano_", "pvalue_"):
+        c = stem[len(prefix):] if stem.startswith(prefix) else None
+        if c and tables and c in tables.files:
+            tested, up, dn = tables.counts(c)
+            if prefix == "volcano_":
+                top = "; ".join(f"{gene_label(r)} (log2FC {r['_lfc']:+.2f}, adj.P {fmt_p(r['_p'])})"
+                                for r in tables.top(c, 5))
+                return (f"{tables.display(c)}: {up + dn:,} of {tested:,} proteins significant at "
+                        f"adj.P < {tables.adjp:g} ({up:,} up, {dn:,} down; no fold-change "
+                        f"filter). Top 5 by adj.P: {top}.")
+            raw = raw_pvalues(tables, c)
+            if raw:
+                below = sum(x < 0.05 for x in raw)
+                return (f"{tables.display(c)}: {len(raw):,} p-values, {below:,} "
+                        f"({100 * below / len(raw):.0f}%) below 0.05; {up + dn:,} significant "
+                        f"at adj.P < {tables.adjp:g}.")
+    if stem.startswith("qc_detected_vs_inferred") and qc_path and os.path.exists(qc_path):
+        q = list(csv.DictReader(csv_text(qc_path)))
+        if q:
+            det = sorted(int(float(r["Detected"])) for r in q)
+            pct = sorted(float(r["PctInferred"]) for r in q)
+            return (f"{len(q)} samples; proteins detected per sample {det[0]:,}–{det[-1]:,} "
+                    f"(median {det[len(det) // 2]:,}) of {int(float(q[0]['Total'])):,}; "
+                    f"inferred {pct[0]:.0f}–{pct[-1]:.0f}% per sample.")
+    if stem.startswith("qc_protein_counts") and em_path and os.path.exists(em_path):
+        with csv_text(em_path) as fh:
+            rd = csv.reader(fh)
+            head = next(rd)
+            cols = [i for i, h in enumerate(head) if h not in ("Protein.Group", "Genes", "Protein.Names")]
+            n = [0] * len(cols)
+            for rec in rd:
+                for k, i in enumerate(cols):
+                    if i < len(rec) and rec[i] not in ("", "NA", "NaN"):
+                        n[k] += 1
+        if n:
+            return (f"proteins with a value per sample: {min(n):,}–{max(n):,} across {len(n)} "
+                    f"samples" + (" (identical: the matrix is complete by construction)"
+                                  if min(n) == max(n) else "") + ".")
+    return None
+
+
+# Rows a reader must not take for the sample's biology: the antibody's own chains and
+# common-contaminant entries. An Ig chain is recognised three ways, because many have no gene
+# name (a mouse-brain IP cohort: P06330 HVM51_MOUSE, P01647 KV5AE_MOUSE ... -- Genes empty):
+#  1. the gene: IMGT symbols, human and mouse/rat forms alike (IGHG1, Ighg2c, IGKC, IGKV1-5,
+#     IGLC2, IGLV1-40, JCHAIN/IGJ, rat Igg-2a) -- whole symbol, so IGHMBP2 (a helicase),
+#     IGLL1/IGLL5, IgLON (IGLON5) and IGF are not;
+#  2. the UniProt entry name, which is what DIA-NN's Protein.Names holds: Ig V regions
+#     (HV*/KV*/LV*; not HVCN1, the proton channel), D/J segments (HD/HJ/KJ/LJ + digits) and the
+#     IG-named chains (IGHG3, IGHA, IGG2A, IGKC, IGJ, IGW, IGNAR ...), for the organisms that
+#     have reviewed Ig entries -- elsewhere the same prefixes name toxins (KV53_BUNCI) and
+#     venom peptides (LV1A_BUTOC);
+#  3. a protein description, when an engine gives one ("Ig kappa chain V-V region",
+#     "Immunoglobulin heavy constant gamma 1") -- not an Fc receptor, not BiP ("immunoglobulin
+#     heavy chain-binding protein").
+# Checked 2026-09-28 against UniProt: every reviewed entry named HV*/KV*/LV*/IG* and every
+# KW-1280 (Immunoglobulin) entry, 610 in all, with 0 disagreements between the rules and the
+# entries' own names.
+_IG_GENE = re.compile(r"^(?:IGH(?:[GA]\d*[A-Z]?|M|D|E|[VDJ]\d[\w.-]*)|IGK(?:C|[VJ]\d[\w.-]*)|"
+                      r"IGL(?:C\d*|[VJ]\d[\w.-]*)|JCHAIN|IGJ|IGG-?\d[A-C]?)$", re.I)
+_IG_ORGS = ("HUMAN", "MOUSE", "RAT", "RABIT", "CANLF", "CHICK", "XENLA", "EQUAS", "CAICR",
+            "HETFR", "GINCI", "CARAU", "GORGO", "CAVPO", "AQUCT", "SUNMU", "MESAU")
+_IG_ENTRY = re.compile(r"^(?:(?!HVCN)(?:HV|KV|LV)[A-Z0-9]+|(?:HD|HJ|KJ|LJ)\d+|IG(?:H[GAMDE][A-Z0-9]*|"
+                       r"H1M|G\d?[A-C]?|[ADEMK]\d?|L\d|LC\d*|KC|J|W[A-Z0-9]*|NAR))"
+                       r"_(?:" + "|".join(_IG_ORGS) + r")$")
+_IG_DESC = re.compile(r"\b(?:immunoglobulin|Ig)\s+(?:heavy|kappa|lambda|light|gamma|mu|alpha|delta|"
+                      r"epsilon|J)\b(?![^()]{0,40}\bFc\b)[^()]{0,40}?\b(?:chain|variable|constant|"
+                      r"joining|diversity|region)\b(?![-\s]binding)|\bIg(?:W|NAR)\b", re.I)
+
+
+def is_ig_chain(gene, names=None):
+    """THE Ig-chain test (one definition: the top tables and the brief's background list).
+    gene: the row's first gene; names: its Protein.Names (DIA-NN: UniProt entry names)."""
+    g = (gene or "").split(";")[0].strip()
+    n = (names or "").split(";")[0].strip()
+    return bool(_IG_GENE.match(g) or _IG_ENTRY.match(n) or _IG_DESC.search(n))
+
+
+def background_flag(gene, protein, names=None, keratin_kept=()):
+    """"Ig chain" / "contaminant" / None for one DE row. `keratin_kept`: a keratin sample's
+    keratin-family Cont_ accessions run_de.R kept as the analyte (keratin_kept_accessions) --
+    a row whose only Cont_ accessions are those is sample protein, not contamination."""
+    cont = [t.strip() for t in (protein or "").split(";")
+            if t.strip().startswith(CONTAMINANT_TAGS)]
+    if cont and not all(t in keratin_kept for t in cont):
+        return "contaminant"
+    if is_ig_chain(gene, names):
+        return "Ig chain"
+    return None
+
+
+def keratin_kept_accessions(prov):
+    """The keratin-family Cont_ accessions run_de.R's contaminant filter left in for a keratin
+    sample (de_provenance.json contaminants.keratin_sample.exempt_accessions); empty otherwise."""
+    cont = prov.get("contaminants") if isinstance(prov.get("contaminants"), dict) else {}
+    k = cont.get("keratin_sample") if isinstance(cont.get("keratin_sample"), dict) else {}
+    return frozenset(a for a in (k.get("exempt_accessions") or []) if isinstance(a, str))
+
+
+def detected_columns(row, contrast):
+    """ "k/n A, k/n B" from the DE table's own Detected_<group> columns (run_de.R: k of n
+    samples in the group with the protein measured), or None when the table has none."""
+    parts = [g.strip() for g in (contrast or "").split("-")]
+    if len(parts) != 2:
+        return None
+    vals = [row.get(f"Detected_{g}") for g in parts]
+    if not all(v not in (None, "", "NA") for v in vals):
+        return None
+    return ", ".join(f"{v} {contrast_label(g)}" for v, g in zip(vals, parts))
+
+
+def detection_note_fn(tables_dir, prov, conditions):
+    """-> f(protein, contrast) giving "detected 3/3 Old_Kv21, 0/3 Old_IgG" from
+    Detection_Matrix.csv, or None when there is no matrix. The word follows the record:
+    "detected" when 0 means inferred (dpc), "quantified" when 0 means missing (maxlfq)."""
+    path = os.path.join(tables_dir or "", "Detection_Matrix.csv")
+    if not os.path.exists(path):
+        return None
+    word = "quantified" if (prov.get("detection_matrix") or {}).get("zero_means") == "missing" \
+        else "detected"
+    rd = csv.reader(csv_text(path))
+    head = next(rd)
+    det = {rec[0]: {head[i]: rec[i] for i in range(1, len(rec))} for rec in rd}
+    groups = {}
+    if conditions and os.path.exists(conditions):
+        for r in csv.DictReader(csv_text(conditions)):
+            groups.setdefault((r.get("Group") or "").strip(), []).append(
+                (r.get("File.Name") or "").strip())
+
+    def on(v):
+        try:
+            return float(v) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def note(protein, contrast, row=None):
+        own = detected_columns(row or {}, contrast)
+        if own:                           # the DE table's own per-group counts win
+            ev = ((row or {}).get("Evidence") or "").strip()   # run_de.R's own category
+            return f"{word} {own}" + (f" — {ev}" if ev and ev != "NA" else "")
+        d = det.get(protein)
+        if d is None:
+            return "not recorded"
+        parts = [g.strip() for g in contrast.split("-")] if contrast else []
+        if len(parts) == 2 and all(g in groups for g in parts):
+            return f"{word} " + ", ".join(
+                f"{sum(on(d.get(s)) for s in groups[g])}/{len(groups[g])} {contrast_label(g)}"
+                for g in parts)
+        return f"{word} in {sum(on(v) for v in d.values())}/{len(d)} samples"
+    return note
+
+
+def audit_plain(path):
+    """The client's Audit & caveats: audit_results' plain table, one row per check, from the
+    AUDIT.json beside AUDIT.md (or AUDIT.md's own lines, for a session without it). A staff
+    report: the raw AUDIT.md -- check codes, B1-B4 strings, "not real biology" -- was what clients
+    read here. None when there are no findings to read (the page then shows AUDIT.md as it is)."""
+    found = None
+    try:
+        with open(os.path.splitext(path)[0] + ".json", encoding="utf-8") as fh:
+            j = json.load(fh)
+        if isinstance(j, dict) and isinstance(j.get("findings"), list):
+            found = j["findings"]
+    except (OSError, ValueError):
+        pass
+    if found is None:
+        found = audit_results.findings_from_md(read_text(path))
+    return audit_results.client_section_md(found) or None
+
+
+# Every report's section on how it was made (before the appendix), and the public page that
+# explains it
+HOW_MADE_TITLE = "How this report was made"
+# From 2.15 the page is the skill repository's (Ruling 89a); DE-LIMP's copy stays live for the
+# reports made before it.
+HOW_MADE_URL = "https://bsphinney.github.io/UCD-Proteomics-AI-Skill/how-reports-are-made.html"
+HOW_MADE_LINK = ("How these reports are made, step by step, and how your lab can run the same "
+                 "pipeline")
+
+
+def _skill_version():
+    """skill_version.py's reading of plugin.json, or None when it cannot say (its unknown tag, or
+    a partial copy of scripts/ without it): the section then names no version."""
+    try:
+        import skill_version as sv
+    except ImportError:
+        return None
+    v = sv.skill_version()
+    return None if v == sv.UNKNOWN else v
+
+
+def how_made(a, prov, md_text, report_secs):
+    """"How this report was made", in plain words for the lab: the software that made the
+    numbers, Claude running the pipeline (and writing the text, when there is an AI-written
+    report), the podcast, the expert review. Each sentence only when a record of the run holds
+    it -- a fact no record holds is left out, never filled in (rule 2); the DE is named by its
+    own label (rule 1). -> the section's blocks (build_page). The body sits between
+    make_podcast's HOWMADE markers, which a podcast check's sources leave out; the podcast's
+    paragraph is make_podcast.how_made_block's, between its own markers, so `link` can fill it
+    in when the podcast comes after the report."""
+    eng, ver = search_engine(a.session, prov)
+    unchosen = search_not_recorded_text(a.session, prov)
+    pinned = search_engine_pinned(a.session, prov)
+    did = []
+    if eng:
+        did.append(f"{eng}{' ' + ver if ver else ''}"
+                   # client words, not staff's (C2 biologist nit)
+                   + (" (the version planned for this workflow; the search's own record was "
+                      "not available)" if pinned else "") + " searched the raw instrument files")
+    if prov.get("display_label"):
+        did.append(f"{prov['display_label']} estimated the protein amounts and ran the statistics")
+    elif search_quantity_clause(a.session, prov):
+        # no DE: a FragPipe DDA search's own protein quantity, as its record declares it (rule 1)
+        did.append(search_quantity_clause(a.session, prov))
+    p1 = ("The numbers in this report come from established scientific software: "
+          + ", and ".join(did) + ".") if did else ""
+    faims_note = search_faims_sentence(a.session, prov)
+    if faims_note:
+        p1 += (" " if p1 else "") + faims_note
+    if unchosen:
+        p1 += (" " if p1 else "") + (f"Which search these numbers come from was not recorded "
+                                     f"({unchosen}).")
+    repro = os.path.join(a.tables, "reproducibility_log.R") if a.tables else None
+    if repro and os.path.isfile(repro):
+        r = os.path.relpath(repro, os.path.dirname(os.path.abspath(a.out)))
+        r = os.path.basename(repro) if r.startswith("..") else r.replace(os.sep, "/")
+        p1 += f" `{r}` re-runs the statistics as plain R code, with no AI involved."
+    v = _skill_version()                  # the version building this page
+    ran = prov.get("skill_version")       # the version that ran the DE (run_de.R records it)
+    ran = ran if isinstance(ran, str) and ran.strip() and not ran.startswith("(unknown") else None
+    p2 = ("Claude, Anthropic's AI model, ran each step, following the UC Davis Proteomics Core's "
+          "pipeline" + (f" (skill {ran})" if ran else "")
+          + (", and wrote this report's analysis text" if md_text is not None else "") + "."
+          # a page built by another version than the DE's, or a DE from before the record named one
+          + (f" This report was built with skill {v}." if v and v != ran else ""))
+    outdir = os.path.dirname(os.path.abspath(a.out))
+    exp = next((t for t, _ in report_secs if "expert review" in norm_title(t)), None)
+    p4 = (f"Separate Claude reviewers — a proteomics expert, a biologist and a statistician — "
+          f"checked the analysis; their notes are in the {exp} section." if exp else "")
+    mp = make_podcast
+    return ([("raw", mp.HOWMADE_START, mp.HOWMADE_START),
+             ("md", "\n\n".join(p.strip() for p in (p1, p2) if p.strip())),
+             ("raw", mp.how_made_block(outdir, "html"), mp.how_made_block(outdir, "md"))]
+            + ([("md", p4)] if p4 else [])
+            + [("raw", f'<p class="howmade"><a href="{html.escape(HOW_MADE_URL)}">'
+                       f"{html.escape(HOW_MADE_LINK)}</a></p>",
+                f"[{HOW_MADE_LINK}]({HOW_MADE_URL})"),
+               ("raw", mp.HOWMADE_END, mp.HOWMADE_END)])
+
+
+def build_page(a, prov, tables, figs, md_text, used):
+    """Assemble the page ONCE, as data. render_html() and render_md() draw this same list,
+    so the HTML report and its Markdown twin cannot say different things (rule 3).
+    -> (title, subtitle_md, sections); section = {anchor, title, kind, blocks}, block =
+    ("md", text) | ("glance", data) | ("gallery", section, [names]) | ("top", data) |
+    ("submission", html, markdown) -- the CoreOmics record, main() puts it first |
+    ("raw", html, markdown) -- one thing written for each renderer (a link, a marker)."""
+    sections, h1, pre = [], None, ""
+    report_secs = []
+    if md_text is not None:
+        h1, pre, report_secs = split_md_sections(md_text)
+    report_h2 = {norm_title(t) for t, _ in report_secs}
+    referenced = set(report_figures(md_text)) if md_text is not None else set()
+    glance_anchor = anchor("Results at a glance", used)
+    # Every record the page reads is read before the glance is assembled, so its "could not be
+    # read" callout lists them all (a record read later would be on stderr only).
+    extras = []
+    for path, title, key in ((a.quality, "Sample quality notes", "quality"),
+                             (a.audit, "Audit & caveats", "audit")):
+        if not (path and os.path.exists(path)):
+            continue
+        if report_h2 & (SUPERSEDED_BY[key] | {norm_title(title)}):
+            continue                    # the report has its own -- never show it twice
+        body = audit_plain(path) if key == "audit" else None
+        extras.append((title, body or strip_h1(read_text(path))))
+    top = top_data(tables, a, prov)
+    how = how_made(a, prov, md_text, report_secs)
+    g = glance_data(prov, tables, a.tables, a.session)
+    for n in (not_drawn_note(figs.failed, referenced), unreadable_note()):
+        if n:
+            g["notes"].append(n)
+    if g["tiles"] or g["contrasts"] or g["notes"]:
+        sections.append({"anchor": glance_anchor,
+                         "title": "Results at a glance", "kind": None, "blocks": [("glance", g)]})
+    if md_text is None:
+        gal = {}
+        for fn in a._listed:
+            if figs.suppress and fn.startswith(figs.suppress):
+                figs.resolve("", fn)               # recorded as suppressed
+                continue
+            sec, rank = classify(fn)
+            gal.setdefault(sec, []).append((rank, fn))
+        for sec in SECTION_ORDER:
+            if sec in gal:
+                sections.append({"anchor": anchor(sec, used), "title": sec, "kind": None,
+                                 "blocks": [("gallery", sec, [fn for _, fn in sorted(gal[sec])])]})
+    for title, body in extras:
+        sections.append({"anchor": anchor(title, used), "title": title,
+                         "kind": severity(title, body), "blocks": [("md", body)]})
+    for title, body in report_secs:
+        sections.append({"anchor": anchor(title, used), "title": title,
+                         "kind": severity(title, body), "blocks": [("md", body)]})
+    sd = getattr(a, "_sets", None)
+    if sd and norm_title(SETS_TITLE) not in report_h2:     # the report's own section wins
+        sections.append({"anchor": anchor(SETS_TITLE, used), "title": SETS_TITLE, "kind": None,
+                         "blocks": [("md", sd["md"])]})
+    if top:
+        sections.append({"anchor": anchor("Top proteins per contrast", used),
+                         "title": "Top proteins per contrast", "kind": None,
+                         "blocks": [("top", top)]})
+    # The peak check (skyline_peaks.py, step 8f): its record's section, whatever the outcome -- a
+    # step that did not run says why (architectural rule 4); the report's own section wins
+    pk = getattr(a, "_peaks", None)
+    if pk and norm_title(skyline_peaks.SECTION_TITLE) not in report_h2:
+        sections.append({"anchor": anchor(skyline_peaks.SECTION_TITLE, used),
+                         "title": skyline_peaks.SECTION_TITLE, "kind": None,
+                         "blocks": [("md", pk["md"])]})
+    # The pipeline's own sections (de_provenance.json `report_sections`: {title, markdown}; e.g.
+    # run_silac.R's channel mixing and channel-specific proteins) -- the report's own section of
+    # the same title wins, as for the set tests
+    for sec in prov.get("report_sections") or []:
+        if (isinstance(sec, dict) and sec.get("title") and sec.get("markdown")
+                and norm_title(sec["title"]) not in report_h2):
+            sections.append({"anchor": anchor(sec["title"], used), "title": sec["title"],
+                             "kind": None, "blocks": [("md", sec["markdown"])]})
+    # How this report was made: last before the appendix, on every page; the report's own wins
+    if norm_title(HOW_MADE_TITLE) not in report_h2:
+        sections.append({"anchor": anchor(HOW_MADE_TITLE, used), "title": HOW_MADE_TITLE,
+                         "kind": None, "blocks": how})
+    if md_text is not None:
+        app = [fn for fn in a._listed if fn.startswith(APPENDIX_FIGURES) and fn not in referenced]
+        if app:
+            sections.append({"anchor": anchor(APPENDIX, used), "title": APPENDIX, "kind": None,
+                             "blocks": [("gallery", APPENDIX, app)]})
+    subtitle = None
+    if pre.strip() and len(pre.strip()) < 600 and "\n\n" not in pre.strip():
+        subtitle, pre = pre.strip(), ""
+    if pre.strip():                      # anything else before the first section stays first
+        sections.insert(0, {"anchor": anchor("Introduction", used), "title": "Introduction",
+                            "kind": None, "blocks": [("md", pre)]})
+    return h1, subtitle, sections
+
+
+def strip_h1(text):
+    return re.sub(r"\A\s*#\s+[^\n]*\n", "", text, count=1)
+
+
+def split_md_sections(md):
+    """-> (h1 text, text before the first ## heading, [(h2 title, body)]), fences respected."""
+    h1, pre, secs, cur, fence = None, [], [], None, False
+    for ln in md.splitlines():
+        if ln.startswith("```"):
+            fence = not fence
+        m = None if fence else re.match(r"^(#{1,2})\s+(.*)", ln)
+        if m and len(m.group(1)) == 1 and h1 is None and cur is None:
+            h1 = m.group(2).strip()
+            continue
+        if m and len(m.group(1)) == 2:
+            cur = [m.group(2).strip(), []]
+            secs.append(cur)
+            continue
+        (cur[1] if cur else pre).append(ln)
+    return h1, "\n".join(pre), [(t, "\n".join(b)) for t, b in secs]
+
+
+def glance_data(prov, tables, tables_dir, session=None):
+    tiles = []
+    # a pipeline that names its own units (run_silac.R: replicates, channels) says so in its
+    # record (`glance_tiles`: [[number, label], ...]); otherwise samples and groups
+    own = [t for t in prov.get("glance_tiles") or []
+           if isinstance(t, list) and len(t) == 2 and isinstance(t[0], int)]
+    if own:
+        tiles.extend((n, str(lab)) for n, lab in own)
+    if not own and isinstance(prov.get("n_samples"), int):
+        tiles.append((prov["n_samples"], "samples"))
+    if not own and isinstance(prov.get("groups"), dict):
+        tiles.append((len(prov["groups"]), "groups"))
+    rows = []
+    for c in tables.contrasts:
+        tested, up, dn = tables.counts(c)
+        rows.append({"contrast": tables.display(c), "tested": tested, "up": up, "down": dn})
+    if rows:
+        tiles.append((len(rows), "contrasts"))
+        tiles.append((max(r["tested"] for r in rows), "proteins tested"))
+    notes = [n for n in (search_measurement_note(prov, session), first_pass_note(prov, session),
+                         identifications_only_note(prov, session),
+                         protein_fdr_note(prov, session), semi_specific_note(prov, session),
+                         search_inputs_note(prov, session),
+                         runs_left_out_note(prov),
+                         added_sequences_note(session), inferred_note(prov, tables_dir),
+                         not_measured_note(prov),
+                         database_note(prov, tables_dir, session), keratin_note(prov),
+                         covariate_note(prov))
+             if n]
+    return {"tiles": tiles, "contrasts": rows, "adjp": tables.adjp, "adjp_src": tables.src,
+            "recorded": tables.src == "de_provenance.json", "notes": notes,
+            "rule": rule_text(tables.adjp, tables.src)}
+
+
+def not_drawn_note(failed, referenced=()):
+    """The fixed "not drawn in this run" callout: every figure make_figures.R's figures.json
+    lists under `failed`, with its reason, so a missing PCA or top-protein plot is never just
+    absent. A figure the report references already carries its own note where it would be."""
+    items = [(n, why) for n, why in (failed or {}).items() if n not in set(referenced)]
+    if not items:
+        return None
+    return {"kind": "warning",
+            "title": f"{len(items)} figure{'' if len(items) == 1 else 's'} could not be drawn "
+                     f"in this run",
+            "text": "; ".join(f"`{n}`" + (f": {why.rstrip('.')}" if why else "")
+                              for n, why in items)
+                    + " (make_figures.R's `failed` list in `figures/figures.json`)."}
+
+
+def inferred_note(prov, tables_dir):
+    """The fixed "inferred, not measured" callout. Only for a DPC-Quant run (pipeline_id dpc):
+    it is the detection-probability model that supplies inferred values, and its own record
+    (missing_policy) says how -- the page does not restate the policy in its own words."""
+    if (prov.get("pipeline_id") or prov.get("method")) != "dpc":
+        return None
+    qc = os.path.join(tables_dir or "", "QC_detected_vs_inferred.csv")
+    if not os.path.exists(qc):
+        return None
+    try:
+        pct = sorted(float(r["PctInferred"]) for r in csv.DictReader(csv_text(qc)))
+    except (OSError, KeyError, ValueError) as e:
+        print(f"[make_analysis_html] WARNING: {qc} unreadable ({e}); the inferred-values "
+              f"note is left out", file=sys.stderr)
+        return None
+    if not pct:
+        return None
+    dm = os.path.exists(os.path.join(tables_dir, "Detection_Matrix.csv"))
+    policy = (prov.get("missing_policy") or "").strip().rstrip(".")
+    return {"kind": "warning" if pct[-1] >= 50 else "info",
+            "title": "Some values are inferred, not measured",
+            "text": ((f"{policy}. " if policy else
+                      f"Missing-value policy: not recorded in de_provenance.json. ")
+                     + f"Where no precursor of a protein was observed in a sample, its value there "
+                       f"is a model estimate, not a measurement: {pct[0]:.0f}–{pct[-1]:.0f}% of "
+                       f"each sample's protein values (median {pct[len(pct) // 2]:.0f}%) are "
+                       f"inferred in this run (`QC_detected_vs_inferred.csv`). A fold change "
+                       f"where one group was never measured is a detection event, not a measured "
+                       f"magnitude"
+                     + (" — `Detection_Matrix.csv` marks every value." if dm else "."))}
+
+
+def not_measured_note(prov):
+    """The fixed "not tested" callout, from run_de.R's record (2.12.0): in each contrast a protein
+    measured in no run of the compared groups is listed but not tested (`not_measured`), with each
+    contrast's count from `de_tables`. None when the record has no such rule or none was excluded."""
+    rec = prov.get("not_measured") if isinstance(prov.get("not_measured"), dict) else None
+    tabs = prov.get("de_tables") if isinstance(prov.get("de_tables"), dict) else {}
+    per = [(c, t["n_not_measured"]) for c, t in tabs.items()
+           if isinstance(t, dict) and isinstance(t.get("n_not_measured"), int) and t["n_not_measured"]]
+    if not rec or not per:
+        return None
+    return {"kind": "info",
+            "title": "Proteins measured only in other groups are not tested in a comparison",
+            "text": (f"In each comparison, a protein measured in no run of either group compared has "
+                     f"no fold change or p-value: its DE table row says `Evidence` = "
+                     f"*{rec.get('label') or 'not recorded'}*, and it is left out of that comparison's "
+                     f"multiple-testing correction and of the counts of tested proteins here. "
+                     + "; ".join(f"{contrast_label(c)} {n:,}" for c, n in per) + ".")}
+
+
+def database_note(prov, tables_dir, session=None):
+    """The fixed contaminant-database caveat: run_de.R's record says real proteins may have been
+    removed as contaminants (database_risk). Shown by the page itself -- it must never depend
+    on the report writer remembering it -- and naming the proteins: the ones fetch_fasta.py can
+    show are identical to target proteins when the searched FASTA is still readable, else every
+    contaminant group the filter removed (some of which are then real)."""
+    cont = prov.get("contaminants") if isinstance(prov.get("contaminants"), dict) else {}
+    if cont.get("database_risk") is not True:
+        return None
+    removed = []
+    table = cont.get("removed_table")
+    path = os.path.join(tables_dir or "", table) if table else None
+    if path and os.path.exists(path):
+        removed = [r for r in csv.DictReader(csv_text(path))
+                   if (r.get("Contaminant.Group") or "").upper() == "TRUE"]
+    named, how, extra = [], "", ""
+    meta_path = next((m for m in (cont.get("fasta_meta"),
+                                  os.path.join(session, "input", "search.fasta.meta.json")
+                                  if session else None) if m and os.path.exists(m)), None)
+    if meta_path and removed:
+        try:
+            import fetch_fasta
+            meta = load_record(meta_path)     # an unreadable one is said, on the page too
+            if not meta:
+                raise ValueError(f"{os.path.basename(meta_path)} could not be read")
+            tc = fetch_fasta.target_contaminants(meta)
+            named = fetch_fasta.seen_only_as_cont(
+                tc["kept_as_contaminant"],
+                [({t.strip().upper() for t in (r.get("Protein.Group") or "").split(";")},
+                  r.get("Genes") or "?") for r in removed])
+            if named:
+                how = "identical to target proteins, re-checked in the searched FASTA"
+            elif tc.get("legacy_note"):
+                extra = "the searched FASTA could not be re-checked"
+        except Exception as e:                           # said, not swallowed
+            extra = f"the FASTA check could not run: {type(e).__name__}: {e}"
+    if not named and removed:
+        named = sorted({(r.get("Genes") or r.get("Protein.Group") or "?").split(";")[0]
+                        for r in removed}, key=str.lower)
+        how = ("every contaminant group the filter removed; which of them are real cannot be "
+               "told from here" + (f" ({extra})" if extra else ""))
+    text = str(cont.get("database_note") or "").strip()
+    text = text[:1].upper() + text[1:]
+    if named:
+        text += f" Proteins affected ({how}; {len(named)}): {', '.join(named)}."
+    return {"kind": "warning", "title": "Real proteins may have been removed as contaminants",
+            "text": text}
+
+
+def search_record(prov, session=None):
+    """The search's search_provenance.json: the one of the search folder of de_provenance.json's
+    `input` (session.search_folder_of: the report's folder, or its parent for FragPipe's DIA
+    route -- as audit_results.py reads it), else the session's search record wherever it is
+    (session.search_record: output/search_dda/ as much as output/search/, tie-broken by that
+    input; none when the session's records leave the choice open). {} when there is none."""
+    return load_record(search_record_path(prov, session))
+
+
+def search_record_path(prov, session=None):
+    """search_record()'s file, or None: its folder is the search's (the page's notes ask
+    sage_lfq_check.search_quantified of it)."""
+    inp = prov.get("input")
+    beside = _beside_record(inp)
+    if beside:
+        return beside
+    if not session:
+        return None
+    import session as sess                      # one definition of where the search record is
+    return sess.search_record(sess.paths_for(session), inp)[0]
+
+
+def first_pass_note(prov, session=None):
+    """The fixed CAUTION for a DIA-NN --dda search whose second pass failed, so its results are
+    the first-pass report (dda_first_pass.caution decides; the words are AUDIT.md's plain-language
+    row, audit_results.PLAIN). Shown by the page itself: on the no-DE route the audit, which
+    carried it to the page, does not run (C2 biologist M1). None otherwise."""
+    import dda_first_pass
+    if not dda_first_pass.caution(search_record(prov, session)):
+        return None
+    from audit_results import PLAIN
+    return {"kind": "warning", "title": "These results come from the search's first pass",
+            "text": PLAIN["dda_first_pass"][1]["WARN"]}
+
+
+def identifications_only_note(prov, session=None):
+    """The fixed callout for a search for identifications only (sage_lfq_check.search_quantified,
+    the predicate the DE gate shares): no quantities and no differential expression, with the
+    identifications per run from its record (*_identifications.json `per_run`). Shown by the
+    page itself, never left to the writer (C2 biologist M1). None for a quantifying search."""
+    path = search_record_path(prov, session)
+    if not path:
+        return None
+    import sage_lfq_check
+    folder = os.path.dirname(path)
+    if sage_lfq_check.search_quantified(folder):
+        return None
+    per, extra = [], []
+    for name, unit in (("sage_identifications.json", "precursors"),
+                       ("fragpipe_identifications.json", "peptides")):
+        rec = load_record(os.path.join(folder, name))
+        # FragPipe: per_run counts identifications.tsv rows (peptide forms: a peptide with a
+        # modification is a second row); per_run_peptides the distinct peptides (X8 F4). A record
+        # without the second says "forms", never "peptides".
+        distinct = rec.get("per_run_peptides") or {}
+        for run, n in sorted((rec.get("per_run") or {}).items()):
+            n = n.get("precursors") if isinstance(n, dict) else n
+            if not (isinstance(n, int) and not isinstance(n, bool)):
+                continue
+            d = distinct.get(run)
+            if unit == "peptides" and isinstance(d, int) and not isinstance(d, bool):
+                forms = f" ({n:,} peptide forms)" if n != d else ""
+                per.append(f"{run}: {d:,} peptides{forms}")
+            elif unit == "peptides":
+                per.append(f"{run}: {n:,} peptide forms")
+            else:
+                per.append(f"{run}: {n:,} {unit}")
+        # a FragPipe record's contaminant share (the skill's classifier) and, when its protein
+        # groups have no protein-level FDR, that they are not FDR-controlled (Ruling 120)
+        if isinstance(rec.get("contaminant_summary"), str) and rec["contaminant_summary"].strip():
+            extra.append("Contaminants: " + rec["contaminant_summary"].strip())
+        import fragpipe_params
+        if (fragpipe_params.no_protein_fdr(rec.get("protein_fdr"))
+                and isinstance(rec.get("protein_filter"), str)):
+            extra.append("Protein-level filter: " + rec["protein_filter"].strip() + ".")
+    return {"kind": "info", "title": "Identifications only: no quantities",
+            "text": "This search was for identifications only: it measured no protein or "
+                    "peptide amounts, so this report has no differential expression and compares "
+                    "no amounts between samples. The identifications are in the search folder's "
+                    "identifications.tsv"
+                    + (" (identified per run: " + "; ".join(per) + ")." if per else ".")
+                    + "".join(" " + x for x in extra)}
+
+
+def _beside_record(report):
+    """The search_provenance.json of the search folder of `report` (session.search_folder_of: its
+    folder, or its parent for FragPipe's DIA route), when there is one; else None."""
+    if not report:
+        return None
+    import session as sess
+    path = os.path.join(sess.search_folder_of(report), sess.SEARCH_RECORD)
+    return path if os.path.exists(path) else None
+
+
+def protein_fdr_note(prov, session=None):
+    """The fixed CAUTION for a quantified FragPipe search whose protein groups rest on no
+    protein-level FDR (the Nonspecific workflows' --prot 1): its record's `protein_fdr`
+    (run_search.adapt_fragpipe_dda), asked through fragpipe_params.no_protein_fdr -- the one
+    predicate the analysis brief asks too (C2 proteomics H1). An identifications-only search says
+    it in identifications_only_note. None otherwise."""
+    import fragpipe_params
+    q = search_record(prov, session).get("fragpipe_quantity")
+    pfdr = fragpipe_params.recorded_protein_fdr(q)
+    if not (isinstance(q, dict) and q.get("status") in (None, "ok")
+            and fragpipe_params.no_protein_fdr(pfdr)):
+        return None
+    return {"kind": "warning", "title": "The protein groups have no protein-level FDR",
+            "text": "The search filtered its peptide matches at its false discovery rate, but not "
+                    "the protein groups those peptides map to. Protein-level filter: "
+                    + str(pfdr.get("protein_filter") or "").strip().rstrip(".")
+                    + ". So the number of proteins in this report is not a controlled result; "
+                      "read each protein with its peptide evidence."}
+
+
+def semi_specific_note(prov, session=None):
+    """The fixed callout for a semi-specific search (its parameters, read by
+    make_methods.search_record, the reader the Methods use): cleavage_rules.SEMI_SPECIFIC_CAVEAT,
+    the one wording (C2 bio M3). None for any other digest or no search record."""
+    path = search_record_path(prov, session)
+    if not path:
+        return None
+    import cleavage_rules
+    import make_methods
+    try:
+        rec = make_methods.search_record(search_prov=path)
+    except (OSError, ValueError) as e:            # said, never a silent pass
+        print(f"[make_analysis_html] the search record {path} could not be read for its digest: "
+              f"{e}", file=sys.stderr)
+        return None
+    text = cleavage_rules.semi_specific_caveat((rec or {}).get("cleavage"))
+    return {"kind": "info", "title": "A semi-specific search", "text": text} if text else None
+
+
+def added_sequences_note(session=None):
+    """The fixed callout for the user's own target sequences in the search database (fetch_fasta
+    --add-fasta: a bait, a tag), from the session's FASTA sidecar, worded by
+    make_methods.added_sequences_sentence (the one description): what was added, the
+    contaminant entries removed because most of each is an added protein, and the peptides an
+    added sequence shares with a contaminant kept beside it -- ambiguous between the two, which a
+    reader of its numbers must know. A warning when there are such peptides; None when nothing
+    was added."""
+    fmeta = load_record(os.path.join(session, "input", "search.fasta.meta.json")) if session else {}
+    if not fmeta.get("added_sequences"):
+        return None
+    from make_methods import added_sequences_sentence
+    text = added_sequences_sentence(fmeta).strip()
+    shared = bool(fmeta.get("contaminants_sharing_peptides_with_added_sequences"))
+    return {"kind": "warning" if shared else "info",
+            "title": ("Added sequences share peptides with contaminants" if shared
+                      else "Sequences added to the search database"), "text": text}
+
+
+def search_inputs_note(prov, session=None):
+    """The fixed flag for repeats in the search's input list (search_provenance.json
+    `repeated_paths`: one file listed more than once and searched once; `repeated_names`:
+    different files sharing a run name), worded by check_report_runs.repeats_text -- the one
+    wording, shared with stderr and the HT manifest. None when nothing was repeated."""
+    sprov = search_record(prov, session)
+    paths = [r for r in sprov.get("repeated_paths") or [] if isinstance(r, dict) and r.get("path")]
+    names = [r for r in sprov.get("repeated_names") or [] if isinstance(r, dict) and r.get("paths")]
+    if not (paths or names):
+        return None
+    from check_report_runs import repeats_text
+    return {"kind": "warning" if names else "info",
+            "title": "The search's file list repeated runs", "text": " ".join(
+                t[:1].upper() + t[1:] + "." for t in repeats_text(paths, names))}
+
+
+def search_measurement_note(prov, session=None):
+    """The fixed CAUTION for a search that fell back instead of measuring its scan window or mass
+    accuracy (search_provenance.json scan_window.mode / mass_acc.mode), worded by
+    probe_fallback.caution() -- the one wording, shared with AUDIT.md and the run record. Shown by
+    the page itself, like database_note: it must never depend on the report writer remembering
+    it. The search record is search_record's: the one beside de_provenance.json's `input` (as
+    audit_results.py reads it), else the session's, wherever its search is. None when nothing
+    fell back."""
+    sprov = search_record(prov, session)
+    if not sprov:
+        return None
+    # provenance_caution() type-checks every piece: a malformed record never stops the page
+    from probe_fallback import measurement_note, provenance_caution
+    text, note = provenance_caution(sprov), measurement_note(sprov)
+    if not (text or note):
+        return None
+    return {"kind": "warning",
+            "title": ("The search did not measure what it was to measure" if text else
+                      "The probed runs disagreed on the mass accuracy"),
+            "text": " ".join(x for x in (text, note) if x)}
+
+
+def runs_left_out_note(prov):
+    """The fixed callout for runs the search reported that the DE left out (run_de.R's
+    `runs_left_out`; reasons from collect_conditions.py --validate --exclude), worded by
+    make_methods.de_runs_left_out_sentence (the one description). A warning when a run has no
+    recorded reason, or its decisions record could not be read (`reasons_unreadable`: the
+    sentence then says "reason not read"); None when every searched run was analysed."""
+    from make_methods import de_runs_left_out_sentence
+    text = de_runs_left_out_sentence(prov)
+    if not text:
+        return None
+    runs = (prov.get("runs_left_out") or {}).get("runs") or []
+    unexplained = any(not (isinstance(x, dict) and isinstance(x.get("reason"), str)
+                           and x["reason"].strip()) for x in runs)
+    # a design run that had no quantities was meant to be analysed: always a warning
+    unexplained = unexplained or bool((prov.get("runs_left_out") or {}).get("not_quantified"))
+    # the reasons exist but could not be read: never an info callout
+    unexplained = unexplained or bool((prov.get("runs_left_out") or {}).get("reasons_unreadable"))
+    return {"kind": "warning" if unexplained else "info",
+            "title": "Searched runs left out of the analysis", "text": text}
+
+
+def covariate_note(prov):
+    """The fixed callout for a continuous covariate (run_de.R --numeric-covariates): every group
+    comparison is adjusted for it, worded by make_methods.de_covariate_sentence (the one
+    description). A warning when Group explains most of its variance (the record's `confounded`);
+    None when every covariate was a factor."""
+    from make_methods import de_covariate_sentence
+    text = de_covariate_sentence(prov)
+    if not text:
+        return None
+    terms = ((prov.get("covariates") or {}).get("terms") or []) \
+        if isinstance(prov.get("covariates"), dict) else []
+    warn = any(isinstance(t, dict) and t.get("confounded") is True for t in terms)
+    return {"kind": "warning" if warn else "info",
+            "title": ("Comparisons adjusted for a covariate that nearly matches the groups" if warn
+                      else "Comparisons adjusted for a continuous covariate"), "text": text}
+
+
+def keratin_note(prov):
+    """The fixed keratin-sample callout: run_de.R's record says these samples are keratin (hair,
+    wool, feather, skin, nail) and keratin is the analyte -- what was kept and why, worded by
+    make_methods.de_keratin_sentence (the one description). A warning when the record carries a
+    caution (keratin entries left in the search database, not identified, or added by the search
+    engine itself). None for any other sample."""
+    cont = prov.get("contaminants") if isinstance(prov.get("contaminants"), dict) else {}
+    k = cont.get("keratin_sample") if isinstance(cont.get("keratin_sample"), dict) else {}
+    if k.get("value") is not True:
+        return None
+    from make_methods import de_keratin_sentence
+    text = de_keratin_sentence(cont)
+    warn = k.get("caution") is True
+    note = str(k.get("note") or "").strip()
+    if warn and note:
+        text += f" {note[:1].upper()}{note[1:]}"
+    return {"kind": "warning" if warn else "info",
+            "title": "Keratin sample: keratin is the analyte, not a contaminant", "text": text}
+
+
+TOP_K = 20
+
+
+def top_data(tables, a, prov):
+    """Top TOP_K proteins by adj.P per contrast, with a measured-vs-inferred note."""
+    if not tables.contrasts:
+        return []
+    cond = os.path.join(a.session, "input", "conditions.csv") if a.session else None
+    note = detection_note_fn(a.tables, prov, cond)
+    word = "quantified" if (prov.get("detection_matrix") or {}).get("zero_means") == "missing" \
+        else "detected"
+    kept = keratin_kept_accessions(prov)
+    out = []
+    for c in tables.contrasts:
+        raw = tables.label.get(c)
+        rows = []
+        for r in tables.top(c, TOP_K):
+            det = note(r.get("Protein.Group"), raw, r) if note else None
+            if det is None and detected_columns(r, raw):
+                det = f"{word} {detected_columns(r, raw)}"
+            prot, name = (r.get("Protein.Group") or "?"), gene_label(r, describe=False)
+            # the name column never repeats the accession: no gene and no entry name -> "—"
+            rows.append({"protein": prot, "gene": "—" if name == prot.split(";")[0] else name,
+                         "desc": short_description(r.get("Description")),
+                         "lfc": r["_lfc"], "p": r["_p"], "sig": r["_p"] < tables.adjp,
+                         "det": det, "flag": background_flag(r.get("Genes"), r.get("Protein.Group"),
+                                                             r.get("Protein.Names"), kept)})
+        out.append({"contrast": tables.display(c), "rows": rows, "counts": tables.counts(c),
+                    "adjp": tables.adjp})
+    return out
+
+
+# ---- protein-set tests (run_sets.R) ---------------------------------------------------------
+# Drawn from run_sets.R's own record: its counts, its reading rules and its methods paragraph are
+# quoted, never restated here. Detail tables list only sets significant in BOTH tests -- a list
+# of one-test sets invites reading a broad shift as a specific category.
+SETS_RECORD = "sets_provenance.json"
+SETS_TITLE = "Protein-set tests"
+SETS_TOP = 10
+
+
+def _sets_detail(tables_dir, cn, c, check_col, check, what="sets"):
+    """The sets significant in BOTH tests for one comparison, as a Markdown table."""
+    path = os.path.join(tables_dir, c.get("file") or "")
+    try:
+        top = [r for r in csv.DictReader(csv_text(path)) if r.get("Call") == "camera + fry"]
+    except OSError:
+        top = []
+    L = [f"**{contrast_label(cn)}** ({what}) — sets significant in both tests ({len(top)}; the "
+         f"first {min(len(top), SETS_TOP)} by FDR, `{c.get('file')}`):", "",
+         f"| Set | Source | Proteins | Mean log2FC | camera FDR | fry FDR | {check_col} | Flags |",
+         "|---|---|---|---|---|---|---|---|"]
+    for r in top[:SETS_TOP]:
+        L.append(f"| {r.get('Set_Name')} | {r.get('Source')} | {r.get('NGenes')} | "
+                 f"{float(r['Mean_logFC']):.2f} | {r.get('camera_Direction')} "
+                 f"{fmt_p(float(r['camera_FDR']))} | {r.get('fry_Direction')} "
+                 f"{fmt_p(float(r['fry_FDR']))} | {check(r)} | {r.get('Flags') or ''} |")
+    return L + [""]
+
+
+def sets_data(tables_dir, figures_dir, base, suggested=()):
+    """run_sets.R's record -> {"md": section text, "figures": [names shown], "all_figures":
+    [every figure it drew], "captions": {name: caption}}, or None without a record."""
+    rec = load_record(os.path.join(tables_dir or "", SETS_RECORD)) if tables_dir else {}
+    if not rec:
+        return None
+    fdr = (rec.get("settings") or {}).get("fdr", {}).get("value")
+    fdr_s = f"{fdr:g}" if isinstance(fdr, (int, float)) else "the recorded threshold"
+    sets = rec.get("settings") or {}
+
+    def val(k):
+        v = sets.get(k) or {}
+        tagged = str(v.get("source", "")).startswith("DEFAULT")
+        return f"{v.get('value')}" + (" (DEFAULT — not user-confirmed)" if tagged else "")
+    fig_dir = os.path.normpath(os.path.join(tables_dir, rec.get("figure_dir") or ""))
+
+    def fig_ref(name):
+        return os.path.relpath(os.path.join(fig_dir, name), base).replace(os.sep, "/")
+
+    srcs = "; ".join(s.get("name", "?") for s in (rec.get("sources") or {}).values()) or \
+        "not recorded"
+    L = [f"Protein-set tests ask whether a predefined group of proteins ({srcs}) shifted "
+         "together in a comparison, even when few of its proteins change enough on their own. "
+         "**camera** asks whether the set's proteins changed *more than the other proteins* "
+         "(competitive); **fry** asks whether they changed *at all* (self-contained). Both use "
+         f"the differential-expression model itself. Significant: FDR < {fdr_s} "
+         f"(Benjamini–Hochberg across the sets of each comparison); sets of {val('min_size')} to "
+         f"{val('max_size')} tested proteins; camera's inter-protein correlation "
+         f"{val('camera_inter_gene_cor')}.", ""]
+    rows, shown, all_figs, caps, detail = [], [], [], {}, []
+    for cn, c in (rec.get("contrasts") or {}).items():
+        role = c.get("ip_role")
+        what = {"control_vs_control": " — control vs control: the lysate background",
+                "bait_vs_control": " — bait vs control: what co-purifies",
+                "bait_between_conditions": " — one bait between conditions (not normalised)"
+                }.get(role, "")
+        # camera's count is not a result where camera has little power (the record says where)
+        cam = (f"{c.get('camera', '?')} (little power)" if c.get("camera_low_power")
+               else f"{c.get('camera', '?')}")
+        rows.append(f"| {contrast_label(cn)}{what} | {c.get('n_significant_proteins', '?')} | "
+                    f"{c.get('n_sets', '?')} | {cam} | {c.get('fry', '?')} | "
+                    f"{c.get('reading') or 'no reading recorded'} |")
+        if c.get("figure") and not str(c["figure"]).startswith("skipped"):
+            all_figs.append(c["figure"])
+            caps[c["figure"]] = (f"Each point is a protein set in {contrast_label(cn)}: its effect "
+                                 "(mean log2 fold change of its proteins) against camera's FDR (left) "
+                                 "and fry's (right); the colour says which test is significant, a "
+                                 f"hollow point carries a flag ({c.get('file')}).")
+        if c.get("both"):
+            detail.append((cn, c))
+        if c.get("figure") in all_figs and (c.get("both") or cn in suggested):
+            shown.append((cn, c["figure"]))
+    L += ["| Comparison | Significant proteins | Sets tested | camera | fry | What it shows |",
+          "|---|---|---|---|---|---|", *rows, ""]
+    for cn, c in detail:
+        L += _sets_detail(tables_dir, cn, c, "Run depth",
+                          lambda r: "/".join(x for x in (r.get("camera_Depth"), r.get("fry_Depth"))
+                                             if x) or "—")
+    for cn, fn in shown:
+        L += [f"![Protein-set tests: {contrast_label(cn)}]({fig_ref(fn)})", ""]
+    ip = rec.get("pulldown") or {}
+    baits = ip.get("baits") or {}
+    if baits:
+        L += ["**Pulldown: between-condition tests relative to each bait's complex.** Each IP was "
+              "offset by the median of its bait's interactome (" + (ip.get("interactome_rule") or
+              "rule not recorded") + "); sets within the interactome were then compared between "
+              "conditions. The recovery difference is how much less (negative) or more of the "
+              "complex the first condition's IPs brought down, by each reference.", ""]
+        # the general statement once here; each bait's reading (in the table) gives its own numbers
+        bias = ip.get("direction_bias") or ""
+        if bias:
+            L += [f"**What these tests see less well.** {bias}", ""]
+        L += ["| Bait | Comparison | Interactome proteins | Recovery difference, interactome / "
+              "bait protein (log2) | Sets | camera | fry | What it shows |",
+              "|---|---|---|---|---|---|---|---|"]
+        for b, r in baits.items():
+            if r.get("skipped"):
+                L.append(f"| {b} | — | — | — | not run: {r['skipped']} | | | |")
+                continue
+            od = r.get("offset_difference") or {}
+            for cn, c in (r.get("contrasts") or {}).items():
+                diff = " / ".join(f"{od[k][cn]:+.2f}" if cn in (od.get(k) or {}) else "—"
+                                  for k in ("interactome", "bait"))
+                if c.get("error"):
+                    L.append(f"| {b} | {contrast_label(cn)} | {r.get('n_interactome')} | {diff} | "
+                             f"not run: {c['error']} | | | |")
+                    continue
+                L.append(f"| {b} | {contrast_label(cn)} | {r.get('n_interactome')} | {diff} | "
+                         f"{c.get('n_sets')} | {c.get('camera')} | {c.get('fry')} | "
+                         f"{c.get('reading') or 'no reading recorded'} |")
+                if c.get("figure") and not str(c["figure"]).startswith("skipped"):
+                    all_figs.append(c["figure"])
+                    caps[c["figure"]] = (f"Bait-normalised set tests, {contrast_label(cn)}: each "
+                                         "point is a set within the interactome; effect relative "
+                                         "to the reference against camera's and fry's FDR "
+                                         f"({c.get('file')}).")
+            if r.get("bait_normaliser_note"):
+                L.append(f"| {b} | | | {r['bait_normaliser_note']} | | | | |")
+        L.append("")
+        for b, r in baits.items():
+            for cn, c in (r.get("contrasts") or {}).items():
+                if c.get("both"):
+                    L += _sets_detail(tables_dir, cn, c, "Other reference",
+                                      lambda row: row.get("Reference_Robust") or "—",
+                                      f"bait {b}, relative to the {c.get('reference')} reference")
+    rules = rec.get("reading") or []
+    if rules:
+        L += ["**How to read these** (run_sets.R's rules, `sets_provenance.json`):", ""]
+        L += [f"- {x}" for x in rules] + [""]
+    if rec.get("methods_paragraph"):
+        L += [f"*Methods:* {rec['methods_paragraph']}", ""]
+    return {"md": "\n".join(L), "figures": [fn for _, fn in shown], "all_figures": all_figs,
+            "captions": caps}
+
+
+def severity(title, content):
+    """Callout severity for the sections a PI must not miss; None for ordinary sections."""
+    t = norm_title(title)
+    txt = html.unescape(re.sub(r"<[^>]+>", " ", content))
+    crit = "⛔" in txt or re.search(r"\bFAIL\b|\bcritical\b|CONFOUNDED", txt, re.I)
+    if (t in SUPERSEDED_BY["audit"] or "audit" in t or t in SUPERSEDED_BY["quality"]
+            or "quality notes" in t or "expert review" in t or "caveat" in t):
+        return "critical" if crit else "warning"
+    return None
+
+
+# ------------------------------------------------------------------ renderer 1: HTML
+def render_html(title, subtitle, sections, figs, facts, used, feedback=None, star=None):
+    emitted = set()
+    hf = _HtmlFigs(figs, emitted)
+    body = []
+    for sec in sections:
+        parts = []
+        for b in sec["blocks"]:
+            if b[0] == "md":
+                parts.append(md_to_html(b[1], hf, used=used)[0])
+            elif b[0] == "glance":
+                parts.append(glance_html(b[1]))
+            elif b[0] == "gallery":
+                if b[1] == "Quality control":
+                    parts.append(rs.callout("info", "<p>Read these first. They decide how much "
+                                            "weight the results below can carry &mdash; a volcano "
+                                            "plot looks equally convincing whether or not the run "
+                                            "was any good.</p>"))
+                parts += [figs.html("", fn, emitted) for fn in b[2]]
+            elif b[0] == "top":
+                parts.append(top_html(b[1]))
+            elif b[0] in ("submission", "raw"):
+                parts.append(b[1])
+        body.append(rs.section(sec["anchor"], md_inline(sec["title"]), "".join(parts), sec["kind"]))
+    if star:                                     # the GitHub star line, before the survey
+        body.append(star)
+    if feedback:                                 # the Core's survey line, last in the page
+        body.append(feedback)
+    return rs.page(title, "".join(body),
+                   toc=[(s["anchor"], md_inline(s["title"])) for s in sections],
+                   facts=facts, subtitle=md_inline(subtitle) if subtitle else None,
+                   footer=(f"Self-contained: all {figs.n} figure(s) are embedded, so this one file "
+                           f"is the whole report &mdash; no network needed; copy it anywhere and "
+                           f"double-click to open. A plain-text twin, Analysis_Report.md, and a "
+                           f"PDF, Analysis_Report.pdf, carry the same content. Generated by the UC Davis "
+                           f"Proteomics Core pipeline skill (make_analysis_html.py). Click a figure "
+                           f"to enlarge it."))
+
+
+def glance_html(g):
+    out = [rs.stat_tiles([(v, lab, None, "key") for v, lab in g["tiles"]])] if g["tiles"] else []
+    if g["contrasts"]:
+        out.append(rs.stat_tiles(
+            [(r["up"] + r["down"], r["contrast"],
+              f"&#9650;&thinsp;{r['up']:,} up &nbsp;&#9660;&thinsp;{r['down']:,} down", None)
+             for r in g["contrasts"]],
+            heading=f"Significant proteins per contrast (adj. p < {g['adjp']:g}"
+                    + ("" if g["recorded"] else ", default — not recorded") + ")"))
+        out.append(f"<p class='lead'>Counted directly from the DE tables. {md_inline(g['rule'])}</p>")
+    for i in g["notes"]:
+        out.append(rs.callout(i["kind"], f"<p>{md_inline(i['text'])}</p>", title=i["title"]))
+    return "".join(out)
+
+
+def _top_lead():
+    return (f"The {TOP_K} proteins with the smallest adjusted p per contrast, from the DE tables "
+            f"(the full lists are the DE_*.csv files). {LOGFC_DIRECTION} A row flagged Ig chain "
+            f"(the antibody's own chains) or contaminant is not the sample's biology.")
+
+
+def _ns_divider(t):
+    return f"not significant below this line (adj.P ≥ {t['adjp']:g})"
+
+
+def top_name_columns(rows):
+    """-> (show the Gene column, show the Description column). A table whose rows carry a FASTA
+    description (run_silac.R's) shows it; the Gene column goes when no row has a gene or entry
+    name -- a database without them (NCBI) would fill it with dashes."""
+    desc = any(r.get("desc") for r in rows)
+    gene = not desc or any(r["gene"] != "—" for r in rows)
+    return gene, desc
+
+
+def top_html(top):
+    out = [f"<p class='lead'>{md_inline(_top_lead())}</p>"]
+    for t in top:
+        tested, up, dn = t["counts"]
+        det = any(r["det"] for r in t["rows"])
+        flag = any(r["flag"] for r in t["rows"])
+        gene, desc = top_name_columns(t["rows"])
+        head = (["Protein"] + (["Gene"] if gene else []) + (["Description"] if desc else [])
+                + ["log2FC", "adj.P"] + (["Measured"] if det else [])
+                + (["Note"] if flag else []))
+        body, prev_sig = [], True
+        for r in t["rows"]:
+            if prev_sig and not r["sig"]:
+                body.append({"divider": _ns_divider(t)})
+            prev_sig = r["sig"]
+            body.append([rs.esc(r["protein"])] + ([rs.esc(r["gene"])] if gene else [])
+                        + ([rs.esc(r.get("desc") or "")] if desc else [])
+                        + [f"{r['lfc']:+.2f}", fmt_p(r["p"])]
+                        + ([rs.esc(r["det"] or "")] if det else [])
+                        + ([f"<b>{rs.esc(r['flag'])}</b>" if r["flag"] else ""] if flag else []))
+        # open: a closed <details> does not print, and the PDF must carry these tables
+        out.append(f"<details open><summary><strong>{rs.esc(t['contrast'])}</strong> &mdash; "
+                   f"{up + dn:,} significant ({up:,} up, {dn:,} down)</summary>"
+                   f"{rs.table([rs.esc(h) for h in head], body)}</details>")
+    return "".join(out)
+
+
+# ------------------------------------------------------------------ renderer 2: Markdown
+_TAGS = re.compile(r"</?(?:br|img|div|span|p|b|i|em|strong|sup|sub|code|a|table|thead|tbody|"
+                   r"tr|td|th|details|summary|font|u|hr|section|figure|figcaption)\b[^>]*>", re.I)
+
+
+def md_expand(text, figs, emitted, md_dir):
+    """The report's Markdown with every image reference replaced by its text-bearing figure
+    block (image link + caption + data summary), and any HTML tag stripped."""
+    out, fence = [], False
+    for ln in text.splitlines():
+        if ln.startswith("```"):
+            fence = not fence
+            out.append(ln)
+            continue
+        if fence or not IMG_REF.search(ln):
+            out.append(_TAGS.sub("", ln) if not fence else ln)
+            continue
+        if ln.lstrip().startswith("|"):          # inside a table: a reference, not a block
+            out.append(_TAGS.sub("", IMG_REF.sub(
+                lambda m: _fig_word(figs.resolve(*_ref(m))), ln)))
+            continue
+        # A figure is a block: blank lines around it, so neither the text before nor the
+        # line after (often the next figure, or a list) runs into it.
+        last = 0
+        for m in IMG_REF.finditer(ln):
+            text = _TAGS.sub("", ln[last:m.start()]).strip()
+            if text:
+                out += ["", text]
+            out += ["", figs.md(*_ref(m), emitted, md_dir), ""]
+            last = m.end()
+        text = _TAGS.sub("", ln[last:]).strip()
+        if text:
+            out += [text, ""]
+    return "\n".join(out)
+
+
+def _fig_word(e):
+    if e["status"] == "suppressed":
+        return ""
+    return f"Figure {e['n']}" if e["status"] == "ok" else f"[{e['text']}]"
+
+
+def quote(text):
+    return "\n".join(("> " + ln) if ln.strip() else ">" for ln in text.strip("\n").splitlines())
+
+
+def render_md(title, subtitle, sections, figs, facts, md_dir, feedback=None, star=None):
+    emitted = set()
+    L = [f"# {title}", ""]
+    fl = " · ".join(f"**{k}:** {v}" for k, v in facts if v not in (None, ""))
+    if fl:
+        L += [fl, ""]
+    if subtitle:
+        L += [_TAGS.sub("", subtitle), ""]
+    L += ["*This is the plain-text twin of Analysis_Report.html, made from the same sections, for "
+          "NotebookLM or other AI notebooks: each figure's caption and the numbers it shows are "
+          "written out as text.*", ""]
+    for sec in sections:
+        L += [f"## {sec['title']}", ""]
+        parts = []
+        for b in sec["blocks"]:
+            if b[0] == "md":
+                parts.append(md_expand(b[1], figs, emitted, md_dir).strip("\n"))
+            elif b[0] == "glance":
+                parts.append(glance_md(b[1]))
+            elif b[0] == "gallery":
+                parts += [figs.md("", fn, emitted, md_dir) for fn in b[2]]
+            elif b[0] == "top":
+                parts.append(top_md(b[1]))
+            elif b[0] in ("submission", "raw"):
+                parts.append(b[2])
+        body = "\n\n".join(p for p in parts if p.strip())
+        if sec["kind"]:
+            body = quote(f"**{rs.CALLOUT_KINDS[sec['kind']][1]}.**\n\n{body}")
+        L += [body, ""]
+    footer = [x for x in (star, feedback) if x]
+    if footer:
+        L += ["---", ""] + [y for x in footer for y in (x, "")]
+    doc = "\n".join(L)
+    return re.sub(r"\n{3,}", "\n\n", doc).rstrip() + "\n"
+
+
+def glance_md(g):
+    out = []
+    if g["tiles"]:
+        out.append(" · ".join(f"**{v:,}** {lab}" for v, lab in g["tiles"]))
+    if g["contrasts"]:
+        rows = ["| Contrast | Significant | Up | Down | Tested |", "|---|---:|---:|---:|---:|"]
+        rows += [f"| {r['contrast']} | {r['up'] + r['down']:,} | {r['up']:,} | {r['down']:,} | "
+                 f"{r['tested']:,} |" for r in g["contrasts"]]
+        out.append("\n".join(rows))
+        out.append(g["rule"])
+    for i in g["notes"]:
+        out.append(quote(f"**{rs.CALLOUT_KINDS[i['kind']][1]}:** {i['title']}. {i['text']}"))
+    return "\n\n".join(out)
+
+
+def top_md(top):
+    out = [_top_lead()]
+    for t in top:
+        tested, up, dn = t["counts"]
+        det = any(r["det"] for r in t["rows"])
+        flag = any(r["flag"] for r in t["rows"])
+        gene, desc = top_name_columns(t["rows"])
+        ncol = 3 + gene + desc + det + flag
+        rows = [f"### {t['contrast']}", "",
+                f"{up + dn:,} significant ({up:,} up, {dn:,} down) of {tested:,} tested.", "",
+                "| Protein |" + (" Gene |" if gene else "") + (" Description |" if desc else "")
+                + " log2FC | adj.P |" + (" Measured |" if det else "")
+                + (" Note |" if flag else ""),
+                "|---|" + ("---|" if gene else "") + ("---|" if desc else "") + "---:|---:|"
+                + ("---|" if det else "") + ("---|" if flag else "")]
+        prev_sig = True
+        for r in t["rows"]:
+            if prev_sig and not r["sig"]:
+                rows.append(f"| *{_ns_divider(t)}* |" + " |" * (ncol - 1))
+            prev_sig = r["sig"]
+            cell = (r.get("desc") or "").replace("|", "/")
+            rows.append(f"| {r['protein']} |" + (f" {r['gene']} |" if gene else "")
+                        + (f" {cell} |" if desc else "")
+                        + f" {r['lfc']:+.2f} | {fmt_p(r['p'])} |"
+                        + (f" {r['det'] or ''} |" if det else "")
+                        + (f" **{r['flag']}** |" if r["flag"] else " |" if flag else ""))
+        out.append("\n".join(rows))
+    return "\n\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--session", help="session dir; infers report/figures/tables under output/")
+    ap.add_argument("--report", help="analysis report markdown")
+    ap.add_argument("--figures", help="figures dir")
+    ap.add_argument("--tables", help="DE tables dir")
+    ap.add_argument("--quality", help="SAMPLE_QUALITY.md")
+    ap.add_argument("--audit", help="AUDIT.md")
+    ap.add_argument("--title", help="page title (default: the report's own # heading)")
+    ap.add_argument("--submission", help="CoreOmics submission to show (a record file or fetch's "
+                                         "folder); default: the one attached to --session")
+    ap.add_argument("--adjp", type=float, default=0.05,
+                    help="only when the tables carry no de_provenance.json (its adjp wins)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--md-out", help="the Markdown twin (default: --out with .md, e.g. "
+                                     "output/Analysis_Report.md)")
+    ap.add_argument("--no-pdf", action="store_true",
+                    help="skip the PDF (default: print the HTML to --out with .pdf with a "
+                         "headless Chrome/Chromium/Edge when one is installed)")
+    a = ap.parse_args()
+    _UNREADABLE.clear()                  # one page per run
+
+    if a.session:
+        o = os.path.join(a.session, "output")
+        a.report = a.report or os.path.join(o, "AI_Analysis_Report.md")
+        a.figures = a.figures or os.path.join(o, "figures")
+        a.tables = a.tables or os.path.join(o, "tables")
+        for attr, fn in (("quality", "SAMPLE_QUALITY.md"), ("audit", "AUDIT.md")):
+            p = os.path.join(o, fn)
+            if not getattr(a, attr) and os.path.exists(p):
+                setattr(a, attr, p)
+    has_report = bool(a.report and os.path.exists(a.report))
+    prov = load_record(os.path.join(a.tables, "de_provenance.json")) if a.tables else {}
+    md_out = a.md_out or (os.path.splitext(a.out)[0] + ".md")
+    if os.path.abspath(md_out) == os.path.abspath(a.report or ""):
+        sys.exit("[make_analysis_html] --md-out would overwrite the report it is made from")
+
+    fjd = read_figures_json(a.figures)
+    if fjd["error"]:
+        print(f"[make_analysis_html] WARNING: figures.json {fjd['error']}; captions and its "
+              f"figure list are not used", file=sys.stderr)
+    have_fj = fjd["found"] and not fjd["error"]
+    a._listed = [f["file"] for f in fjd["figures"]]
+    caps = {f["file"]: f["caption"] for f in fjd["figures"]}
+    # make_figures.R's `failed` list: figures it tried and could not draw this run
+    failed = {f["file"]: f["reason"] for f in fjd["failed"]}
+    available = (sorted(fn for fn in os.listdir(a.figures) if fn.lower().endswith(IMAGE_EXT))
+                 if a.figures and os.path.isdir(a.figures) else [])
+
+    adjp, adjp_src = significance_rule(a.tables, a.adjp)
+    tables = Tables(a.tables, prov, adjp, adjp_src)
+    qc = os.path.join(a.tables or "", "QC_detected_vs_inferred.csv")
+    em = os.path.join(a.tables or "", "Expression_Matrix.csv")
+    # Images resolve relative to the report's folder and must stay inside the session.
+    base = os.path.dirname(os.path.abspath(a.report)) if has_report else (a.figures or ".")
+    root = os.path.abspath(a.session) if a.session else base
+    complete, complete_why = matrix_complete(a.tables, prov)
+    # run_sets.R's section: its figures are its own record's, not figures.json's
+    a._sets = sets_data(a.tables, a.figures, base,
+                        suggested=(prov.get("set_tests") or {}).get("suggested_for") or ())
+    if a._sets:
+        caps.update(a._sets["captions"])
+    # the peak check's section: its pictures are its own record's (output/skyline/), not
+    # figures.json's
+    out_dir = (os.path.join(a.session, "output") if a.session
+               else os.path.dirname(os.path.abspath(a.tables)) if a.tables else None)
+    a._peaks = skyline_peaks.report_data(out_dir, base) if out_dir else None
+    # the peak check's state this report is made with, for its record (report_files.
+    # mark_skill_report facts): a delivery never ships skyline/ beside a report that says the
+    # check was not part of it (skyline_peaks.report_disagrees)
+    a._peak_state = ((a._peaks or {}).get("state") or "missing") if out_dir else None
+    if a._peaks:
+        caps.update(a._peaks["captions"])
+    figs = Figures(base, root, a.figures, caps,
+                   summarize=lambda nm: figure_summary(nm, tables, qc, em),
+                   suppress=SUPPRESS_WHEN_COMPLETE if complete else (),
+                   current=(a._listed + (a._sets["all_figures"] if a._sets else [])
+                            + (a._peaks["figures"] if a._peaks else [])) if have_fj
+                   else None, failed=failed)
+
+    md_text = md_orig = None
+    n_par = 0
+    if has_report:
+        import core_submission            # ... and its survey + star lines (the twin's): added below
+        md_text = md_orig = core_submission.strip_feedback(
+            make_podcast.strip_block(read_text(a.report)))  # its Listen line: the card is below
+        # The client never saw a draft: Expert Review Notes and the audit state what was checked,
+        # in the present tense; the review -> fix history is logs/decisions.md's (staff only).
+        # A warning, not a stop -- the phrases are a lint, and a staff member reads the report.
+        hist = draft_history(md_orig) + draft_history_loose(md_orig)
+        if hist:
+            print(f"[make_analysis_html] WARNING: draft history in {os.path.basename(a.report)} "
+                  f"({len(hist)} place(s)): " + " | ".join(f"\"{h}\"" for h in hist[:8])
+                  + " -- the client never saw a draft: say what was checked and where the report "
+                    "deals with it, in the present tense; the review history goes in "
+                    "logs/decisions.md (SKILL.md step 8d)", file=sys.stderr)
+        # The peak check is a visual check of DIA-NN's peaks: never "confirmed by Skyline"
+        over = peak_check_overclaims(md_orig) + peak_check_overclaims_loose(md_orig)
+        if over:
+            print(f"[make_analysis_html] WARNING: {os.path.basename(a.report)} claims more for the "
+                  f"Skyline peak check than it shows ({len(over)} place(s)): "
+                  + " | ".join(f"\"{o}\"" for o in over[:8])
+                  + " -- Skyline reuses DIA-NN's peak edges by default, so a matching peak is not "
+                    "independent confirmation; say it is a visual check of DIA-NN's peaks, and "
+                    "point to where Skyline picked a different peak (references/skyline.md)",
+                  file=sys.stderr)
+        # The one source both renderers draw from, so the HTML, .md and PDF all lose it.
+        md_text, gone, n_par = drop_suppressed(md_text, figs.suppress)
+        figs.suppressed += [g for g in gone if g not in figs.suppressed]
+    # The CoreOmics submission this run answers goes first: ONE record, attached to the session
+    # (submission_report.py attach) or named by --submission. The record and its rendering
+    # (allowlisted: never a contact or billing field) live in submission_report.py, and its
+    # label is the header's Submission fact -- never a number read from other text.
+    import submission_report
+    sub = submission_report.report_section(a.submission, a.session)
+    # The session's records (manifest, FASTA meta, search provenance) and the QC table a figure
+    # summary reads are read now, before the page is assembled: see build_page().
+    facts = session_facts(a, prov, sub["label"] if sub else None)
+    if os.path.exists(qc):
+        read_text(qc)
+    used = set()
+    sub_anchor = anchor("Submission", used) if sub else None
+    h1, subtitle, sections = build_page(a, prov, tables, figs, md_text, used)
+    # How this report was made is on every page: by itself it is no report
+    if (not [s for s in sections if s["title"] != HOW_MADE_TITLE] and not subtitle
+            and md_text is None):
+        sys.exit("[make_analysis_html] nothing to render — check --session/--report/--figures")
+    title = a.title or (re.sub(r"[*`]", "", h1) if h1 else "Proteomics Analysis Report")
+    if sub:
+        sections.insert(0, {"anchor": sub_anchor, "title": "Submission",
+                            "kind": None, "blocks": [("submission", sub["html"], sub["md"])]})
+
+    # The Core's feedback survey, last in the page and its twin: Core runs only, as
+    # submission_report.core_run decides of the SESSION (the one test, the one input, as README,
+    # link and share ask it; --submission feeds only the Submission section above); the link
+    # and its words are core_submission.feedback_line's. It asks about the podcast when one
+    # exists now.
+    fb = {}
+    core = submission_report.core_run(a.session)
+    if core:
+        pod = make_podcast.has_podcast(os.path.dirname(os.path.abspath(a.out)))
+        import core_submission
+        fb = {fmt: core_submission.feedback_line("report", core["prot"], pod, fmt)
+              for fmt in ("html", "md")}
+    elif a.session:
+        # Not a Core run: for Core staff only, one line saying the survey is left out and how to
+        # add it (submission_report.survey_off_note; None for anyone outside the Core) -- a
+        # warning, never a gate
+        off = submission_report.survey_off_note(a.session)
+        if off:
+            print(f"[make_analysis_html] NOTE: {off}", file=sys.stderr)
+    # Just before it, on every run (Core or not): please star the skill's GitHub repository
+    # (core_submission.star_line, its words and plugin.json's address)
+    import core_submission
+    star = {fmt: core_submission.star_line(fmt) for fmt in ("html", "md")}
+    doc = render_html(title, subtitle, sections, figs, facts, used, feedback=fb.get("html"),
+                      star=star["html"])
+    md_doc = render_md(title, subtitle, sections, figs, facts,
+                       os.path.dirname(os.path.abspath(md_out)), feedback=fb.get("md"),
+                       star=star["md"])
+
+    if has_report:
+        referenced = set(report_figures(md_orig))
+        left_out = [f for f in available if f not in set(figs.embedded) and f not in referenced
+                    and f not in set(a._sets["all_figures"] if a._sets else ())]
+        why = f"not referenced in {os.path.basename(a.report)}"
+    else:
+        left_out = [f for f in available if f not in set(a._listed)
+                    and f not in set(a._sets["all_figures"] if a._sets else ())
+                    and not (figs.suppress and f.startswith(figs.suppress))]
+        why = "not listed in figures.json" if a._listed else "no report and no figures.json"
+    if left_out:
+        print(f"[make_analysis_html] WARNING: {len(left_out)} image(s) in {a.figures} are "
+              f"{why} and were NOT embedded: {', '.join(left_out)}", file=sys.stderr)
+    if figs.suppressed:
+        print(f"[make_analysis_html] left out {', '.join(figs.suppressed)}"
+              + (f" and the report paragraph describing it" if has_report and n_par else "")
+              + f": {complete_why}, so every bar is the same number; "
+              f"qc_detected_vs_inferred.png is the per-sample depth view", file=sys.stderr)
+    if figs.missing:
+        print(f"[make_analysis_html] WARNING: {len(figs.missing)} referenced image(s) are "
+              f"missing and are shown as a 'figure missing' note: {', '.join(figs.missing)}",
+              file=sys.stderr)
+    if figs.rejected:
+        print(f"[make_analysis_html] WARNING: {len(figs.rejected)} image reference(s) point "
+              f"outside the session and were not embedded: {', '.join(figs.rejected)}",
+              file=sys.stderr)
+    if figs.stale:
+        print(f"[make_analysis_html] WARNING: {len(figs.stale)} referenced image(s) are not in "
+              f"this run's figures.json (left from an earlier run) and are shown as a note, not "
+              f"embedded: {', '.join(figs.stale)}", file=sys.stderr)
+
+    # The optional podcast's Listen card and line (make_podcast.py): added before the files are
+    # written, so the HTML, its .md twin and the PDF printed from the HTML all carry it.
+    outdir = os.path.dirname(os.path.abspath(a.out))
+    doc = make_podcast.add_listen_card(doc, outdir)
+    md_doc = make_podcast.add_listen_md(md_doc, outdir)
+    for path, text in ((a.out, doc), (md_out, md_doc)):
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    # The skill's record of its own report (report_files.mark_skill_report, 2.14.2): make_podcast,
+    # deliver and finalize go ahead only for a report this script wrote, as it is now -- a Core submission's
+    # pandoc copy over Analysis_Report.html passed for one. Never silent when it cannot be written.
+    import report_files
+    try:
+        skill_record = os.path.join(os.path.dirname(os.path.abspath(a.out)),
+                                    report_files.SKILL_REPORT_RECORD)
+        report_files.mark_skill_report(
+            a.out, "make_analysis_html.py", _skill_version(),
+            facts={"peak_check_state": a._peak_state}
+            if getattr(a, "_peak_state", None) else None)
+    except OSError as e:
+        skill_record = None
+        print(f"[make_analysis_html] WARNING: {report_files.SKILL_REPORT_RECORD} could not be "
+              f"written ({e.strerror or e}): make_podcast.py, deliver and finalize will not take "
+              f"this report as the skill's until it is", file=sys.stderr)
+    # The PDF: the same HTML through its print stylesheet, so it carries the figures -- for
+    # NotebookLM (which reads a PDF's images too) and for printing. Never fatal: without a
+    # browser (HIVE) it says so, and finalize retries on the laptop.
+    pdf_out = os.path.splitext(a.out)[0] + ".pdf"
+    if a.no_pdf:
+        pdf_status, pdf_note = "INFO", "--no-pdf was given"
+    else:
+        # print_report(): a failed print never leaves an older PDF looking current
+        pdf_status, pdf_note = html_to_pdf.print_report(a.out, pdf_out)
+    pdf_ok = pdf_status == "OK"
+    print(f"[make_analysis_html] {'PDF: ' + pdf_out + ' (' + pdf_note + ')' if pdf_ok else pdf_status + ': no PDF -- ' + pdf_note}",
+          file=sys.stderr)
+    print(json.dumps({"wrote": a.out, "bytes": os.path.getsize(a.out),
+                      "markdown_twin": md_out, "markdown_bytes": os.path.getsize(md_out),
+                      "pdf": pdf_out if pdf_ok else None, "pdf_note": pdf_note,
+                      "figures_embedded": figs.n,
+                      "figure_list": os.path.basename(a.report) if has_report else "figures.json",
+                      "figures_not_embedded": left_out, "figures_missing": figs.missing,
+                      "figures_rejected": figs.rejected, "figures_suppressed": figs.suppressed,
+                      "figures_stale": figs.stale, "pdf_status": pdf_status,
+                      "records_unreadable": dict(_UNREADABLE), "skill_record": skill_record,
+                      "contrasts": len(tables.contrasts), "self_contained": True}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

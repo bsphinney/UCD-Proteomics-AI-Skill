@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# =============================================================================
+# hive_exec.sh  --  Run a command on UC Davis HIVE over SSH using the user's
+# private key. Claude Code runs LOCALLY; this is how the HIVE steps execute.
+#
+#   Set once per session:
+#     export HIVE_USER=<your HIVE user>
+#     export HIVE_KEY=~/.ssh/id_ed25519     # the path the user gave you
+#
+#   Run a command on HIVE:
+#     bash hive_exec.sh 'sbatch ~/run/job.sh'
+#     bash hive_exec.sh 'ls -d /quobyte/proteomics-grp/dia-nn/build_*/diann-*'
+#
+#   Copy files to/from HIVE (helpers):
+#     bash hive_exec.sh --put  ./local/path   '~/remote/path'
+#     bash hive_exec.sh --get  '~/remote/path' ./local/path
+#
+#   Run a command on a HIVE COMPUTE node (one blocking srun, the queue spelled out) -- for
+#   anything heavier than seconds of light work (HPC@UCD's ucd-hpc rules):
+#     bash hive_exec.sh --job --time 30 --mem 4G 'python3 ~/proteomics-pipeline/scripts/...'
+#   --preemptible: the command can be run again, so it runs on the preemptible queue (publicgrp/low).
+#   --session DIR: the session folder it serves; the job starts there and carries
+#   --comment=session:<name> (otherwise it runs in your home and cannot be traced to its session).
+#
+#   Put the skill on HIVE -- once, and again after every skill update:
+#     bash hive_exec.sh --put-skill
+#   = scripts/ AND .claude-plugin/ into ~/proteomics-pipeline/. plugin.json is where every
+#   HIVE-side record reads the skill version (skill_version.py); scripts/ alone reads "unknown".
+#   `bash skill_version.sh --check-hive` (SKILL.md step 0) says when a re-put is due.
+#
+#   Calls share one SSH connection for 10 minutes (ControlMaster); HIVE_SSH_MUX=0 disables.
+#
+#   --put refuses a source that is already on HIVE (a mapped drive or SMB mount of a
+#   share HIVE mounts -- see hive_path.sh) and prints the HIVE path to use in place;
+#   HIVE_PUT_FORCE=1 uploads anyway. With no rsync (Git Bash on Windows has none),
+#   --put/--get use scp.
+#
+# Heavy compute must go through SLURM (sbatch, or --job), never the login node.
+# =============================================================================
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# Env vars do not survive between tool calls / shells, so requiring HIVE_USER in the
+# environment means every helper that shells out (watch_run.sh especially) silently
+# fails with an empty result -- which downstream code reads as "nothing there".
+# Persist it once to a config file and every later invocation just works.
+CFG="${HIVE_ENV_FILE:-$HOME/.config/ucdavis-proteomics/hive.env}"
+if [ -z "${HIVE_USER:-}" ] && [ -f "$CFG" ]; then . "$CFG"; fi
+HU="${HIVE_USER:?set HIVE_USER, or save it once: mkdir -p ~/.config/ucdavis-proteomics && printf \'HIVE_USER=<user>\\nHIVE_KEY=~/.ssh/id_ed25519\\n\' > ~/.config/ucdavis-proteomics/hive.env}"
+# A Core member, 2026-09-23, Windows 11: ssh's default user there is the AD login `AD3+<user>`, and
+# every call that relied on it got "Permission denied". The same name in HIVE_USER fails the
+# same way, after spending one of HIVE's throttled connection attempts -- so stop here.
+case "$HU" in
+  *[+\\@[:space:]]*)
+    guess="${HU##*[+\\]}"; guess="${guess%%@*}"
+    echo "HIVE_USER='$HU' looks like a Windows domain login, not a HIVE username." >&2
+    echo "HIVE usernames are the plain UC Davis login id (probably '$guess'): export HIVE_USER=$guess" >&2
+    exit 2 ;;
+esac
+KEY="${HIVE_KEY:?set HIVE_KEY to the private-key path the user gave you}"
+KEY="${KEY/#\~/$HOME}"
+# Git Bash: the key in the form every ssh there reads. Git's own ssh takes /c/Users/... and
+# C:/Users/...; Windows' OpenSSH only the second, which it used to get from Git Bash's automatic
+# path conversion -- now off for the command (below), so it is given that form here.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*) case "$KEY" in /*) command -v cygpath >/dev/null 2>&1 && KEY="$(cygpath -m "$KEY")" ;; esac ;;
+esac
+HOST="${HIVE_HOST:-hive.hpc.ucdavis.edu}"
+[ -f "$KEY" ] || { echo "private key not found: $KEY" >&2; exit 2; }
+
+# Connection reuse. HIVE's sshd throttles rapid NEW connections (MaxStartups): measured
+# 2026-09-16, 8 quick separate ssh calls got "kex_exchange_identification: read: Operation
+# timed out" for 20+ minutes while the HIVE status page said operational. A multiplexed
+# master makes every later call a channel on one connection instead of a new handshake.
+# %C (a hash of host/user/port) keeps the socket path short -- a spelled-out ControlPath
+# can overflow the ~104-byte unix-socket limit. A stale master prints
+# "mux_client_request_session: read from master failed: Broken pipe" and ssh falls back to
+# a normal connection, which is harmless. Native Windows OpenSSH has no ControlMaster, so
+# it is off there; HIVE_SSH_MUX=0 turns it off anywhere.
+MUX=()
+MUX_E=""
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) HIVE_SSH_MUX=0 ;; esac
+if [ "${HIVE_SSH_MUX:-1}" != "0" ]; then
+  [ -d "$HOME/.ssh" ] || mkdir -m 700 -p "$HOME/.ssh"
+  MUX=(-o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=10m)
+  MUX_E=" -o ControlMaster=auto -o 'ControlPath=$HOME/.ssh/cm-%C' -o ControlPersist=10m"
+fi
+# StrictHostKeyChecking=accept-new: a Core member, 2026-09-23, the first call from a new laptop died
+# "Host key verification failed" -- HIVE was not in known_hosts yet and there is no prompt
+# to answer in a non-interactive call. accept-new records an UNKNOWN key and still refuses
+# a CHANGED one. check_access.sh prints the fingerprint for the user to compare.
+HK=(-o StrictHostKeyChecking=accept-new)
+# Keep-alives: a laptop that sleeps or a VPN that reconnects inside ControlPersist leaves the
+# master on a dead TCP connection, and every later call multiplexes onto it and hangs until
+# TCP gives up -- minutes, with ConnectTimeout not applying (review 2026-09-23). 15 s x 3 =
+# the dead connection is dropped within ~45 s and the next call opens a fresh one.
+HK+=(-o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+# ${MUX[@]+...}: an empty array under `set -u` is an "unbound variable" error in bash < 4.4,
+# and macOS still ships bash 3.2 as /bin/bash.
+SSH=(ssh -i "$KEY" -o IdentitiesOnly=yes -o ConnectTimeout=20 "${HK[@]}" ${MUX[@]+"${MUX[@]}"} "$HU@$HOST")
+# $KEY is single-quoted inside -e: rsync parses that string itself and DOES honour
+# quotes (verified -- a path with a space arrives as one argv entry), whereas bare
+# $KEY gets split and ssh is handed a truncated path. Matches the SSH=() array above.
+RSYNC_E="ssh -i '$KEY' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -o ServerAliveCountMax=3$MUX_E"
+SCP=(scp -i "$KEY" -o IdentitiesOnly=yes "${HK[@]}" ${MUX[@]+"${MUX[@]}"} -r)
+
+# rsync and scp both read the "T" of T:\x as a HOST name. On a Windows shell (Git Bash, MSYS2,
+# Cygwin) spell a drive-letter path the shell's own way first -- cygpath knows /t/x vs
+# /cygdrive/t/x -- for rsync as well as scp (review 2026-09-23: only the scp path did it).
+# Anywhere else a path is left exactly as given.
+winpath() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      case "$1" in
+        [A-Za-z]:[\\/]*)
+          # A trailing \ (T:\Data\P1\) names the folder in Windows terms, but a trailing /
+          # means "copy the CONTENTS" to rsync -- so drop it (review 2026-09-23).
+          local p
+          if command -v cygpath >/dev/null 2>&1; then p="$(cygpath -u "$1")"
+          else p="/$(printf '%s' "${1%%:*}" | tr '[:upper:]' '[:lower:]')/${1:3}"; p="${p//\\//}"; fi
+          while [ "${#p}" -gt 3 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+          printf '%s\n' "$p"; return ;;
+      esac ;;
+  esac
+  printf '%s\n' "$1"
+}
+
+usage() { echo "usage: hive_exec.sh '<command>' | --job [--time MIN] [--mem SIZE] [--cpus N] [--preemptible] [--session DIR] '<command>' | --put <local> <remote> | --get <remote> <local> | --put-skill" >&2; exit 2; }
+
+# A Core member, 2026-09-23: T:\Data\lab\service\... went up by scp (7.1 GB, ~20 min) although T: is
+# the Flinders share HIVE mounts at /nfs/lssc0/flinders/proteomics. hive_path.sh makes no
+# ssh call for an ordinary local path, so this costs nothing unless the source is on a share.
+put_guard() {
+  [ "${HIVE_PUT_FORCE:-0}" = 1 ] && return 0
+  local j rc
+  j="$(bash "$HERE/hive_path.sh" "$1")"; rc=$?
+  case $rc in
+    0) echo "REFUSING --put: '$1' is already on HIVE -- use the hive_path below in place." >&2
+       printf '%s\n' "$j" | grep -E '^  "(hive_path|how)"' >&2
+       echo "(HIVE_PUT_FORCE=1 uploads it anyway.)" >&2
+       exit 4 ;;
+    1) echo "note: '$1' is on a network share but no HIVE copy was verified; uploading:" >&2
+       printf '%s\n' "$j" | grep -E '^  "how"' >&2 ;;
+    3) ;;
+    *) echo "note: hive_path.sh failed (exit $rc); uploading without the on-HIVE check." >&2 ;;
+  esac
+}
+
+# scp/sftp does not reliably expand a leading ~/ (OpenSSH >= 9 scp speaks SFTP). A relative
+# remote path is relative to home under both protocols, so drop it.
+rpath() { local r="$1"; case "$r" in "~") r=. ;; "~/"*) r="${r#\~/}"; [ -n "$r" ] || r=. ;; esac; echo "$r"; }
+
+# rsync, which the rest of the skill assumes, is not in Git Bash on Windows (a Core member,
+# 2026-09-23: "rsync: command not found", then scp commands hand-built by the agent). These
+# keep rsync's meaning, which scp -r does not have on its own:
+#   - a directory lands INSIDE <dest>, and <dest> is created if missing. scp -r to a
+#     missing <dest> would instead make <dest> itself the copy.
+#   - a trailing slash on the source ("dir/" = copy the CONTENTS) cannot be said with scp,
+#     which copies the directory itself either way -- refused rather than silently changed.
+no_contents_copy() {
+  echo "hive_exec.sh: '$1' ends in '/', which under rsync copies the folder's CONTENTS." >&2
+  echo "Without rsync (scp fallback) that cannot be done; drop the trailing slash to copy" >&2
+  echo "the folder itself into the destination, or install rsync." >&2
+  exit 2
+}
+scp_put() {
+  local src="$1" dst; dst="$(rpath "$2")"
+  case "$src" in */) [ -d "$src" ] && no_contents_copy "$src" ;; esac
+  # scp reads the "T" of T:\x as a host name; Git Bash spells that drive /t/x.
+  case "$src" in [A-Za-z]:[\\/]*) src="/$(printf '%s' "${src%%:*}" | tr '[:upper:]' '[:lower:]')/${src:3}"; src="${src//\\//}" ;; esac
+  if [ -d "$src" ] || [ "${dst%/}" != "$dst" ]; then
+    "${SSH[@]}" "mkdir -p -- $(printf '%q' "$dst")" || exit
+    dst="${dst%/}/"
+  fi
+  "${SCP[@]}" "$src" "$HU@$HOST:$dst"
+}
+scp_get() {
+  local src dst="$2" b rc
+  case "$1" in */) no_contents_copy "$1" ;; esac
+  src="$(rpath "$1")"
+  if [ -d "$dst" ] || [ "${dst%/}" != "$dst" ]; then
+    mkdir -p "$dst" && "${SCP[@]}" "$HU@$HOST:$src" "${dst%/}/"; return
+  elif [ -e "$dst" ]; then
+    "${SCP[@]}" "$HU@$HOST:$src" "$dst"; return                    # overwrite a file, as rsync does
+  fi
+  # A missing <dest>: rsync names a single FILE <dest>, but puts a DIRECTORY at <dest>/<name>.
+  # Which it is shows only after the copy, so land it inside a new <dest>/ and unwrap a file.
+  mkdir -p "$dst" || exit
+  "${SCP[@]}" "$HU@$HOST:$src" "$dst/"; rc=$?
+  [ $rc -eq 0 ] || { rmdir "$dst" 2>/dev/null; return $rc; }
+  b="$(basename "$src")"
+  if [ -f "$dst/$b" ] && [ "$(ls -A "$dst")" = "$b" ]; then
+    mv "$dst/$b" "$dst.part.$$" && rmdir "$dst" && mv "$dst.part.$$" "$dst"
+  fi
+}
+
+# A remote path with a space, a quote or a glob character cannot go through rsync or scp: the
+# remote shell re-splits it (rsync) or an old scp does, so "UC Davis Lab/logs" became the
+# stray file "UC" (2.14.1, I16/I33). Such a path is streamed as tar over the same ssh, with
+# the remote side quoted once by printf %q -- as the generic branch below does. A "plain"
+# path keeps the rsync/scp commands above unchanged. Such a path is taken LITERALLY: a glob or
+# $VAR in it is not expanded (rsync's remote shell used to); nothing in the skill relies on that.
+PLAIN_RE='^[A-Za-z0-9._/~+=:@%,-]+$'
+is_plain_path() { [[ "$1" =~ $PLAIN_RE ]]; }
+# a remote path as one shell word, with a leading ~ left to expand
+rq() {
+  case "$1" in
+    "~") printf '%s' '"$HOME"' ;;
+    "~/"*) printf '"$HOME"/%s' "$(printf '%q' "${1#\~/}")" ;;
+    *) printf '%q' "$1" ;;
+  esac
+}
+# run a command on HIVE and keep its stdin/stdout for the caller. NOT a login shell (no -l):
+# the stream is binary, and a profile that prints to stdout would corrupt it. $HOME is set anyway.
+rssh() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "${SSH[@]}" "bash -c $(printf '%q' "$1")"; }
+# split <path> into dir and name for tar -C (a trailing slash was removed by the caller)
+split_path() { case "$1" in */*) sp_dir="${1%/*}"; [ -n "$sp_dir" ] || sp_dir=/ ;; *) sp_dir=. ;; esac; sp_name="${1##*/}"; }
+HX_STAGE=""
+hx_cleanup() { [ -z "$HX_STAGE" ] || rm -rf "$HX_STAGE"; }
+# --get by tar. A destination that does not exist yet receives the stream directly; otherwise
+# it is staged NEXT TO the destination (same disk, so the result is a rename, not a second copy)
+# and a failed get leaves the destination as it was.
+tar_get() {
+  local src="$1" dst="$2" rc b dir par new=0
+  [ -e "$dst" ] || new=1
+  par="$(dirname "${dst%/}")"; [ -d "$par" ] || par="${TMPDIR:-/tmp}"
+  if [ "${src%/}" != "$src" ] && [ "$src" != "/" ]; then
+    # trailing slash: the CONTENTS
+    if [ $new -eq 1 ]; then
+      mkdir -p -- "$dst" || return
+      rssh "cd -- $(rq "${src%/}") && tar -cf - ." | tar -C "$dst" -xf -; rc=$?
+      [ $rc -eq 0 ] || rm -rf "$dst"
+      return $rc
+    fi
+    HX_STAGE="$(mktemp -d "$par/.hive_get.XXXXXX")" || return; trap hx_cleanup EXIT; trap 'exit 130' INT TERM
+    rssh "cd -- $(rq "${src%/}") && tar -cf - ." | tar -C "$HX_STAGE" -xf -; rc=$?
+    [ $rc -eq 0 ] && tar -C "$HX_STAGE" -cf - . | tar -C "$dst" -xf -; return $?
+  fi
+  HX_STAGE="$(mktemp -d "$par/.hive_get.XXXXXX")" || return; trap hx_cleanup EXIT; trap 'exit 130' INT TERM
+  split_path "$src"; dir="$sp_dir"; b="$sp_name"
+  rssh "cd -- $(rq "$dir") && tar -cf - -- $(printf '%q' "$b")" | tar -C "$HX_STAGE" -xf -; rc=$?
+  [ $rc -eq 0 ] || return $rc
+  if [ -d "$HX_STAGE/$b" ]; then
+    mkdir -p -- "$dst" || return
+    if [ -e "${dst%/}/$b" ]; then   # merge into what is there, keeping mtimes
+      mkdir -p -- "${dst%/}/$b" && tar -C "$HX_STAGE/$b" -cf - . | tar -C "${dst%/}/$b" -xf -
+    else mv -- "$HX_STAGE/$b" "${dst%/}/$b"; fi
+  elif [ -e "$HX_STAGE/$b" ]; then
+    if [ -d "$dst" ] || [ "${dst%/}" != "$dst" ]; then mkdir -p -- "$dst" && mv -f -- "$HX_STAGE/$b" "${dst%/}/$b"
+    else mv -f -- "$HX_STAGE/$b" "$dst"; fi           # an existing file is overwritten, a missing dest becomes the file
+  else return 1; fi
+}
+# The stream tar_put sends. A Mac's bsdtar writes each file's extended attributes -- nearly every
+# file carries com.apple.provenance -- as an AppleDouble "._<name>" member and as
+# LIBARCHIVE.xattr headers; HIVE's GNU tar unpacks the first as real files beside the data
+# (._Analysis_Report.html ... in a session of record: review M6, the real HIVE test T5b) and
+# warns about the second for every file. COPYFILE_DISABLE=1 drops the ._ members; on macOS
+# --no-mac-metadata --no-xattrs (checked once: this tar must take them) drops the headers too.
+PUT_TAR_OPTS=() PUT_TAR_CHECKED=0
+put_tar() {
+  if [ "$PUT_TAR_CHECKED" = 0 ]; then
+    PUT_TAR_CHECKED=1
+    case "$(uname -s 2>/dev/null)" in
+      Darwin) COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -cf - -T /dev/null \
+                >/dev/null 2>&1 && PUT_TAR_OPTS=(--no-mac-metadata --no-xattrs) ;;
+    esac
+  fi
+  COPYFILE_DISABLE=1 tar ${PUT_TAR_OPTS[@]+"${PUT_TAR_OPTS[@]}"} "$@"
+}
+tar_put() {
+  local src="$1" dst="$2" parent name chm=""
+  if [ -d "$src" ]; then
+    if [ "${src%/}" != "$src" ]; then parent="$src"; name=.; else split_path "$src"; parent="$sp_dir"; name="$sp_name"; fi
+    put_tar -C "$parent" -cf - -- "$name" | rssh "mkdir -p -- $(rq "${dst%/}") && tar -C $(rq "${dst%/}") -xf -"
+  elif [ "${dst%/}" != "$dst" ]; then
+    split_path "$src"
+    put_tar -C "$sp_dir" -cf - -- "$sp_name" | rssh "mkdir -p -- $(rq "${dst%/}") && tar -C $(rq "${dst%/}") -xf -"
+  else
+    # a file to a name: into it when <dst> is a folder on HIVE, else it BECOMES <dst>
+    split_path "$src"
+    [ -x "$src" ] && chm=" && chmod +x"
+    rssh "if [ -d $(rq "$dst") ]; then cat > $(rq "$dst")/$(printf '%q' "$sp_name")${chm:+ && chmod +x $(rq "$dst")/$(printf '%q' "$sp_name")}; else cat > $(rq "$dst")${chm:+ && chmod +x $(rq "$dst")}; fi" < "$src"
+  fi
+}
+
+case "${1:-}" in
+  # The skill's scripts/ and .claude-plugin/ (the version) side by side, as in the skill itself.
+  --put-skill) [ $# -eq 1 ] || usage
+         root="$(cd "$HERE/.." && pwd)"
+         [ -f "$root/.claude-plugin/plugin.json" ] || {
+           echo "hive_exec.sh: no .claude-plugin/plugin.json beside $HERE -- run this from the" >&2
+           echo "installed skill, whose version it records." >&2; exit 2; }
+         for d in scripts .claude-plugin; do
+           bash "$HERE/hive_exec.sh" --put "$root/$d" '~/proteomics-pipeline/' || exit
+         done
+         echo "put $root/scripts and $root/.claude-plugin into ~/proteomics-pipeline/ on HIVE" ;;
+  --put) [ $# -eq 3 ] || usage; shift; put_guard "$1"; src="$(winpath "$1")"
+         if ! is_plain_path "$2"; then tar_put "$src" "$2"
+         elif command -v rsync >/dev/null 2>&1; then rsync -e "$RSYNC_E" -a "$src" "$HU@$HOST:$2"
+         else scp_put "$src" "$2"; fi ;;
+  # --get is -rlt, not -a: HIVE's shared dirs are setgid 2775, and -a's permission/group copy
+  # makes macOS fail with "fchmodat ... Operation not permitted" (exit 23) AFTER the files
+  # arrive -- measured 2026-09-16 -- so a good copy read as a failed one.
+  --get) [ $# -eq 3 ] || usage; shift
+         dst="$(winpath "$2")"
+         if ! is_plain_path "$1"; then tar_get "$1" "$dst"
+         elif command -v rsync >/dev/null 2>&1; then rsync -e "$RSYNC_E" -rlt "$HU@$HOST:$1" "$dst"
+         else scp_get "$1" "$dst"; fi ;;
+  # A command for a COMPUTE node -- HPC@UCD's ucd-hpc rules: on a login node nothing "past a
+  # few seconds of CPU or much I/O" (a walk of a share, an install, a zip, hashing raw files).
+  # On HIVE, on_compute.py runs it under ONE blocking srun with the queue spelled out
+  # (--account/--partition/--qos from run_search.slurm_queue) and waits; its output and exit
+  # status are the command's. --time in minutes (default 30), --mem with a unit (default 4G),
+  # --cpus (default 1). Checked here, before any connection is spent.
+  --job) shift; jopts=""
+         while [ $# -gt 0 ]; do
+           case "$1" in
+             --time|--cpus)
+               [ $# -ge 2 ] && [[ "$2" =~ ^[1-9][0-9]*$ ]] \
+                 || { echo "hive_exec.sh --job: $1 takes a whole number (minutes for --time)" >&2; exit 2; }
+               jopts="$jopts $1 $2"; shift 2 ;;
+             --mem)
+               [ $# -ge 2 ] && [[ "$2" =~ ^[1-9][0-9]*[KMGT]$ ]] \
+                 || { echo "hive_exec.sh --job: --mem takes a size with a unit, e.g. 4G (a bare number is megabytes to SLURM)" >&2; exit 2; }
+               jopts="$jopts $1 $2"; shift 2 ;;
+             # a restartable, read-only command: at the user's own CPU cap on high it may run
+             # on low (preemptible) instead of waiting behind their searches (on_compute.py)
+             --preemptible) jopts="$jopts $1"; shift ;;
+             # the session this serves: the job starts in it (--chdir) and carries
+             # --comment=session:<name>, so it can be traced (it runs in the user's home otherwise)
+             --session)
+               [ $# -ge 2 ] || { echo "hive_exec.sh --job: --session takes a folder" >&2; exit 2; }
+               jopts="$jopts $1 $(printf '%q' "$2")"; shift 2 ;;
+             *) break ;;
+           esac
+         done
+         [ $# -ge 1 ] || usage
+         remote="python3 ~/proteomics-pipeline/scripts/on_compute.py$jopts -- bash -lc $(printf '%q' "$*")"
+         MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "${SSH[@]}" "bash -l -c $(printf '%q' "$remote")" ;;
+  "")    usage ;;
+  # LOGIN shell (bash -l). ssh with a bare command runs a NON-login shell, where
+  # HIVE does not put sacct/squeue/sbatch on PATH. Every SLURM query then returned
+  # nothing, and watch_run.sh read that emptiness as "PENDING" -- so a job array with
+  # 14 TIMEOUT tasks reported as still running. Silence must never look like health.
+  # A command for HIVE holds HIVE paths only: Git Bash must not rewrite them for a Windows ssh
+  # (/nfs/... -> C:/Program Files/Git/nfs/...; staff report, skill 2.13.1).
+  *)     MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "${SSH[@]}" "bash -l -c $(printf '%q' "$*")" ;;
+esac

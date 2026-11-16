@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "UC Davis Proteomics Core pipeline (ucdavis-proteomics-core-pipeline): an AI skill for Claude"
+abstract: "A Claude Code skill for reproducible proteomics, from raw .raw/.d/.mzML files to a database search with DIA-NN, Sage or FragPipe, limpa DPC-Quant and limma differential expression, quality audits, publication Methods, an analysis report, and a full reproducibility bundle for every run. Before version 2.15 it was developed in the DE-LIMP repository (https://github.com/bsphinney/DE-LIMP)."
+authors:
+  - family-names: Phinney
+    given-names: "Brett S."
+    affiliation: "UC Davis Genome Center Proteomics Core Facility"
+version: "2.15.0"
+date-released: "2026-11-12"
+license: PolyForm-Noncommercial-1.0.0
+repository-code: "https://github.com/bsphinney/UCD-Proteomics-AI-Skill"
+url: "https://bsphinney.github.io/UCD-Proteomics-AI-Skill/"
+keywords:
+  - proteomics
+  - mass spectrometry
+  - DIA
+  - DDA
+  - DIA-NN
+  - Sage
+  - limpa
+  - limma
+  - differential expression
+  - reproducibility
+  - Claude Code skill

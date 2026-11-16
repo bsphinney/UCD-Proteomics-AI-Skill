@@ -1,0 +1,950 @@
+#!/usr/bin/env python3
+"""
+hive_remote from a Windows laptop: what one real session (gstaff, 2026-09-23, Windows 11 +
+Git Bash) ran into, and what now stops it.
+
+  1. The raw folder was T:\\Data\\lab\\service\\..., and T: is \\\\128.120.208.24\\proteomics --
+     the Flinders share HIVE mounts at /nfs/lssc0/flinders/proteomics. Nothing mapped the one
+     to the other; 7.1 GB that was already on HIVE was uploaded (~20 min). hive_path.sh maps
+     a local path to its HIVE path and verifies it, and `hive_exec.sh --put` refuses to
+     upload a source it verifies.
+  2. Git Bash has no rsync, so --put/--get died. They fall back to scp -- keeping rsync's
+     meaning, which scp -r does not have on its own.
+  3. First contact failed "Host key verification failed"; the default ssh user was the AD
+     login `AD3+gstaff` ("Permission denied"); python3 was the Microsoft Store stub.
+     check_access.sh now says which of these it is, instead of hive_ssh: "failed".
+
+No test contacts a real host: ssh, scp, rsync, ssh-keygen and ssh-keyscan are recorders on a
+PATH that holds nothing else but a few linked coreutils, `uname`/`net`/`mount`/`cygpath` are
+fakes, and HIVE itself is a directory tree reached through HIVE_EXEC.
+"""
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
+HIVE_PATH = os.path.join(SCRIPTS, "hive_path.sh")
+HIVE_EXEC = os.path.join(SCRIPTS, "hive_exec.sh")
+CHECK_ACCESS = os.path.join(SCRIPTS, "check_access.sh")
+
+COREUTILS = ("bash", "tr", "awk", "dirname", "basename", "ls", "sort", "wc", "stat", "grep",
+             "head", "tail", "cat", "mkdir", "mv", "rmdir", "rm", "mktemp", "sed", "chmod")
+HOST = "hive.hpc.ucdavis.edu"
+FLINDERS = "/nfs/lssc0/flinders/proteomics"
+PUBLISHED_ED25519 = "SHA256:b5nv86Ciaqg1yrUVai6bZ0Hk4IpzAFLWtIPDBdacbQM"
+
+NET_USE = (
+    "New connections will be remembered.\r\n\r\n\r\n"
+    "Status       Local     Remote                    Network\r\n\r\n"
+    "-------------------------------------------------------------------------------\r\n"
+    "OK           T:        \\\\128.120.208.24\\proteomics\r\n"
+    "                                                Microsoft Windows Network\r\n"
+    "Unavailable  R:        \\\\files.example.edu\\bioinfo  Microsoft Windows Network\r\n"
+    "The command completed successfully.\r\n\r\n"
+)
+
+# Every fake is a small bash script. RECORD appends one call's argv, one arg per line.
+RECORD = 'for a in "$@"; do printf "%s\\n" "$a"; done >> "$LOGS/{name}.log"; echo "--end--" >> "$LOGS/{name}.log"\n'
+SHIMS = {
+    "uname": 'echo "${FAKE_UNAME:-Darwin}"\n',
+    "mount": 'cat "$FAKE_MOUNT" 2>/dev/null\n',
+    "net": '[ -f "$FAKE_NET" ] || exit 1\ncat "$FAKE_NET"\n',
+    "powershell.exe": RECORD.format(name="powershell") + 'printf "%s\\r\\n" "$FAKE_PS_ROOT"\n',
+    # cygpath -u <Windows path>: the share's local copy lives under $SHAREROOT
+    "cygpath": ('[ -n "${FAKE_CYGPATH_OUT:-}" ] && { echo "$FAKE_CYGPATH_OUT"; exit; }\n'
+                # -m (the key, hive_exec.sh): this computer's paths already read as they are
+                '[ "$1" = -m ] && { echo "$2"; exit; }\n'
+                'p="${2//\\\\//}"\n'
+                'case "$p" in [A-Za-z]:*) p="${p#?:}" ;; //*) p="${p#//}"; p="${p#*/}"; p="/${p#*/}" ;; esac\n'
+                'echo "$SHAREROOT$p"\n'),
+    "ssh": RECORD.format(name="ssh") + (
+        'case "${FAKE_SSH:-ok}" in\n'
+        # FAKE_CK: what check_access.sh's probe of ~/.coreomics_token answers on "HIVE";
+        # FAKE_STAFF: a file holding what its staff probe printed there
+        '  ok) echo HAS_SBATCH; echo HAS_GRP; [ -z "${FAKE_CK:-}" ] || echo "COREOMICS_KEY=$FAKE_CK"\n'
+        '      [ -z "${FAKE_STAFF:-}" ] || cat "$FAKE_STAFF" ;;\n'
+        '  old_ls_d) echo HAS_SBATCH; echo /quobyte/proteomics-grp ;;\n'
+        # a HIVE account outside the Core: sbatch, but proteomics-grp cannot be listed
+        '  not_core) echo HAS_SBATCH; [ -z "${FAKE_CK:-}" ] || echo "COREOMICS_KEY=$FAKE_CK"\n'
+        '            [ -z "${FAKE_STAFF:-}" ] || cat "$FAKE_STAFF" ;;\n'
+        '  hostkey) echo "Warning: Permanently added x" >&2; echo "Host key verification failed." >&2; exit 255 ;;\n'
+        '  denied) echo "UC Davis HPC -- authorised use only" >&2\n'
+        '          echo "tester@hive.hpc.ucdavis.edu: Permission denied (publickey)." >&2; exit 255 ;;\n'
+        '  throttled) echo "kex_exchange_identification: read: Operation timed out" >&2; exit 255 ;;\n'
+        '  other) echo "UC Davis HPC -- authorised use only" >&2\n'
+        '         echo "Received disconnect from 1.2.3.4 port 22:2: Too many authentication failures" >&2\n'
+        # OpenSSH always follows a Received disconnect with this reasonless line (packet.c)
+        '         echo "Disconnected from 1.2.3.4 port 22" >&2; exit 255 ;;\n'
+        'esac\n'),
+    "scp": RECORD.format(name="scp") + (
+        # --get into a directory: leave a file named after the remote source, as scp would
+        'if [ -n "${FAKE_SCP_CREATE:-}" ]; then\n'
+        '  for last; do :; done\n'
+        '  [ -d "$last" ] && echo data > "$last/${FAKE_SCP_CREATE}"\n'
+        'fi\n'),
+    "rsync": RECORD.format(name="rsync"),
+    "ssh-keygen": RECORD.format(name="ssh-keygen") + (
+        'case "$*" in\n'
+        '  *-lf*) cat >/dev/null; echo "256 ${FAKE_SCAN_FP} hive.hpc.ucdavis.edu (ED25519)" ;;\n'
+        '  *-F*/etc/ssh*) exit 1 ;;\n'
+        '  *-F*) [ -n "${FAKE_KNOWN_FP:-}" ] || exit 1\n'
+        '        echo "# Host hive.hpc.ucdavis.edu found: line 1"\n'
+        '        echo "hive.hpc.ucdavis.edu ED25519 ${FAKE_KNOWN_FP}" ;;\n'
+        'esac\n'),
+    "ssh-keyscan": RECORD.format(name="ssh-keyscan") + 'echo "hive.hpc.ucdavis.edu ssh-ed25519 AAAAC3fake"\n',
+}
+
+# HIVE_EXEC stand-in: runs the remote script against $HIVEROOT instead of /, and maps the
+# paths it prints back, so the script under test sees exactly what HIVE would answer.
+FAKE_HIVE = (
+    'echo call >> "$LOGS/hive.log"\n'
+    's="${1//\\/nfs\\/lssc0\\//$HIVEROOT/nfs/lssc0/}"\n'
+    's="${s//\\/quobyte\\//$HIVEROOT/quobyte/}"\n'
+    'bash -c "$s" 2>&1 | while IFS= read -r l; do printf "%s\\n" "${l//$HIVEROOT/}"; done\n'
+)
+
+
+def _write_exe(path, body):
+    with open(path, "w") as fh:
+        fh.write("#!/bin/bash\n" + body)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class Harness(unittest.TestCase):
+    SKIP_SHIMS = ()
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        # realpath: macOS's /var is /private/var, and `cd -P` in the scripts resolves it
+        self.d = os.path.realpath(self._tmp.name)
+        self.bin = self._mk("bin")
+        self.logs = self._mk("logs")
+        self.home = self._mk("home")
+        for tool in COREUTILS:
+            real = shutil.which(tool)
+            if not real:
+                self.skipTest(f"{tool} is not installed")
+            os.symlink(real, os.path.join(self.bin, tool))
+        for name, body in SHIMS.items():
+            if name not in self.SKIP_SHIMS:
+                _write_exe(os.path.join(self.bin, name), body)
+        self.fake_hive = os.path.join(self.d, "fake_hive.sh")
+        _write_exe(self.fake_hive, FAKE_HIVE)
+        self.key = os.path.join(self.d, "id_test")
+        open(self.key, "w").close()
+        # what the laptop sees on the share, and what HIVE has at /nfs/lssc0/flinders/proteomics
+        self.shareroot = self._mk("share")
+        self.hiveroot = self._mk("hive")
+        self.service = "Data/lab/service"
+        for root in (self.shareroot, os.path.join(self.hiveroot, FLINDERS.lstrip("/"))):
+            run = os.path.join(root, self.service, "P1")
+            os.makedirs(os.path.join(run, "c.d"))
+            for f in ("a.raw", "b.raw"):
+                with open(os.path.join(run, f), "w") as fh:
+                    fh.write("x" * 10)
+            with open(os.path.join(root, self.service, "one.raw"), "w") as fh:
+                fh.write("y" * 1234)
+        # an instrument still writing: HIVE may hold MORE than the laptop listed
+        open(os.path.join(self.hiveroot, FLINDERS.lstrip("/"), self.service, "P1", "new.raw"), "w").close()
+        self.mount_file = os.path.join(self.d, "mount.txt")
+        self.set_mount("/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n")
+        self.net_file = os.path.join(self.d, "net.txt")
+        with open(self.net_file, "w", newline="") as fh:
+            fh.write(NET_USE)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _mk(self, *parts):
+        p = os.path.join(self.d, *parts)
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    def set_mount(self, text):
+        with open(self.mount_file, "w") as fh:
+            fh.write(text)
+
+    def env(self, **extra):
+        e = {"PATH": self.bin, "HOME": self.home, "LOGS": self.logs, "HIVEROOT": self.hiveroot,
+             "SHAREROOT": self.shareroot, "FAKE_MOUNT": self.mount_file, "FAKE_NET": self.net_file,
+             "HIVE_EXEC": f"bash {self.fake_hive}", "HIVE_USER": "tester", "HIVE_KEY": self.key,
+             "HIVE_ENV_FILE": os.path.join(self.d, "no.env"), "TMPDIR": self._mk("tmp")}
+        e.update(extra)
+        return e
+
+    def run_script(self, script, *args, **env):
+        # job_env: not a search job (copies of the skill's own hive_exec.sh / hive_path.sh)
+        return subprocess.run(["bash", script, *args], capture_output=True, text=True,
+                              env=self.env(**env), cwd=self.d, timeout=60)
+
+    def _log(self, name):
+        p = os.path.join(self.logs, f"{name}.log")
+        if not os.path.exists(p):
+            return ""
+        with open(p) as fh:
+            return fh.read()
+
+    def calls(self, name):
+        """argv of every call a recorder saw, in order"""
+        out, cur = [], []
+        for line in self._log(name).split("\n"):
+            if line == "--end--":
+                out.append(cur)
+                cur = []
+            elif line or cur:
+                cur.append(line)
+        return out
+
+    def hive_calls(self):
+        return len(self._log("hive").split())
+
+
+class HivePathWindowsTests(Harness):
+    WIN = {"FAKE_UNAME": "MINGW64_NT-10.0-22631"}
+
+    def resolve(self, path, **env):
+        r = self.run_script(HIVE_PATH, path, **{**self.WIN, **env})
+        return r, json.loads(r.stdout)
+
+    def test_a_mapped_drive_resolves_to_the_flinders_mount_and_is_verified(self):
+        """gstaff's exact path shape. One ssh call, and HIVE having an extra file the laptop
+        has not seen yet (an instrument still writing) does not break the match."""
+        for form in ("T:\\Data\\lab\\service\\P1", "T:/Data/lab/service/P1"):
+            with self.subTest(form=form):
+                r, j = self.resolve(form)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(j["unc_or_mount_source"], "\\\\128.120.208.24\\proteomics")
+                self.assertEqual((j["server"], j["share"], j["rest"]),
+                                 ("128.120.208.24", "proteomics", "Data/lab/service/P1"))
+                self.assertEqual(j["candidates"], [f"{FLINDERS}/Data/lab/service/P1"])
+                self.assertIs(j["verified"], True)
+                self.assertEqual(j["hive_path"], f"{FLINDERS}/Data/lab/service/P1")
+        self.assertEqual(self.hive_calls(), 2)          # one per resolve, never one per candidate
+
+    def test_unc_paths_in_both_spellings(self):
+        for form in ("\\\\128.120.208.24\\proteomics\\Data\\lab\\service\\P1",
+                     "//128.120.208.24/proteomics/Data/lab/service/P1"):
+            with self.subTest(form=form):
+                r, j = self.resolve(form)
+                self.assertEqual((j["server"], j["share"], j["rest"]),
+                                 ("128.120.208.24", "proteomics", "Data/lab/service/P1"))
+                self.assertIs(j["verified"], True, j["how"])
+
+    def test_git_bash_drive_spelling_is_parsed_as_the_drive(self):
+        """/t/Data/... is how Git Bash shows T:\\Data\\... . It is not readable on this test
+        machine, so it cannot be verified -- and must not claim to be."""
+        r, j = self.resolve("/t/Data/lab/service/P1")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual((j["share"], j["rest"]), ("proteomics", "Data/lab/service/P1"))
+        self.assertEqual(j["candidates"], [f"{FLINDERS}/Data/lab/service/P1"])
+        self.assertIs(j["verified"], False)
+        self.assertIsNone(j["hive_path"])
+        self.assertEqual(self.hive_calls(), 0)
+
+    def test_a_file_is_verified_by_size(self):
+        r, j = self.resolve("T:\\Data\\lab\\service\\one.raw")
+        self.assertIs(j["verified"], True, j["how"])
+        self.assertIn("1234 bytes", j["how"])
+        with open(os.path.join(self.hiveroot, FLINDERS.lstrip("/"), self.service, "one.raw"), "a") as fh:
+            fh.write("more")
+        r, j = self.resolve("T:\\Data\\lab\\service\\one.raw")
+        self.assertEqual(r.returncode, 1)
+        self.assertIs(j["verified"], False)
+        self.assertIsNone(j["hive_path"])
+
+    def test_a_directory_missing_names_on_hive_is_not_verified(self):
+        open(os.path.join(self.shareroot, self.service, "P1", "only_here.raw"), "w").close()
+        r, j = self.resolve("T:\\Data\\lab\\service\\P1")
+        self.assertIs(j["verified"], False)
+        self.assertIn("1 of 4 names missing", j["how"])
+
+    def test_case_typed_differently_on_windows_still_finds_the_hive_folder(self):
+        """SMB ignores case, so t:\\data\\LAB works on the laptop; HIVE's NFS does not."""
+        r, j = self.resolve("t:\\data\\LAB\\service\\P1",
+                            FAKE_CYGPATH_OUT=os.path.join(self.shareroot, self.service, "P1"))
+        self.assertIs(j["verified"], True, j["how"])
+        # A case-insensitive test filesystem (macOS APFS) answers `data` itself, so only a
+        # case-sensitive one -- like HIVE's NFS -- shows the fold happened.
+        if not os.path.exists(os.path.join(self.hiveroot, FLINDERS.lstrip("/"), "data")):
+            self.assertEqual(j["hive_path"], f"{FLINDERS}/Data/lab/service/P1")
+        self.assertEqual(j["hive_path"].lower(), f"{FLINDERS}/Data/lab/service/P1".lower())
+
+    def test_a_local_disk_is_not_a_share_and_makes_no_ssh_call(self):
+        r, j = self.resolve("C:\\Users\\gstaff\\raw")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(j["candidates"], [])
+        self.assertEqual(self.hive_calls(), 0)
+
+    def test_powershell_is_the_fallback_when_there_is_no_net(self):
+        os.remove(os.path.join(self.bin, "net"))
+        r, j = self.resolve("T:\\Data\\lab\\service\\P1", FAKE_PS_ROOT="\\\\128.120.208.24\\proteomics")
+        self.assertEqual(j["share"], "proteomics")
+        self.assertIs(j["verified"], True, j["how"])
+        self.assertEqual(len(self.calls("powershell")), 1)
+
+    def test_an_unknown_share_tries_flinders_then_quobyte_in_one_call(self):
+        bio = os.path.join(self.hiveroot, "quobyte", "bioinfo", "runs")
+        os.makedirs(bio)
+        local = self._mk("share", "runs")
+        for p in (bio, local):
+            open(os.path.join(p, "r1.raw"), "w").close()
+        r, j = self.resolve("R:\\runs")
+        self.assertEqual(j["candidates"], ["/nfs/lssc0/flinders/bioinfo/runs", "/quobyte/bioinfo/runs"])
+        self.assertIs(j["verified"], True, j["how"])
+        self.assertEqual(j["hive_path"], "/quobyte/bioinfo/runs")
+        self.assertEqual(self.hive_calls(), 1)
+
+
+class HivePathMountTests(Harness):
+    def test_a_macos_smb_mount_of_the_flinders_share(self):
+        vol = self._mk("Volumes", "proteomics")
+        shutil.rmtree(vol)
+        shutil.copytree(self.shareroot, vol)
+        self.set_mount("/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+                       f"//gc-prot-core-user@128.120.208.24/proteomics on {vol} (smbfs, nodev, nosuid, mounted by x)\n")
+        r = self.run_script(HIVE_PATH, os.path.join(vol, self.service, "P1"))
+        j = json.loads(r.stdout)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(j["unc_or_mount_source"], "//gc-prot-core-user@128.120.208.24/proteomics")
+        self.assertEqual(j["hive_path"], f"{FLINDERS}/Data/lab/service/P1")
+
+    def test_a_relative_path_inside_the_mount(self):
+        vol = self._mk("Volumes", "proteomics")
+        shutil.rmtree(vol)
+        shutil.copytree(self.shareroot, vol)
+        self.set_mount(f"//u@128.120.208.24/proteomics on {vol} (smbfs, nodev)\n")
+        r = subprocess.run(["bash", HIVE_PATH, "P1"], capture_output=True, text=True,
+                           env=self.env(), cwd=os.path.join(vol, self.service))
+        self.assertIs(json.loads(r.stdout)["verified"], True, r.stdout)
+
+    def test_proteomics_grp_maps_to_quobyte(self):
+        vol = self._mk("Volumes", "proteomics-grp")
+        grp = os.path.join(self.hiveroot, "quobyte", "proteomics-grp", "fasta")
+        os.makedirs(grp)
+        os.makedirs(os.path.join(vol, "fasta"))
+        for p in (grp, os.path.join(vol, "fasta")):
+            open(os.path.join(p, "human.fasta"), "w").close()
+        self.set_mount(f"//someone@some-server/proteomics-grp on {vol} (smbfs, nodev)\n")
+        j = json.loads(self.run_script(HIVE_PATH, os.path.join(vol, "fasta")).stdout)
+        self.assertEqual(j["candidates"], ["/quobyte/proteomics-grp/fasta"])
+        self.assertIs(j["verified"], True, j["how"])
+
+    def test_linux_cifs_and_nfs_mounts(self):
+        cifs = self._mk("mnt", "prot")
+        nfs = self._mk("mnt", "bio")
+        self.set_mount(f"//128.120.208.24/proteomics on {cifs} type cifs (rw,relatime)\n"
+                       f"10.66.43.50:/flinders/export/group/bioinfo on {nfs} type nfs4 (rw,relatime)\n")
+        j = json.loads(self.run_script(HIVE_PATH, os.path.join(cifs, "Data")).stdout)
+        self.assertEqual((j["share"], j["rest"]), ("proteomics", "Data"))
+        j = json.loads(self.run_script(HIVE_PATH, os.path.join(nfs, "x")).stdout)
+        self.assertEqual((j["server"], j["share"]), ("10.66.43.50", "bioinfo"))
+        self.assertEqual(j["candidates"], ["/nfs/lssc0/flinders/bioinfo/x", "/quobyte/bioinfo/x"])
+
+    def test_an_ordinary_local_folder_makes_no_ssh_call(self):
+        local = self._mk("scripts")
+        r = self.run_script(HIVE_PATH, local)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIs(json.loads(r.stdout)["verified"], False)
+        self.assertEqual(self.hive_calls(), 0)
+
+
+class PutGuardTests(Harness):
+    def setUp(self):
+        super().setUp()
+        self.vol = self._mk("Volumes", "proteomics")
+        shutil.rmtree(self.vol)
+        shutil.copytree(self.shareroot, self.vol)
+        self.set_mount(f"//u@128.120.208.24/proteomics on {self.vol} (smbfs, nodev)\n")
+        self.run_dir = os.path.join(self.vol, self.service, "P1")
+
+    def test_put_refuses_data_already_on_hive_and_names_the_path(self):
+        r = self.run_script(HIVE_EXEC, "--put", self.run_dir, "~/proteomics-pipeline/data/")
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertIn(f"{FLINDERS}/Data/lab/service/P1", r.stderr)
+        self.assertEqual(self.calls("rsync") + self.calls("scp"), [])
+
+    def test_force_uploads_anyway(self):
+        r = self.run_script(HIVE_EXEC, "--put", self.run_dir, "~/d/", HIVE_PUT_FORCE="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.calls("rsync")), 1)
+        self.assertEqual(self.hive_calls(), 0)
+
+    def test_an_unverified_share_path_still_uploads_but_says_so(self):
+        open(os.path.join(self.run_dir, "not_on_hive.raw"), "w").close()
+        r = self.run_script(HIVE_EXEC, "--put", self.run_dir, "~/d/")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no HIVE copy was verified", r.stderr)
+        self.assertEqual(len(self.calls("rsync")), 1)
+
+    def test_a_plain_local_path_uploads_without_any_ssh(self):
+        """The guard runs before EVERY --put; for an ordinary path it must cost no connection
+        (HIVE throttles them)."""
+        local = self._mk("scripts")
+        r = self.run_script(HIVE_EXEC, "--put", local, "~/proteomics-pipeline/")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.hive_calls(), 0)
+        self.assertEqual(self.calls("ssh"), [])
+        argv = self.calls("rsync")[0]
+        self.assertEqual(argv[-2:], [local, f"tester@{HOST}:~/proteomics-pipeline/"])
+        ssh_e = argv[argv.index("-e") + 1]
+        self.assertIn("StrictHostKeyChecking=accept-new", ssh_e)
+        self.assertIn("ControlMaster=auto", ssh_e)
+
+    def test_a_windows_domain_login_is_refused_before_ssh(self):
+        for user in ("AD3+gstaff", "AD3\\gstaff"):
+            with self.subTest(user=user):
+                r = self.run_script(HIVE_EXEC, "hostname", HIVE_USER=user)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("'gstaff'", r.stderr)
+        self.assertEqual(self.calls("ssh"), [])
+
+    def test_every_ssh_call_accepts_a_new_host_key(self):
+        self.run_script(HIVE_EXEC, "hostname")
+        argv = self.calls("ssh")[0]
+        self.assertIn("StrictHostKeyChecking=accept-new", argv)
+        self.assertEqual(argv[-1], "bash -l -c hostname")
+
+
+class ScpFallbackTests(Harness):
+    SKIP_SHIMS = ("rsync",)          # Git Bash on Windows: no rsync at all
+
+    def setUp(self):
+        super().setUp()
+        self.src = self._mk("scripts")
+        open(os.path.join(self.src, "run_search.py"), "w").close()
+
+    def test_put_a_folder_creates_the_destination_and_lands_inside_it(self):
+        r = self.run_script(HIVE_EXEC, "--put", self.src, "~/proteomics-pipeline/")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls("ssh")[0][-1], "mkdir -p -- proteomics-pipeline/")
+        argv = self.calls("scp")[0]
+        self.assertEqual(argv[-2:], [self.src, f"tester@{HOST}:proteomics-pipeline/"])
+        for opt in ("IdentitiesOnly=yes", "StrictHostKeyChecking=accept-new", "ControlMaster=auto"):
+            self.assertIn(opt, argv)
+        self.assertEqual(argv[argv.index("-i") + 1], self.key)
+        self.assertIn("-r", argv)
+
+    def test_put_a_folder_to_a_destination_without_a_slash_still_lands_inside_it(self):
+        self.run_script(HIVE_EXEC, "--put", self.src, "~/proteomics-pipeline")
+        self.assertEqual(self.calls("ssh")[0][-1], "mkdir -p -- proteomics-pipeline")
+        self.assertEqual(self.calls("scp")[0][-1], f"tester@{HOST}:proteomics-pipeline/")
+
+    def test_on_windows_there_is_no_controlmaster(self):
+        r = self.run_script(HIVE_EXEC, "--put", self.src, "~/x/", FAKE_UNAME="MINGW64_NT-10.0-22631")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = self.calls("scp")[0]
+        self.assertNotIn("ControlMaster=auto", argv)
+        self.assertIn("StrictHostKeyChecking=accept-new", argv)
+
+    def test_a_trailing_slash_source_is_refused_not_reinterpreted(self):
+        """rsync: dir/ = the CONTENTS. scp copies the folder either way."""
+        r = self.run_script(HIVE_EXEC, "--put", self.src + "/", "~/x/")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("CONTENTS", r.stderr)
+        self.assertEqual(self.calls("scp"), [])
+
+    def test_put_a_file_to_a_new_name_needs_no_mkdir(self):
+        f = os.path.join(self.src, "run_search.py")
+        self.run_script(HIVE_EXEC, "--put", f, "~/proteomics-pipeline/job.sh")
+        self.assertEqual(self.calls("ssh"), [])
+        self.assertEqual(self.calls("scp")[0][-1], f"tester@{HOST}:proteomics-pipeline/job.sh")
+
+    def test_get_into_a_folder(self):
+        dst = os.path.join(self.d, "session", "output") + "/"
+        r = self.run_script(HIVE_EXEC, "--get", "~/proteomics-pipeline/out", dst)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isdir(dst))
+        self.assertEqual(self.calls("scp")[0][-2:], [f"tester@{HOST}:proteomics-pipeline/out", dst])
+
+    def test_get_one_file_to_a_new_name_leaves_a_file(self):
+        """rsync names a single file <dest>; scp is pointed at a fresh <dest>/ and the lone
+        file is unwrapped, so the result is the same."""
+        dst = os.path.join(self.d, "report.parquet")
+        r = self.run_script(HIVE_EXEC, "--get", "~/out/report.parquet", dst,
+                            FAKE_SCP_CREATE="report.parquet")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(dst))
+
+
+class PutSkillTests(Harness):
+    """--put-skill: scripts/ AND .claude-plugin/ go up together. Every HIVE-side record reads the
+    skill version from ../.claude-plugin/plugin.json (skill_version.py); scripts/ put up alone
+    recorded "unknown" -- and "0.0.0" in the deposit package's sdrf.tsv."""
+
+    def fake_skill(self, with_plugin=True):
+        root = self._mk("skill")
+        sd = self._mk("skill", "scripts")
+        for f in ("hive_exec.sh", "hive_path.sh", "hive_shares.tsv"):
+            shutil.copy(os.path.join(SCRIPTS, f), sd)
+        if with_plugin:
+            with open(os.path.join(self._mk("skill", ".claude-plugin"), "plugin.json"), "w") as fh:
+                fh.write('{"version": "9.9.9"}\n')
+        return root, os.path.join(sd, "hive_exec.sh")
+
+    def test_both_folders_land_side_by_side_in_proteomics_pipeline(self):
+        root, hx = self.fake_skill()
+        r = self.run_script(hx, "--put-skill")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dests = [argv[-2:] for argv in self.calls("rsync")]
+        self.assertEqual(dests, [[os.path.join(root, d), f"tester@{HOST}:~/proteomics-pipeline/"]
+                                 for d in ("scripts", ".claude-plugin")])
+        self.assertEqual(self.calls("ssh"), [], "local paths: the put guard makes no connection")
+
+    def test_without_plugin_json_nothing_is_put(self):
+        _, hx = self.fake_skill(with_plugin=False)
+        r = self.run_script(hx, "--put-skill")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("plugin.json", r.stderr)
+        self.assertEqual(self.calls("rsync") + self.calls("scp"), [])
+
+    def test_it_takes_no_arguments(self):
+        _, hx = self.fake_skill()
+        self.assertEqual(self.run_script(hx, "--put-skill", "~/elsewhere/").returncode, 2)
+        self.assertEqual(self.calls("rsync"), [])
+
+
+class CheckAccessTests(Harness):
+    def check(self, user="tester", **env):
+        r = self.run_script(CHECK_ACCESS, user, self.key, **env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_the_json_parses_and_has_the_new_fields(self):
+        j = self.check(FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertNotIn("proteomics_grp_access", j)            # renamed: it is a LOCAL check
+        for k in ("local_proteomics_grp_access", "core_member", "hive_ssh_error",
+                  "hive_host_key_known", "hive_host_key_fingerprints", "local_python3"):
+            self.assertIn(k, j)
+        self.assertEqual(j["hive_ssh"], "ok")
+        self.assertIsNone(j["hive_ssh_error"])
+        self.assertIs(j["core_member"], True)
+        self.assertIs(j["hive_host_key_known"], True)
+        self.assertEqual(self.calls("ssh-keyscan"), [])         # known: no extra connection
+        self.assertEqual(j["recommended_mode"], "hive_remote")
+
+    def test_group_membership_needs_a_listing_not_ls_d(self):
+        """/quobyte is 777 and proteomics-grp is 2770: `ls -d` succeeds for every account."""
+        j = self.check(FAKE_SSH="old_ls_d")
+        self.assertIs(j["hive_ssh_has_proteomics_grp"], False)
+        self.assertEqual(j["core_member"], j["local_proteomics_grp_access"])
+        probe = self.calls("ssh")[0][-1]
+        self.assertIn("ls /quobyte/proteomics-grp", probe)
+        self.assertNotIn("ls -d", probe)
+
+    def test_an_unknown_host_key_is_scanned_and_accepted_when_it_matches(self):
+        j = self.check(FAKE_SCAN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_host_key_known"], False)
+        self.assertEqual(j["hive_host_key_fingerprints"], [f"ED25519 {PUBLISHED_ED25519}"])
+        self.assertIs(j["hive_host_key_matches_published"], True)
+        self.assertIn("StrictHostKeyChecking=accept-new", self.calls("ssh")[0])
+
+    def test_an_unknown_key_that_does_not_match_is_not_auto_trusted(self):
+        j = self.check(FAKE_SCAN_FP="SHA256:somethingElse", FAKE_SSH="hostkey")
+        self.assertIs(j["hive_host_key_matches_published"], False)
+        self.assertIn("StrictHostKeyChecking=yes", self.calls("ssh")[0])
+        self.assertEqual(j["hive_ssh_error"]["kind"], "host_key")
+        self.assertIn("published fingerprint", j["hive_ssh_error"]["detail"])
+
+    def test_failures_are_classified(self):
+        for mode, kind, text in (("hostkey", "host_key", "Host key verification failed"),
+                                 ("denied", "permission_denied", "Permission denied (publickey)"),
+                                 ("throttled", "timeout", "kex_exchange_identification"),
+                                 # unclassified: ssh's LAST line, never the pre-auth banner
+                                 ("other", "other", "Too many authentication failures")):
+            with self.subTest(mode=mode):
+                j = self.check(FAKE_SSH=mode, FAKE_KNOWN_FP=PUBLISHED_ED25519)
+                self.assertEqual(j["hive_ssh"], "failed")
+                self.assertEqual(j["hive_ssh_error"]["kind"], kind)
+                self.assertIn(text, j["hive_ssh_error"]["detail"])      # not the banner line
+
+    def test_a_windows_domain_login_is_flagged_and_not_tried(self):
+        j = self.check(user="AD3+gstaff")
+        self.assertIn("'gstaff'", j["hive_user_warning"])
+        self.assertEqual(j["hive_ssh"], "failed")
+        self.assertEqual(self.calls("ssh"), [])
+
+    def test_the_windows_store_python_stub_is_reported_and_not_run(self):
+        apps = self._mk("WindowsApps")
+        marker = os.path.join(self.d, "stub_ran")
+        _write_exe(os.path.join(apps, "python3"), f'touch "{marker}"\n')
+        j = self.check(PATH=f"{apps}:{self.bin}", FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["local_python3"]["usable"], False)
+        self.assertIn("WindowsApps", j["local_python3"]["path"])
+        self.assertFalse(os.path.exists(marker), "the Store stub was executed")
+
+    def test_a_real_python3_is_usable_and_none_is_reported_as_none(self):
+        os.symlink(sys.executable, os.path.join(self.bin, "python3"))
+        self.assertIs(self.check(FAKE_KNOWN_FP=PUBLISHED_ED25519)["local_python3"]["usable"], True)
+        os.remove(os.path.join(self.bin, "python3"))
+        j = self.check(FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIsNone(j["local_python3"]["path"])
+        self.assertIs(j["local_python3"]["usable"], False)
+
+
+class CheckAccessCoreOmicsKeyTests(Harness):
+    """check_access.sh reports the CoreOmics key on HIVE -- asked in the SAME ssh call (HIVE
+    throttles new connections) -- and where the CoreOmics steps run (Morgan, 2026-10-08: a
+    Windows laptop whose python3 is the Store stub, the key on the laptop, none on HIVE)."""
+
+    FAKE_KEY = "c0reFAKE" + "00112233445566778899aabbccdd"
+
+    def check(self, store_stub=True, laptop_key=False, **env):
+        path = self.bin
+        if store_stub:                           # Windows: python3 is the Microsoft Store alias
+            apps = self._mk("WindowsApps")
+            _write_exe(os.path.join(apps, "python3"), "exit 9\n")
+            path = f"{apps}:{self.bin}"
+        if laptop_key:
+            with open(os.path.join(self.home, ".coreomics_token"), "w") as fh:
+                fh.write(self.FAKE_KEY + "\n")
+        r = self.run_script(CHECK_ACCESS, "tester", self.key,
+                            **{"PATH": path, "FAKE_KNOWN_FP": PUBLISHED_ED25519, **env})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(self.FAKE_KEY, r.stdout + r.stderr)
+        return json.loads(r.stdout)
+
+    def test_the_key_is_asked_about_in_the_same_call_and_never_read(self):
+        j = self.check(FAKE_CK="mode:600")
+        (argv,) = self.calls("ssh")
+        probe = argv[-1]
+        self.assertIn('f="$HOME/.coreomics_token"', probe)
+        self.assertIn("COREOMICS_KEY=", probe)
+        for reader in ("cat ", "head ", "<\"$f\"", "< \"$f\""):
+            self.assertNotIn(reader, probe)
+        self.assertIs(j["coreomics_key_on_hive"], True)
+        self.assertIn("mode 600", j["coreomics_key_on_hive_detail"])
+        self.assertEqual(j["recommended_mode"], "hive_remote")
+
+    def test_morgan_before_setup_runs_on_hive_and_is_told_to_move_the_key(self):
+        j = self.check(laptop_key=True, FAKE_CK="absent")
+        self.assertIs(j["local_python3"]["usable"], False)
+        self.assertIs(j["coreomics_key_on_hive"], False)
+        self.assertIs(j["coreomics_key_on_this_computer"], True)
+        self.assertEqual(j["coreomics_runs_on"], "hive")
+        self.assertIn("bash scripts/coreomics_key_to_hive.sh", j["coreomics_key_advice"])
+        self.assertIn("standard input", j["coreomics_key_advice"])
+        self.assertNotIn("--paste", j["coreomics_key_advice"])
+
+    def test_after_setup_the_steps_run_on_hive(self):
+        j = self.check(laptop_key=True, FAKE_CK="mode:600")
+        self.assertEqual(j["coreomics_runs_on"], "hive")
+        self.assertIn("ON HIVE through hive_exec.sh", j["coreomics_key_advice"])
+        self.assertIn("core_submission.py check --json", j["coreomics_key_advice"])
+
+    def test_no_key_anywhere_is_the_users_paste(self):
+        j = self.check(FAKE_CK="absent")
+        self.assertIs(j["coreomics_key_on_this_computer"], False)
+        self.assertIn("coreomics_key_to_hive.sh' --paste", j["coreomics_key_advice"])
+        self.assertIn("own Git Bash window", j["coreomics_key_advice"])
+
+    def test_a_key_others_can_read_is_mode_wrong_with_the_fix(self):
+        for answer in ("mode:644", "mode:640", "notmine"):
+            with self.subTest(answer=answer):
+                j = self.check(laptop_key=True, FAKE_CK=answer)
+                self.assertEqual(j["coreomics_key_on_hive"], "mode-wrong")
+                if answer == "notmine":
+                    # another account's file: chmod cannot work; remove it and send again (2.12)
+                    self.assertIn("hive_exec.sh 'rm -f ~/.coreomics_token'", j["coreomics_key_advice"])
+                    self.assertNotIn("chmod 600", j["coreomics_key_advice"])
+                else:
+                    self.assertIn("hive_exec.sh 'chmod 600 ~/.coreomics_token'", j["coreomics_key_advice"])
+                self.assertEqual(j["coreomics_runs_on"], "hive")
+
+    def test_a_working_local_python_keeps_the_laptop_route(self):
+        os.symlink(sys.executable, os.path.join(self.bin, "python3"))
+        j = self.check(store_stub=False, laptop_key=True, FAKE_CK="absent")
+        self.assertIs(j["local_python3"]["usable"], True)
+        self.assertEqual(j["coreomics_runs_on"], "this_computer")
+        self.assertIn("python3 scripts/core_submission.py check --json", j["coreomics_key_advice"])
+
+    def test_without_ssh_nothing_is_claimed_about_hive(self):
+        j = self.check(laptop_key=True, FAKE_SSH="denied")
+        self.assertIsNone(j["coreomics_key_on_hive"])
+        # core_member then rests on this machine alone: on HIVE itself the group is readable
+        route = "this_computer" if j["core_member"] else "none"
+        self.assertEqual((j["recommended_mode"], j["coreomics_runs_on"]), ("local", route))
+
+    def test_outside_the_core_no_coreomics_step_is_routed_or_advised(self):
+        """2.12 staff review: someone outside the Core is never pointed at CoreOmics or its key
+        (SKILL.md steps 0a and 1). A HIVE account that cannot list proteomics-grp is not the Core,
+        whatever key files it has."""
+        if os.access("/quobyte/proteomics-grp", os.R_OK):
+            self.skipTest("this machine reads proteomics-grp itself, so it is the Core")
+        for laptop_key, ck in ((False, ""), (True, "mode:600")):
+            with self.subTest(laptop_key=laptop_key, hive_key=ck):
+                j = self.check(laptop_key=laptop_key, FAKE_SSH="not_core", FAKE_CK=ck)
+                self.assertIs(j["core_member"], False)
+                self.assertEqual(j["recommended_mode"], "hive_remote")
+                self.assertEqual(j["coreomics_runs_on"], "none")
+                self.assertIsNone(j["coreomics_key_advice"])
+                self.assertNotIn("coreomics_key_to_hive", json.dumps(j["coreomics_key_advice"]))
+
+    def test_the_core_still_gets_its_route(self):
+        j = self.check(laptop_key=True, FAKE_CK="mode:600")
+        self.assertIs(j["core_member"], True)
+        self.assertEqual(j["coreomics_runs_on"], "hive")
+        self.assertTrue(j["coreomics_key_advice"])
+
+
+class CheckAccessCoreStaffTests(Harness):
+    """2.15 Ruling 95: ONE definition of Core staff -- the staff list, through staff.py's own check.
+    core_member says only that the group folder is readable. check_access.sh reports both, the
+    staff answer asked in the same SSH call from the skill's copy on HIVE. The staff probe runs
+    here for real (staff.py, a trusted list this account owns, under the test switch); only its
+    printed answer is carried to the fake ssh."""
+
+    ME = __import__("getpass").getuser()
+
+    def probe_text(self):
+        with open(CHECK_ACCESS, encoding="utf-8") as fh:
+            src = fh.read()
+        import re
+        (probe,) = re.findall(r"^STAFF_PROBE='([^']*)'$", src, re.M)
+        return probe
+
+    def staff_answer(self, staff_list=None, skill_on_hive=True):
+        """What the probe prints on "HIVE": HOME with the skill at ~/proteomics-pipeline, the
+        staff list at CORE_STAFF_FILE (None: no list there)."""
+        home = self._mk("hive_home")
+        if skill_on_hive and not os.path.exists(os.path.join(home, "proteomics-pipeline")):
+            os.makedirs(os.path.join(home, "proteomics-pipeline"))
+            os.symlink(SCRIPTS, os.path.join(home, "proteomics-pipeline", "scripts"))
+        pybin = self._mk("pybin")
+        if not os.path.exists(os.path.join(pybin, "python3")):
+            os.symlink(sys.executable, os.path.join(pybin, "python3"))
+        env = {"HOME": home, "PATH": f"{pybin}:/usr/bin:/bin", "SKILL_SLACK_TEST_LOOPBACK": "1",
+               "SKILL_CORE_ADMINS": self.ME, "CORE_STAFF_FILE": os.path.join(self.d, "none.txt"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        if staff_list is not None:
+            d = self._mk("staffcfg")
+            os.chmod(d, 0o755)
+            path = os.path.join(d, "core_staff.txt")
+            with open(path, "w") as fh:
+                fh.write("# the Core's staff\n" + "".join(f"{x}\n" for x in staff_list))
+            os.chmod(path, 0o644)
+            env["CORE_STAFF_FILE"] = path
+        r = subprocess.run(["bash", "-c", "true" + self.probe_text()], capture_output=True,
+                           text=True, env=env, timeout=60)
+        out = os.path.join(self.d, "staff_answer.txt")
+        with open(out, "w") as fh:
+            fh.write(r.stdout)
+        return out
+
+    def check(self, **env):
+        r = self.run_script(CHECK_ACCESS, "tester", self.key,
+                            **{"FAKE_KNOWN_FP": PUBLISHED_ED25519, **env})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_the_probe_is_staffs_own_check_in_the_same_call(self):
+        sys.path.insert(0, SCRIPTS)
+        try:
+            import staff
+        finally:
+            sys.path.remove(SCRIPTS)
+        self.assertIn(staff.STAFF_CHECK_ON_HIVE, self.probe_text())   # one definition
+        self.assertNotIn("'", self.probe_text())
+        j = self.check()
+        (argv,) = self.calls("ssh")
+        self.assertIn(staff.STAFF_CHECK_ON_HIVE, argv[-1])
+        self.assertIn("core_staff", j)
+        self.assertIsNone(j["core_staff"])                      # no answer: never assumed
+        self.assertIn("no answer", j["core_staff_detail"])
+        self.assertIs(j["core_member"], True)
+
+    def test_on_the_list_is_core_staff(self):
+        j = self.check(FAKE_STAFF=self.staff_answer([self.ME]), FAKE_CK="mode:600")
+        self.assertIs(j["core_staff"], True, j["core_staff_detail"])
+        self.assertIs(j["core_member"], True)
+        self.assertEqual(j["coreomics_runs_on"], "hive")
+
+    def test_a_group_member_not_on_the_list_is_not_core_staff(self):
+        j = self.check(FAKE_STAFF=self.staff_answer(["someone_else"]), FAKE_CK="mode:600")
+        self.assertIs(j["core_member"], True)                   # reads the group folder ...
+        self.assertIs(j["core_staff"], False)                   # ... and is still not staff
+        self.assertIn("not on the Core staff list", j["core_staff_detail"])
+        self.assertEqual(j["coreomics_runs_on"], "none")
+        self.assertIsNone(j["coreomics_key_advice"])
+
+    def test_no_usable_list_is_null_and_says_why(self):
+        j = self.check(FAKE_STAFF=self.staff_answer(None))
+        self.assertIsNone(j["core_staff"])
+        self.assertIn("cannot be used", j["core_staff_detail"])
+
+    def test_no_skill_on_hive_yet_is_null_and_says_step_0(self):
+        j = self.check(FAKE_STAFF=self.staff_answer([self.ME], skill_on_hive=False))
+        self.assertIsNone(j["core_staff"])
+        self.assertIn("step 0 puts it there", j["core_staff_detail"])
+
+    def test_without_ssh_nothing_is_claimed(self):
+        j = self.check(FAKE_SSH="denied")
+        self.assertIsNone(j["core_staff"])
+        self.assertIn("SSH login to HIVE failed", j["core_staff_detail"])
+
+
+class HiveLoginSavedTests(Harness):
+    """check_access.sh saves the login that worked. Nothing wrote hive.env before, and the
+    environment does not survive from one tool call to the next, so skill_version.sh
+    --check-hive (SKILL.md step 0) skipped itself for exactly the staff it was for."""
+
+    def check(self, user="tester", key=None, **env):
+        r = self.run_script(CHECK_ACCESS, user, key or self.key,
+                            **{"HIVE_ENV_FILE": self.env_file, **env})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def setUp(self):
+        super().setUp()
+        self.env_file = os.path.join(self.d, "cfg", "ucdavis-proteomics", "hive.env")
+
+    def read(self):
+        with open(self.env_file) as fh:
+            return fh.read()
+
+    def test_a_working_login_is_saved_user_and_key_path_only(self):
+        j = self.check(FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertEqual(j["hive_login_saved"]["saved"], True, j["hive_login_saved"])
+        self.assertEqual(j["hive_login_saved"]["path"], self.env_file)
+        self.assertEqual(self.read(), f"HIVE_USER='tester'\nHIVE_KEY='{self.key}'\n")
+        self.assertEqual(stat.S_IMODE(os.stat(self.env_file).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(self.env_file)).st_mode), 0o700)
+
+    def test_a_failed_login_is_not_saved(self):
+        j = self.check(FAKE_SSH="denied", FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_login_saved"]["saved"], False)
+        self.assertFalse(os.path.exists(self.env_file))
+
+    def test_other_lines_are_kept_and_an_old_login_replaced(self):
+        os.makedirs(os.path.dirname(self.env_file))
+        with open(self.env_file, "w") as fh:
+            fh.write("export HIVE_USER=olduser\nHIVE_HOST=hive2.example\nHIVE_KEY=~/old_key\n")
+        self.check(FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertEqual(self.read(), "HIVE_HOST=hive2.example\n"
+                                      f"HIVE_USER='tester'\nHIVE_KEY='{self.key}'\n")
+
+    def test_a_key_path_with_a_space_is_saved_and_read_back(self):
+        key = os.path.join(self._mk("my keys"), "id ed25519")
+        open(key, "w").close()
+        j = self.check(key=key, FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_login_saved"]["saved"], True)
+        # hive_exec.sh, with nothing in the environment, now reaches HIVE as that user and key
+        env = {k: v for k, v in self.env(HIVE_ENV_FILE=self.env_file).items()
+               if k not in ("HIVE_USER", "HIVE_KEY")}
+        r = subprocess.run(["bash", HIVE_EXEC, "hostname"], capture_output=True, text=True,
+                           env=env, cwd=self.d, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = self.calls("ssh")[-1]
+        self.assertIn(key, argv)
+        self.assertIn(f"tester@{HOST}", argv)
+
+    def test_the_python_readers_read_it(self):
+        """record_run.py and notify_slack.py read hive.env themselves: quotes and all."""
+        self.check(FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        sys.path.insert(0, SCRIPTS)
+        import notify_slack
+        import record_run
+        saved = {k: os.environ.pop(k) for k in ("HIVE_USER", "HIVE_KEY") if k in os.environ}
+        old = os.environ.get("HIVE_ENV_FILE")
+        os.environ["HIVE_ENV_FILE"] = self.env_file
+        try:
+            self.assertEqual(notify_slack._hive_env_user(), "tester")
+            self.assertEqual(record_run.hive_login(), "tester")
+        finally:
+            os.environ.update(saved)
+            if old is None:
+                os.environ.pop("HIVE_ENV_FILE", None)
+            else:
+                os.environ["HIVE_ENV_FILE"] = old
+
+    def test_a_windows_key_path_is_saved_as_git_bash_spells_it(self):
+        """Review: C:\\Users\\gstaff\\.ssh\\id_ed25519 has no "/", so dirname said "." and
+        "$PWD/C:\\Users\\..." was saved. cygpath -u gives the path Git Bash reads."""
+        win = "C:\\Users\\gstaff\\.ssh\\id_ed25519"
+        open(os.path.join(self.d, win), "w").close()        # what -f sees, here, for that path
+        j = self.check(key=win, FAKE_CYGPATH_OUT=self.key, FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_login_saved"]["saved"], True, j["hive_login_saved"])
+        self.assertIn(f"HIVE_KEY='{self.key}'\n", self.read())
+        self.assertNotIn(self.d + "/C:", self.read())
+
+    def test_a_path_that_resolves_to_no_file_is_saved_as_given(self):
+        win = "C:\\Users\\gstaff\\.ssh\\id_ed25519"
+        open(os.path.join(self.d, win), "w").close()
+        j = self.check(key=win, FAKE_CYGPATH_OUT=os.path.join(self.d, "not", "there"),
+                       FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_login_saved"]["saved"], True)
+        self.assertIn(f"HIVE_KEY='{win}'\n", self.read())
+
+    def test_a_relative_key_is_saved_absolute(self):
+        j = self.check(key="id_test", FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_login_saved"]["saved"], True)
+        self.assertIn(f"HIVE_KEY='{self.key}'\n", self.read())
+
+    def test_an_unwritable_place_is_reported_not_fatal(self):
+        j = self.check(HIVE_ENV_FILE="/nonexistent/hive.env", FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_login_saved"]["saved"], False)
+        self.assertIn("could not write", j["hive_login_saved"]["note"])
+        self.assertEqual(j["hive_ssh"], "ok")
+
+
+class HiveLoginSavedWithoutCygpathTests(HiveLoginSavedTests):
+    """Git Bash without cygpath: a Windows key path is saved as the user gave it."""
+    SKIP_SHIMS = ("cygpath",)
+
+    def test_a_windows_key_path_is_saved_as_git_bash_spells_it(self):
+        win = "C:\\Users\\gstaff\\.ssh\\id_ed25519"
+        open(os.path.join(self.d, win), "w").close()
+        j = self.check(key=win, FAKE_KNOWN_FP=PUBLISHED_ED25519)
+        self.assertIs(j["hive_login_saved"]["saved"], True)
+        self.assertIn(f"HIVE_KEY='{win}'\n", self.read())
+
+    def test_a_path_that_resolves_to_no_file_is_saved_as_given(self):
+        self.skipTest("needs cygpath")
+
+
+class WindowsRemoteCommandTests(Harness):
+    """A staff report (skill 2.13.1, Git Bash): Git Bash rewrote the /nfs path of a command meant
+    for HIVE (/nfs/... -> C:/Program Files/Git/nfs/...) when it started a Windows ssh, and the
+    watcher reported no_jobs_file. A command for HIVE never holds a local path, so it is sent with
+    that rewriting off -- and the key, which did need it, is given in the form every ssh on
+    Windows reads (cygpath -m)."""
+    WIN = {"FAKE_UNAME": "MINGW64_NT-10.0-26200"}
+
+    def setUp(self):
+        super().setUp()
+        _write_exe(os.path.join(self.bin, "ssh"), RECORD.format(name="ssh")
+                   + 'echo "MSYS_NO_PATHCONV=${MSYS_NO_PATHCONV:-}" >> "$LOGS/sshenv.log"\n')
+
+    def test_a_command_for_hive_is_never_path_converted(self):
+        for env in ({}, self.WIN):
+            with self.subTest(env=env):
+                r = self.run_script(HIVE_EXEC, "cat /nfs/lssc0/x/jobs.txt", **env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("/nfs/lssc0/x/jobs.txt", self.calls("ssh")[-1][-1])
+                self.assertEqual(self._log("sshenv").split()[-1], "MSYS_NO_PATHCONV=1")
+
+    def test_a_posix_key_path_is_given_to_ssh_in_windows_form(self):
+        r = self.run_script(HIVE_EXEC, "true", HIVE_KEY="/c/Users/tester/.ssh/id_test",
+                            FAKE_CYGPATH_OUT=self.key, **self.WIN)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = self.calls("ssh")[-1]
+        self.assertEqual(argv[argv.index("-i") + 1], self.key)
+        # elsewhere the key is left exactly as given
+        r = self.run_script(HIVE_EXEC, "true", FAKE_CYGPATH_OUT="/wrong")
+        argv = self.calls("ssh")[-1]
+        self.assertEqual(argv[argv.index("-i") + 1], self.key)
+
+
+class ScriptModeTests(unittest.TestCase):
+    def test_new_scripts_are_executable(self):
+        """CI requires mode 100755 on every script with a shebang."""
+        self.assertTrue(os.access(HIVE_PATH, os.X_OK))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

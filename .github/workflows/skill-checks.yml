@@ -1,0 +1,130 @@
+name: Skill checks
+
+# This repository is the skill, so every push and pull request to main is checked (in DE-LIMP
+# the same checks ran only on changes under skill/). The steps are DE-LIMP's skill-checks.yml,
+# copied by export_new_repo.py, plus the last one (the pages the README links to exist).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  skill-checks:
+    runs-on: ubuntu-latest
+    name: Skill scripts + docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Every shebang-bearing script must be executable
+        run: |
+          S=skill/ucdavis-proteomics-core-pipeline/scripts
+          bad=0
+          for f in "$S"/*; do
+            [ -f "$f" ] || continue
+            head -c2 "$f" | grep -q '#!' || continue
+            # git's mode is what ships in the plugin payload, not the checkout's
+            mode=$(git ls-files -s "$f" | awk '{print $1}')
+            if [ "$mode" != "100755" ]; then
+              echo "NOT EXECUTABLE ($mode): $f"; bad=$((bad+1))
+            fi
+          done
+          [ "$bad" -eq 0 ] || { echo "::error::$bad script(s) have a shebang but are not 100755"; exit 1; }
+          echo "all shebang scripts are 100755"
+
+      - name: Shell scripts parse
+        run: |
+          bad=0
+          for f in skill/ucdavis-proteomics-core-pipeline/scripts/*.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f" || { echo "SYNTAX: $f"; bad=$((bad+1)); }
+          done
+          [ "$bad" -eq 0 ] || exit 1
+          echo "all .sh parse"
+
+      # Stdlib only (unittest + sqlite3) on purpose -- no extra CI dependencies,
+      # so this stage cannot start failing because a pinned test package moved.
+      # The identifier guard's client-name and staff-name parts SKIP here, and say so: their
+      # private lists never leave the Core director's Mac (Ruling 93 -- no secret, no copy).
+      # SKILL_REQUIRE_CLIENT_NAMES is never set in CI; the merges are checked on the Mac with it.
+      - name: Python unit tests
+        run: |
+          python3 -m unittest discover \
+            -s skill/ucdavis-proteomics-core-pipeline/tests -v
+
+      - name: Python scripts compile
+        run: |
+          python3 -m compileall -q skill/ucdavis-proteomics-core-pipeline/scripts/ \
+            && echo "all .py compile"
+
+      - name: Every scripts/<file> named in the docs exists
+        run: |
+          python3 - <<'PY'
+          import re, pathlib, sys
+          root = pathlib.Path("skill/ucdavis-proteomics-core-pipeline")
+          have = {p.name for p in (root / "scripts").iterdir() if p.is_file()}
+          missing = {}
+          docs = list(root.glob("*.md")) + list((root / "references").glob("*.md"))
+          for d in docs:
+              for m in re.findall(r'scripts/([A-Za-z0-9_.\-]+\.(?:py|sh|R))', d.read_text()):
+                  if m not in have:
+                      missing.setdefault(m, []).append(d.name)
+          if missing:
+              for name, where in sorted(missing.items()):
+                  print(f"MISSING scripts/{name}  referenced by: {', '.join(sorted(set(where)))}")
+              sys.exit(f"{len(missing)} script(s) referenced in docs do not exist")
+          print(f"all script references resolve ({len(have)} scripts, {len(docs)} docs)")
+          PY
+
+      - name: Plugin manifest is valid and versions agree
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          p = json.load(open("skill/ucdavis-proteomics-core-pipeline/.claude-plugin/plugin.json"))
+          m = json.load(open(".claude-plugin/marketplace.json"))
+          pv = p["version"]
+          mv = [x.get("version") for x in m.get("plugins", []) if x.get("name") == p["name"]]
+          top = m.get("version")
+          print("plugin.json:", pv, "| marketplace entry:", mv, "| marketplace top:", top)
+          bad = [v for v in mv if v != pv]
+          if bad:
+              sys.exit(f"version mismatch: plugin.json {pv} vs marketplace {bad}")
+          print("versions agree")
+          PY
+
+      - name: Dev-only files must not ship in the skill payload
+        run: |
+          S=skill/ucdavis-proteomics-core-pipeline
+          bad=0
+          for f in TODO_TEST_ON_HIVE.md TODO.md NOTES.md scratch.md; do
+            [ -f "$S/$f" ] && { echo "dev file in payload: $S/$f"; bad=$((bad+1)); }
+          done
+          [ "$bad" -eq 0 ] || { echo "::error::move dev checklists out of the skill payload — they land in every user's plugin cache"; exit 1; }
+          echo "no dev-only files in the payload"
+
+      - name: The pages the README and the skill link to exist
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          missing = []
+          for page in ("docs/skill-install.html", "docs/how-reports-are-made.html", "docs/index.html"):
+              if not pathlib.Path(page).is_file():
+                  missing.append(page)
+          readme = pathlib.Path("README.md").read_text(encoding="utf-8")
+          for link in re.findall(r"\]\(([^)#\s]+)\)", readme):
+              if "://" in link or link.startswith("mailto:"):
+                  continue
+              if not pathlib.Path(link).exists():
+                  missing.append(f"README.md -> {link}")
+          if missing:
+              sys.exit("missing: " + ", ".join(missing))
+          print("README links and the skill's pages resolve")
+          PY
+
+      # docs/SKILL_INVENTORY.md is generated from each file's own header (tools/make_inventory.py):
+      # every shipped file has an entry, the page is current, no entry says "no description".
+      - name: The skill inventory is complete and current
+        run: python3 -m unittest discover -s tools -v

@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+Every generated search job ends with the job-end hook: run log, FRAN staging, Slack post
+(notify_slack.wrap_job_script). A test that EXECUTES such a script with an inherited environment
+is isolated only while $SLURM_JOB_ID is unset -- run the suite inside a HIVE allocation and its
+fake searches reach the Core's real run log, FRAN's drop directory and the Core channel.
+tests/job_env.py is the one environment that switches all of that off. This meta-test fails any
+test module that runs a script with bash and does not use it.
+
+A call counts as "runs a generated script" when it is subprocess.run/Popen/call/check_call/
+check_output(["bash" | "sh", <script>, ...]) and <script> is neither a flag ("-c", "-n"), nor a
+skill script referenced through SCRIPTS or an UPPER_CASE constant (those are the skill's own
+scripts, not generated jobs). Such a call must pass env=, and its module must import job_env.
+A script that is generated but is not a search job (e.g. prepare_upload.sbatch) says so with a
+`# job_env: not a search job ...` comment on the line above the call.
+"""
+import ast
+import glob
+import os
+import re
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from job_env import job_env  # noqa: E402
+
+CALLS = {"run", "Popen", "call", "check_call", "check_output"}
+EXEMPT = "job_env: not a search job"
+
+
+def _is_skill_script(node):
+    if isinstance(node, ast.Name) and node.id.isupper():
+        return True                                    # SCRIPT, ENSURE, HIVE_PATH, ...
+    if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "join" and node.args:
+        first = node.args[0]
+        return isinstance(first, ast.Name) and first.id == "SCRIPTS"
+    return False
+
+
+def script_calls(path):
+    """[(line, has_env, exempt)] for every bash/sh call in `path` that runs a script."""
+    with open(path) as fh:
+        src = fh.read()
+    lines = src.splitlines()
+    found = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in CALLS and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess" and node.args
+                and isinstance(node.args[0], ast.List) and len(node.args[0].elts) >= 2):
+            continue
+        prog, target = node.args[0].elts[:2]
+        if not (isinstance(prog, ast.Constant) and prog.value in ("bash", "sh")):
+            continue
+        if isinstance(target, ast.Constant) and str(target.value).startswith("-"):
+            continue                                   # bash -n / bash -c
+        if _is_skill_script(target):
+            continue
+        near = "\n".join(lines[max(0, node.lineno - 2):node.lineno])
+        found.append((node.lineno, any(k.arg == "env" for k in node.keywords), EXEMPT in near))
+    return found, ("from job_env import job_env" in src or "import job_env" in src)
+
+
+# The scripts that decide "is this a cluster login node?" or run work that a login node must not
+# (setup.sh, acquire_tools.sh, ensure_dotnet8.sh, on_compute.py). On HIVE every one of the 22
+# tests that ran them with a bare environment saw a real cluster: HPCCF's cluster file, SLURM at
+# its fixed path, a real sbatch and srun on PATH -- one reached a real srun (Ruling 109, item A).
+CLUSTER_AWARE = re.compile(r"setup\.sh|on_compute|acquire_tools|ensure_dotnet8"
+                           r"|\bSETUP\b|\bON_COMPUTE\b|\bENSURE\b|\bACQUIRE\b|\bsetup_t\.SETUP\b")
+BARE_ENV = re.compile(r"^(os\.environ(\.copy\(\))?|dict\(os\.environ\)|\{\})$")
+
+
+def cluster_script_calls(path):
+    """[(line, how)] for every subprocess call in `path` that runs a cluster-aware script with no
+    env=, or with a bare copy of os.environ. A module that runs one must also import job_env."""
+    with open(path) as fh:
+        src = fh.read()
+    found = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in CALLS and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess" and node.args):
+            continue
+        if not CLUSTER_AWARE.search(ast.unparse(node.args[0])):
+            continue
+        env = [k.value for k in node.keywords if k.arg == "env"]
+        if not env:
+            found.append((node.lineno, "no env="))
+        elif BARE_ENV.match(ast.unparse(env[0])):
+            found.append((node.lineno, "a bare copy of os.environ"))
+        elif "job_env" not in src:
+            found.append((node.lineno, "the module never imports job_env"))
+    return found
+
+
+class JobEnvGuard(unittest.TestCase):
+    def test_every_test_that_runs_a_cluster_aware_script_hides_the_cluster(self):
+        bad, seen = [], 0
+        for path in sorted(glob.glob(os.path.join(HERE, "test_*.py"))):
+            if os.path.basename(path) == os.path.basename(__file__):
+                continue
+            with open(path) as fh:
+                seen += bool(CLUSTER_AWARE.search(fh.read()))
+            for line, how in cluster_script_calls(path):
+                bad.append(f"{os.path.basename(path)}:{line} runs setup.sh / on_compute.py / "
+                           f"acquire_tools.sh / ensure_dotnet8.sh with {how} (use "
+                           "job_env.no_cluster_env)")
+        self.assertEqual(bad, [], "\n".join(bad))
+        self.assertGreaterEqual(seen, 6, "the guard found too few modules that run these scripts")
+
+    def test_the_cluster_guard_catches_a_bare_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "test_bad.py")
+            with open(bad, "w") as fh:
+                fh.write("import os, subprocess\n"
+                         "SETUP = 'x/setup.sh'\n"
+                         "def a():\n"
+                         "    subprocess.run(['bash', SETUP, '--check'])\n"
+                         "def b():\n"
+                         "    subprocess.run(['bash', SETUP], env=os.environ.copy())\n"
+                         "def c(e):\n"
+                         "    subprocess.run(['bash', SETUP], env=e)\n")
+            got = cluster_script_calls(bad)
+        self.assertEqual([(ln, how) for ln, how in got],
+                         [(4, "no env="), (6, "a bare copy of os.environ"),
+                          (8, "the module never imports job_env")])
+
+    def test_no_cluster_env_removes_what_a_cluster_node_adds(self):
+        from job_env import no_cluster_env
+        base = {"PATH": "/usr/bin", "LMOD_CMD": "/x", "MODULEPATH": "/m", "BASH_ENV": "/etc/b",
+                "BASH_FUNC_module%%": "() { :; }", "LOADEDMODULES": "a", "KEEP": "1",
+                "SLURM_JOB_ID": "5"}
+        env = no_cluster_env("/tmp/t", base=base)
+        for k in ("LMOD_CMD", "MODULEPATH", "BASH_ENV", "BASH_FUNC_module%%", "LOADEDMODULES",
+                  "SLURM_JOB_ID"):
+            self.assertNotIn(k, env)
+        self.assertEqual(env["KEEP"], "1")
+        self.assertEqual(env["HPCCF_SLURM_BIN"], "/tmp/t/no_slurm_bin")
+        self.assertEqual(env["UCD_HPC_CLUSTER_CONF"], "/tmp/t/no_cluster_file")
+
+    def test_a_stub_path_given_in_extra_is_kept(self):
+        """A stub-only PATH may hold a FAKE sbatch on purpose; an inherited one loses real ones."""
+        from job_env import no_cluster_env
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "slurm_bin")
+            os.makedirs(real)
+            for t in ("sbatch", "srun"):
+                with open(os.path.join(real, t), "w") as fh:
+                    fh.write("#!/bin/sh\n")
+                os.chmod(os.path.join(real, t), 0o755)
+            inherited = no_cluster_env(d, base={"PATH": real + os.pathsep + "/usr/bin"})
+            self.assertEqual(inherited["PATH"], "/usr/bin")
+            stub = no_cluster_env(d, base={"PATH": "/usr/bin"}, PATH=real)
+            self.assertEqual(stub["PATH"], real)
+
+
+    def test_every_test_that_runs_a_job_script_uses_job_env(self):
+        seen, bad = 0, []
+        for path in sorted(glob.glob(os.path.join(HERE, "test_*.py"))):
+            calls, imports = script_calls(path)
+            for line, has_env, exempt in calls:
+                if exempt:
+                    continue
+                seen += 1
+                name = f"{os.path.basename(path)}:{line}"
+                if not has_env:
+                    bad.append(f"{name} runs a script without env= (use job_env)")
+                elif not imports:
+                    bad.append(f"{name} runs a script but the module never imports job_env")
+        self.assertEqual(bad, [], "\n".join(bad))
+        # The scan must actually be finding them: at the time of writing, 14 call sites in 8
+        # modules run generated scripts. A scan that matches nothing would pass vacuously.
+        self.assertGreaterEqual(seen, 12, "the guard found too few script-running calls")
+
+    def test_the_guard_catches_an_inherited_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "test_bad.py")
+            with open(bad, "w") as fh:
+                fh.write("import os, subprocess\n"
+                         "def t(out):\n"
+                         "    subprocess.run(['bash', os.path.join(out, 'step5_report.sbatch')])\n"
+                         "    subprocess.run(['bash', '-n', 'x.sh'])\n")
+            calls, imports = script_calls(bad)
+        self.assertEqual(calls, [(3, False, False)])
+        self.assertFalse(imports)
+
+    def test_job_env_switches_every_side_effect_off(self):
+        base = {"SLURM_JOB_ID": "1", "SLURM_ARRAY_JOB_ID": "2", "SLURM_ARRAY_TASK_ID": "3",
+                "SKILL_SLACK_WEBHOOK": "https://hooks.slack.com/services/T/B/x",
+                "FRAN_DROP_DIR": "/quobyte/proteomics-grp/fran/incoming", "RECORD_RUN": "on",
+                "HIVE_USER": "someone", "PATH": "/usr/bin"}
+        env = job_env("/tmp/t", base=base, EXTRA="1")
+        for k in ("SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID",
+                  "SKILL_SLACK_WEBHOOK", "HIVE_USER"):
+            self.assertNotIn(k, env)
+        self.assertEqual((env["SKILL_SLACK"], env["FRAN_DEPOSIT"], env["RECORD_RUN"]),
+                         ("0", "off", "off"))
+        # never the live FRAN database, even on HIVE as an account that can read the token
+        self.assertEqual((env["FRAN_HEALTH"], env["FRAN_CORPUS_QUERY"]), ("off", "off"))
+        self.assertEqual(env["SKILL_RUNS_DIR"], "/tmp/t/skill_runs")
+        self.assertEqual(env["FRAN_DROP_DIR"], "/tmp/t/fran_drop")
+        self.assertEqual(env["HIVE_ENV_FILE"], "/nonexistent/hive.env")
+        self.assertEqual((env["PATH"], env["EXTRA"]), ("/usr/bin", "1"))
+
+    def test_a_hive_node_is_not_a_login_node_to_a_test(self):
+        """L8R-F2. On a HIVE node SLURM sits at HPC@UCD's fixed path and HPCCF's cluster file
+        exists; job_env drops SLURM_JOB_ID, so on_compute.on_login_node() said True there and
+        run_search refused every test's inline search. job_env points both at nothing."""
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+        import on_compute
+        with tempfile.TemporaryDirectory() as t:
+            slurm = os.path.join(t, "cvmfs_slurm_bin")
+            os.makedirs(slurm)
+            with open(os.path.join(slurm, "sbatch"), "w") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(os.path.join(slurm, "sbatch"), 0o755)
+            conf = os.path.join(t, "cluster_name.conf")
+            open(conf, "w").close()
+            hive = {"SLURM_JOB_ID": "9900001", "HPCCF_SLURM_BIN": slurm,
+                    "UCD_HPC_CLUSTER_CONF": conf, "PATH": "/usr/bin:/bin"}
+            self.assertTrue(on_compute.on_login_node(dict(hive, SLURM_JOB_ID="")))
+            env = job_env(t, base=hive)
+            self.assertFalse(on_compute.on_login_node(env), env)
+            self.assertFalse(os.path.exists(env["HPCCF_SLURM_BIN"]))
+            self.assertFalse(os.path.exists(env["UCD_HPC_CLUSTER_CONF"]))
+            # a test that wants them names them
+            mine = job_env(t, base=hive, HPCCF_SLURM_BIN=slurm)
+            self.assertEqual(mine["HPCCF_SLURM_BIN"], slurm)
+            self.assertTrue(on_compute.on_login_node(mine))
+
+    def test_a_real_sbatch_on_path_does_not_make_a_login_node(self):
+        """2.14.2 C2 (a HIVE test job): a HIVE job's login shell has the slurm module on PATH,
+        so with SLURM_JOB_ID dropped every finalize test was a login-node run and on_compute
+        handed it to a REAL srun. job_env drops PATH directories holding sbatch/srun; a fake a
+        test names in `extra` still makes a login node."""
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+        import on_compute
+        with tempfile.TemporaryDirectory() as t:
+            slurm = os.path.join(t, "slurm_module_bin")
+            os.makedirs(slurm)
+            for tool in ("sbatch", "srun"):
+                with open(os.path.join(slurm, tool), "w") as fh:
+                    fh.write("#!/bin/sh\nexit 99\n")
+                os.chmod(os.path.join(slurm, tool), 0o755)
+            base = {"SLURM_JOB_ID": "9900001", "PATH": slurm + os.pathsep + "/usr/bin:/bin"}
+            env = job_env(t, base=base)
+            self.assertEqual(env["PATH"], "/usr/bin:/bin")
+            self.assertFalse(on_compute.on_login_node(env), env)
+            mine = job_env(t, base=base, PATH=slurm + os.pathsep + "/usr/bin:/bin")
+            self.assertTrue(on_compute.on_login_node(mine))
+
+
+if __name__ == "__main__":
+    unittest.main()

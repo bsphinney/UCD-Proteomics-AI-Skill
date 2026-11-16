@@ -1,0 +1,1139 @@
+"""
+The CoreOmics submission in every report (submission_report.py).
+
+The report goes to the collaborator and gets forwarded, so the record is ALLOWLISTED: no email,
+phone, billing or internal field may reach it, however CoreOmics or the submitter spells it.
+The fixture is PROT_9756's real record with every contact field stripped and fake people's
+names (tests/fixtures/coreomics_prot9756); the canaries below are planted at test time.
+
+Stdlib only, no network.
+"""
+import copy
+import csv
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
+sys.path.insert(0, SCRIPTS)
+
+import submission_report as sr  # noqa: E402
+import record_run  # noqa: E402
+import session as session_mod  # noqa: E402
+import session_docs  # noqa: E402
+
+FIXTURE = os.path.join(HERE, "fixtures", "coreomics_prot9756")
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+RUNS = {f"LRS{n}": f"08132026__60SPD_DIA-LRS-{n}_S3-A1_1_{23600 + n}" for n in range(96, 126)}
+
+# Planted in every place a contact, billing or internal detail can sit in a CoreOmics record.
+CANARIES = ("canary.submitter@example.org", "canary.pi@example.org", "canary.contact@example.org",
+            "530-555-0142", "(530) 555-0143", "PO-CANARY-7731", "CANARY-PPMS-REF", "CANARY-TOKEN-abc",
+            "CANARY-INTERNAL-NOTE", "CANARY-FUTURE-FIELD", "CANARY-STAFF-ROUTING")
+
+
+def fixture():
+    with open(os.path.join(FIXTURE, "submission.json")) as fh:
+        return json.load(fh)
+
+
+def planted():
+    r = fixture()
+    r.update(email="canary.submitter@example.org", phone="530-555-0142",
+             pi_email="canary.pi@example.org", pi_phone="(530) 555-0143",
+             payment={"display": {"Payment Type": "PO", "Payment Info": "PO-CANARY-7731",
+                                  "PPMS Order Ref #": "CANARY-PPMS-REF"}},
+             import_request="CANARY-TOKEN-abc", notes="CANARY-INTERNAL-NOTE",
+             future_field="CANARY-FUTURE-FIELD",
+             contacts=[{"first_name": "Robin", "last_name": "Contact",
+                        "email": "canary.contact@example.org"}])
+    r["pi"] = dict(r["pi"], email="canary.pi@example.org", phone="(530) 555-0143")
+    sd = r["submission_data"]
+    sd["email_ucd_scientist"] = ["CANARY-STAFF-ROUTING"]
+    sd["description"] += " Questions: canary.submitter@example.org or 530-555-0142."
+    sd["samples"][0] = dict(sd["samples"][0], internal_notes="CANARY-INTERNAL-NOTE")
+    return r
+
+
+def make_session(tmp, raws=None, conditions=None, fasta=None, extra_col="Batch", prov=None):
+    s = os.path.join(tmp, "2026-09-24_PROT_9756")
+    os.makedirs(os.path.join(s, "input"))
+    os.makedirs(os.path.join(s, "output"))
+    if raws is not None:
+        with open(os.path.join(s, "input", "raw_files.txt"), "w") as fh:
+            fh.write("# raw\n" + "".join(f"/data/JUL26/{r}.d\n" for r in raws))
+    if conditions is not None:
+        with open(os.path.join(s, "input", "conditions.csv"), "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["File.Name", "Group"] + ([extra_col] if any(len(r) > 2 for r in conditions) else []))
+            for row in conditions:
+                w.writerow(row)
+    if fasta is not None:
+        with open(os.path.join(s, "input", "search.fasta.meta.json"), "w") as fh:
+            json.dump(fasta, fh)
+    if prov is not None:
+        os.makedirs(os.path.join(s, "output", "tables"))
+        with open(os.path.join(s, "output", "tables", "de_provenance.json"), "w") as fh:
+            json.dump(prov, fh)
+    return s
+
+
+def sheet():
+    return {s["unique_id"]: s["condition_name"] for s in fixture()["submission_data"]["samples"]}
+
+
+def by_age_and_ip(uid):
+    f = [x.strip() for x in re.split(r"\s+-\s*|\s*-\s+", sheet()[uid])]
+    return f"{f[0]}_{f[1]}"
+
+
+def attach_fixture(s, obj=None):
+    return sr.attach(s, sr.sanitize(obj or fixture()))
+
+
+def run(script, *args):
+    return subprocess.run([sys.executable, os.path.join(SCRIPTS, script)] + list(args),
+                          capture_output=True, text=True, timeout=120)
+
+
+def notes_by_id(rec, session=None):
+    return {n["id"]: n["text"] for n in sr.quality_notes(rec, session)}
+
+
+# ------------------------------------------------------------------------ allowlist --
+class TestAllowlist(unittest.TestCase):
+    def assertClean(self, text, where):
+        for c in CANARIES:
+            self.assertNotIn(c, text, f"{c} leaked into {where}")
+        self.assertIsNone(EMAIL_RE.search(text), f"an email address leaked into {where}")
+
+    def test_no_contact_billing_or_internal_field_reaches_any_output(self):
+        rec = sr.sanitize(planted())
+        notes = sr.quality_notes(rec)
+        self.assertClean(json.dumps(rec), "the record")
+        self.assertClean(sr.render_html(rec, notes), "the HTML section")
+        self.assertClean(sr.render_markdown(rec, notes), "the markdown section")
+        self.assertIn("[email removed]", rec["description"])
+        self.assertIn("[phone removed]", rec["description"])
+
+    def test_nor_the_session_files_or_the_finished_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            attach_fixture(s, planted())
+            for rel in ("session.json", "input/submission.json", "input/samples.tsv"):
+                with open(os.path.join(s, rel)) as fh:
+                    self.assertClean(fh.read(), rel)
+            with open(os.path.join(s, "output", "AI_Analysis_Report.md"), "w") as fh:
+                fh.write("# Analysis\n\ntext\n")
+            out = os.path.join(tmp, "report.html")
+            p = run("make_analysis_html.py", "--session", s, "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out) as fh:
+                page = fh.read()
+            self.assertClean(page, "Analysis_Report.html")
+            self.assertIn("PROT_9756", page)
+
+    def test_the_summary_and_facts_given_by_the_user_are_allowlisted_too(self):
+        summary = {"schema": "core_submission/1", "internal_id": "PROT_9756", "id": "9a7e5c3b1d0f",
+                   "submitter": {"name": "Sam Sampleton", "email": "canary.submitter@example.org"},
+                   "pi": {"name": "Alex Example", "email": "canary.pi@example.org"},
+                   "contacts": [{"email": "canary.contact@example.org"}], "samples": []}
+        self.assertClean(json.dumps(sr.sanitize(summary)), "a record from the summary")
+        given = sr.sanitize({"internal_id": "807", "pi": {"name": "A", "email": "canary.pi@example.org"},
+                             "phone": "530-555-0142"})
+        self.assertClean(json.dumps(given), "facts given by the user")
+        self.assertEqual((given["internal_id"], given["source"]), ("PROT_0807", sr.SOURCE_USER))
+
+    def test_every_phone_form_is_removed(self):
+        for phone in ("(530)555-0100", "+15305550100", "5305550100", "530-5550100", "530.555.0100",
+                      "+1 (530) 555-0100", "1 530 555 0100", "+44 20 7946 0958", "+49 30 901820",
+                      "tel: 555-0100", "Phone 752-1234"):
+            got = sr.clean(f"call {phone} today")
+            self.assertEqual(got, "call [phone removed] today", phone)
+
+    def test_quantities_dates_and_names_are_not_phones(self):
+        for text in ("dilutions 100-200-3000 ug", "50 mM Ammonium Bicarbonate", "Cat#10004D",
+                     "sent 2026-07-15", "Kv2.1", "pH 7.4, 150 mM NaCl", "LRS-100", "30 samples"):
+            self.assertEqual(sr.clean(text), text)
+
+    def test_links_are_only_coreomics_and_uniprot_pages(self):
+        for url in ("https://x.example/?e=a@b.co", "https://ucdavis.coreomics.com/submissions/x)",
+                    "javascript:alert(1)", "http://ucdavis.coreomics.com/submissions/9a7e5c3b1d0f"):
+            self.assertIsNone(sr._url(url), url)
+        r = fixture()
+        r["submission_data"]["uniprot"] = "https://evil.example/UP000000589"
+        self.assertNotIn("href='https://evil", sr.render_html(sr.sanitize(r)))
+        r["submission_data"]["uniprot"] = "https://www.uniprot.org/proteomes/UP000000589"
+        self.assertIn("href='https://www.uniprot.org/proteomes/UP000000589'", sr.render_html(sr.sanitize(r)))
+
+    def test_attach_sanitizes_whatever_it_is_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            sr.attach(s, planted())                      # the RAW record, not sanitized first
+            with open(os.path.join(s, "input", "submission.json")) as fh:
+                self.assertClean(fh.read(), "input/submission.json")
+
+    def test_odd_shapes_neither_leak_nor_pass_as_blank(self):
+        r = fixture()
+        r["pi_first_name"] = {"email": "canary.pi@example.org", "first": "Alex"}
+        r["submission_data"]["uniprot"] = {"link": "x"}
+        rec = sr.sanitize(r)
+        self.assertEqual(rec["pi"]["name"], "Example")
+        self.assertIsNone(rec["uniprot"], "a non-text answer is missing, not 'left blank'")
+        self.assertNotIn("uniprot_blank", notes_by_id(rec))
+
+    def test_a_record_from_the_summary_says_what_the_summary_lacks(self):
+        summary = {"schema": "core_submission/1", "internal_id": "PROT_9756", "id": "9a7e5c3b1d0f",
+                   "samples": []}
+        page = sr.render_html(sr.sanitize(summary))
+        self.assertIn("not in submission_summary.json", page)
+
+    def test_sanitize_is_idempotent(self):
+        rec = sr.sanitize(fixture())
+        self.assertEqual(sr.sanitize(copy.deepcopy(rec)), rec)
+
+    def test_submitter_text_is_escaped(self):
+        r = fixture()
+        r["submission_data"]["samples"][0]["condition_name"] = "<script>alert(1)</script>"
+        r["submission_data"]["description"] = "<img src=x onerror=alert(1)>"
+        page = sr.render_html(sr.sanitize(r))
+        self.assertNotIn("<script>alert", page)
+        self.assertNotIn("<img", page)
+
+
+# ------------------------------------------------------------------- the section --
+class TestSection(unittest.TestCase):
+    def test_renders_everything_the_lab_told_the_core(self):
+        rec = sr.sanitize(fixture())
+        page = sr.render_html(rec, sr.quality_notes(rec))
+        for expect in ("href='https://ucdavis.coreomics.com/submissions/9a7e5c3b1d0f'>PROT_9756</a>",
+                       "Alex Example, SOM: Example Department, UC Davis", "Sam Sampleton",
+                       "2026-07-15", "Mouse", "left blank on the form",
+                       "DIA (Quantitative); Affinity Purification (magnetic Beads)",
+                       "peptides", "the lab prepared peptides",
+                       "50 mM Ammonium Bicarbonate", "Protein G coated magnetic beads",
+                       "lets discuss/no idea", "I want the proteomics core to do the data analysis",
+                       "Sample sheet (30 samples)", "<code>LRS96</code>Old - JPH3 - Mouse 1",
+                       "Data quality notes"):
+            self.assertIn(expect, page)
+
+    def test_the_description_is_as_written(self):
+        """The report once said "chemically cross-linked"; the record says "cross-linked"."""
+        rec = sr.sanitize(fixture())
+        for text in (sr.render_html(rec), sr.render_markdown(rec)):
+            self.assertIn("Immunopurifications of cross-linked brain tissue", text)
+            self.assertNotIn("chemically", text)
+
+    def test_markdown_section(self):
+        md = sr.render_markdown(sr.sanitize(fixture()))
+        self.assertTrue(md.startswith("## Submission\n"))
+        self.assertIn("| Submission | [PROT_9756](https://ucdavis.coreomics.com/submissions/9a7e5c3b1d0f) |", md)
+        self.assertIn("| LRS125 | Young - IgG - Mouse 6 |", md)
+
+    def test_facts_given_by_the_user_are_labelled_so(self):
+        rec = sr.sanitize({"internal_id": "PROT_9756", "organism": "mouse", "sample_prep": "lab"})
+        self.assertIn("not read from CoreOmics", sr.render_html(rec))
+        self.assertIn("source_user", notes_by_id(rec))
+        self.assertIn("not in the record", sr.render_html(rec), "missing facts say so")
+
+    def test_report_leads_with_it_and_omits_it_when_there_is_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            with open(os.path.join(s, "output", "AI_Analysis_Report.md"), "w") as fh:
+                fh.write("# Analysis\n\ntext\n\n## Overview\n\nmore\n")
+            out = os.path.join(tmp, "a.html")
+            p = run("make_analysis_html.py", "--session", s, "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out) as fh:
+                page = fh.read()
+            self.assertNotIn('id="submission"', page)
+            self.assertNotIn("<b>Submission</b>", page)
+            attach_fixture(s)
+            p = run("make_analysis_html.py", "--session", s, "--out", out)
+            with open(out) as fh:
+                page = fh.read()
+            # first in the contents, first section, and the header's Submission fact
+            self.assertIn('<ol><li><a href="#submission">Submission</a></li>', page)
+            self.assertLess(page.index('id="submission"'), page.index('id="overview"'))
+            self.assertIn("<b>Submission</b>PROT_9756", page)
+            # styled by report_style.py (the one design system), not by a style of its own
+            import report_style
+            self.assertIn(".subm dl{", report_style.CSS)
+            self.assertEqual(page.count("<style>"), 1)
+
+    def test_a_label_is_not_a_record(self):
+        """--submission names a record, never a bare number: a PROT id with no record behind it
+        is shown as unreadable, and nothing is put in the header."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            with open(os.path.join(s, "output", "AI_Analysis_Report.md"), "w") as fh:
+                fh.write("# Analysis\n\n## Overview\n\nmore\n")
+            out = os.path.join(tmp, "a.html")
+            p = run("make_analysis_html.py", "--session", s, "--submission", "PROT_9101",
+                    "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out) as fh:
+                page = fh.read()
+            self.assertIn("could not be read", page)
+            self.assertIn('class="callout warning"', page)
+            self.assertNotIn("<b>Submission</b>", page)
+
+    def test_an_explicit_record_needs_no_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = os.path.join(tmp, "r.md")
+            with open(rep, "w") as fh:
+                fh.write("# A\n\nx\n")
+            out = os.path.join(tmp, "a.html")
+            p = run("make_analysis_html.py", "--report", rep, "--submission", FIXTURE, "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out) as fh:
+                self.assertIn("PROT_9756", fh.read())
+
+    def test_an_unreadable_record_is_shown_not_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            attach_fixture(s)
+            os.remove(os.path.join(s, "input", "submission.json"))
+            self.assertIn("could not be read", sr.html_section(None, s))
+
+
+# --------------------------------------------------------------------- storage --
+class TestAttach(unittest.TestCase):
+    def test_one_record_in_the_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            with open(os.path.join(s, "session.json"), "w") as fh:
+                json.dump({"qc": False}, fh)
+            p = run("submission_report.py", "attach", "--session", s, "--record", FIXTURE)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(os.path.join(s, "session.json")) as fh:
+                sj = json.load(fh)
+            self.assertFalse(sj["qc"], "other session metadata is kept")
+            self.assertEqual(sj["coreomics"]["internal_id"], "PROT_9756")
+            self.assertEqual(sj["coreomics"]["record"], "input/submission.json")
+            self.assertEqual(sr.load(s)["samples"][0]["unique_id"], "LRS96")
+            with open(os.path.join(s, "input", "samples.tsv")) as fh:
+                self.assertEqual(len(fh.read().splitlines()), 31)
+
+    def test_another_submission_is_not_silently_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            attach_fixture(s)
+            attach_fixture(s)                                   # the same one again: fine
+            with self.assertRaises(sr.RecordError):
+                sr.attach(s, sr.sanitize({"internal_id": "PROT_9757"}))
+            sr.attach(s, sr.sanitize({"internal_id": "PROT_9757"}), replace=True)
+            self.assertEqual(sr.load(s)["internal_id"], "PROT_9757")
+
+    def test_given_facts_warn_about_what_was_not_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            p = run("submission_report.py", "attach", "--session", s, "--given",
+                    json.dumps({"internal_id": "PROT_9756", "sample_prep": "lab", "email": "x@example.org"}))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            out = json.loads(p.stdout)
+            self.assertEqual((out["source"], out["prepared_by"]), (sr.SOURCE_USER, "lab"))
+            self.assertIn("email", out["warnings"][0])
+
+    def test_record_run_finds_both_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            attach_fixture(s)
+            got = record_run.find_prot(None, s, None)
+            self.assertEqual((got["prot"], got["id"]), ("PROT_9756", "9a7e5c3b1d0f"))
+            self.assertTrue(got["source"].endswith("session.json"))
+
+    def test_the_session_readme_names_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            p = session_mod.paths_for(s)
+            self.assertIsNone(session_docs.submission_line(p))
+            attach_fixture(s)
+            line = ("CoreOmics submission: [PROT_9756](https://ucdavis.coreomics.com/submissions/"
+                    "9a7e5c3b1d0f) (source: CoreOmics)")
+            self.assertEqual(session_docs.submission_line(p), line)
+            # the README (and AGENTS.md's study summary) that finalize writes carry it
+            written = session_docs.write_docs(s)
+            for key in ("readme", "agents"):
+                with open(written[key], encoding="utf-8") as fh:
+                    self.assertIn(f"- {line}", fh.read(), key)
+            os.remove(p["submission_record"])           # announced but gone: said, not dropped
+            self.assertIn("could not be read", session_docs.submission_line(p))
+
+
+# --------------------------------------------------------------- feedback survey --
+SURVEY = sr.cs.FEEDBACK_URL                       # its value is pinned in test_core_submission
+
+
+class TestFeedbackSurvey(unittest.TestCase):
+    """The Core's feedback survey is for the Core's own clients (Brett, 2026-09-28). A Core run
+    -- a CoreOmics submission attached, the test that shows the report's Submission section --
+    asks "How did we do?" at the end of the report, its Markdown twin and PDF, in the README and
+    in AGENTS.md. A run outside the Core carries it nowhere."""
+
+    def finished(self, tmp, core):
+        import test_deposit_package as tdp
+        p = tdp.dia_session(tmp)
+        s = p["session_dir"]
+        with open(os.path.join(p["output_dir"], "AI_Analysis_Report.md"), "w") as fh:
+            fh.write("# Analysis\n\nA standfirst.\n\n## Overview\n\nText.\n")
+        if core:
+            attach_fixture(s)
+        r = run("make_analysis_html.py", "--session", s, "--out",
+                os.path.join(p["output_dir"], "Analysis_Report.html"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        f = tdp.finalize(s)
+        self.assertEqual(f.returncode, 0, f.stderr)
+        return p
+
+    def read(self, *parts):
+        with open(os.path.join(*parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    def pdf_text(self, pdf):
+        import shutil
+        if not (shutil.which("pdftotext") and os.path.isfile(pdf)):
+            return None
+        r = subprocess.run(["pdftotext", pdf, "-"], capture_output=True, text=True)
+        return re.sub(r"\s+", "", r.stdout)
+
+    def test_a_core_run_asks_in_the_report_readme_and_agents(self):
+        import html as html_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.finished(tmp, core=True)
+            o, s = p["output_dir"], p["session_dir"]
+            url = SURVEY + "?prot=PROT_9756&src=report"
+            page = self.read(o, "Analysis_Report.html")
+            self.assertIn('<p class="feedback"><strong>How did we do?</strong> Tell us what you '
+                          f'thought of this report: <a href="{html_mod.escape(url)}">a 5-minute '
+                          "survey</a></p></main>", page)              # last in the page
+            import report_style                                        # the PDF prints the URL
+            self.assertIn('p.feedback a::after{content:"\\A" attr(href);white-space:pre}',
+                          report_style.CSS)
+            self.assertTrue(self.read(o, "Analysis_Report.md").endswith(
+                "\n\n**How did we do?** Tell us what you thought of this report: [a 5-minute "
+                f"survey]({url}).\n"))                            # after the star line's rule
+            text = self.pdf_text(os.path.join(o, "Analysis_Report.pdf"))
+            if text is not None:
+                self.assertIn(url.replace("https://", ""), text)
+            readme = SURVEY + "?prot=PROT_9756&src=readme"
+            self.assertIn("\n**How did we do?** Tell us what you thought of the report: [a 5-minute "
+                          f"survey]({readme}).\n", self.read(s, "README.md"))
+            self.assertIn(f'<a href="{html_mod.escape(readme)}">a 5-minute survey</a>',
+                          self.read(s, "README.html"))
+            agents = self.read(s, "AGENTS.md")
+            self.assertIn(f"**Feedback:** the UC Davis Proteomics Core's survey for this project is "
+                          f"{readme} -- ", agents)
+            self.assertLess(agents.index("**Feedback:**"), agents.index("## Do not"))
+
+    def test_a_run_outside_the_core_has_it_nowhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.finished(tmp, core=False)
+            s = p["session_dir"]
+            self.assertIsNone(sr.core_run(s))
+            seen = 0
+            for dp, dns, fns in os.walk(s):
+                if dp == s:                      # the copy of the skill's own code, not an output
+                    dns.remove("scripts")
+                for fn in fns:
+                    with open(os.path.join(dp, fn), "rb") as fh:
+                        data = fh.read()
+                    seen += 1
+                    for s_ in (SURVEY, SURVEY.split("/")[2]):   # the address, and its host
+                        self.assertNotIn(s_.encode(), data, os.path.join(dp, fn))
+                    self.assertNotIn(b"How did we do", data, os.path.join(dp, fn))
+            self.assertGreater(seen, 20)
+            text = self.pdf_text(os.path.join(p["output_dir"], "Analysis_Report.pdf"))
+            if text is not None:
+                self.assertNotIn(SURVEY.split("/")[2], text)
+            for key in ("readme", "agents", "report_html"):
+                self.assertTrue(os.path.isfile({"readme": os.path.join(s, "README.md"),
+                                                "agents": os.path.join(s, "AGENTS.md"),
+                                                "report_html": os.path.join(
+                                                    p["output_dir"], "Analysis_Report.html")}[key]))
+
+    def test_core_run_is_the_one_test_and_fails_closed(self):
+        # review of f18d95e: the report asked report_section() (truthy for an unreadable
+        # --submission) while README asked core_run, and core_run called ANY RecordError Core
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            p = session_mod.paths_for(s)
+            self.assertIsNone(sr.core_run(s))
+            attach_fixture(s)
+            self.assertEqual(sr.core_run(s), {"prot": "PROT_9756"})
+            with open(p["submission_record"]) as fh:
+                record = fh.read()
+            os.remove(p["submission_record"])                # announced, record missing: Core
+            self.assertEqual(sr.core_run(s), {"prot": "PROT_9756"})
+            with open(p["submission_record"], "w") as fh:     # there but unreadable: NOT Core
+                fh.write("{")
+            self.assertIsNone(sr.core_run(s))
+            with open(p["submission_record"], "w") as fh:
+                fh.write(record)
+            for damaged in ("{", "[1, 2]", ""):                # session.json truncated / not a dict
+                with open(p["session_json"], "w") as fh:
+                    fh.write(damaged)
+                self.assertIsNone(sr.core_run(s), repr(damaged))
+            # announced with no record file: Core only when the block names a submission
+            # (verification of cba30b0: any dict passed, so {"coreomics": {}} got the survey)
+            os.remove(p["submission_record"])
+            for block, want in (({}, None), ({"foo": 1}, None), ({"internal_id": "hello"}, None),
+                                ({"note": "n/a"}, None), ({"internal_id": "PROT_0807"},
+                                                          {"prot": "PROT_0807"}),
+                                ({"id": "99922f5337f8"}, {"prot": None})):
+                with open(p["session_json"], "w") as fh:
+                    json.dump({"coreomics": block}, fh)
+                self.assertEqual(sr.core_run(s), want, block)
+            # a record already read (a delivery's summary): it must name a submission
+            self.assertEqual(sr.core_run(record={"internal_id": "PROT_0807"}), {"prot": "PROT_0807"})
+            self.assertEqual(sr.core_run(record={"id": "99922f5337f8"}), {"prot": None})
+            self.assertIsNone(sr.core_run(record={"internal_id": "not a number"}))
+            for i, digits in enumerate(("٩٧٥٦", "１２３")):      # not ASCII: not a PROT number
+                self.assertIsNone(sr.core_run(record={"internal_id": digits}), digits)
+                given = make_session(os.path.join(tmp, f"given{i}"))
+                r = run("submission_report.py", "attach", "--session", given, "--given",
+                        json.dumps({"internal_id": digits, "organism": "mouse"}))
+                self.assertIsNone(sr.core_run(given), (digits, r.stdout, r.stderr))
+            self.assertIsNone(sr.core_run(record=["not", "a", "record"]))
+
+    def test_a_render_from_the_md_twin_carries_the_line_once_or_not_at_all(self):
+        # review of f18d95e: --report output/Analysis_Report.md copied the old line into the body
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            o = os.path.join(s, "output")
+            with open(os.path.join(o, "AI_Analysis_Report.md"), "w") as fh:
+                fh.write("# Analysis\n\ntext\n\n## Overview\n\nmore\n")
+            attach_fixture(s)
+            r = run("make_analysis_html.py", "--session", s, "--out",
+                    os.path.join(o, "Analysis_Report.html"), "--no-pdf")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            twin = os.path.join(o, "Analysis_Report.md")
+            with open(twin, encoding="utf-8") as fh:
+                self.assertEqual(fh.read().count("How did we do?"), 1)
+            again = os.path.join(o, "again.html")
+            for core, n in ((True, 1), (False, 0)):
+                if not core:                                  # the same twin, no longer a Core run
+                    p = session_mod.paths_for(s)
+                    os.remove(p["session_json"])
+                    os.remove(p["submission_record"])
+                r = run("make_analysis_html.py", "--session", s, "--report", twin, "--out", again,
+                        "--no-pdf")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for path in (again, os.path.splitext(again)[0] + ".md"):
+                    with open(path, encoding="utf-8") as fh:
+                        text = fh.read()
+                    self.assertEqual(text.count("How did we do?"), n, (core, path))
+                    self.assertEqual(text.count(SURVEY.split("/")[2]), n, (core, path))
+                    # the star line, on every run: once, never carried into the body
+                    self.assertEqual(text.count("Found this report useful?"), 1, (core, path))
+
+    def test_every_report_asks_for_a_github_star_once(self):
+        # Brett (2026-09-29): "if you like this report please star the github repo so others can
+        # find it ... towards the bottom". Core run or not, just before the survey line when
+        # there is one, in the HTML, the .md twin and the PDF; not in README or AGENTS.md
+        import core_submission as cs
+        with open(os.path.join(SCRIPTS, "..", ".claude-plugin", "plugin.json")) as fh:
+            repo = json.load(fh)["repository"]
+        star = {fmt: cs.star_line(fmt) for fmt in ("html", "md")}
+        self.assertIn(f'<a href="{repo}">', star["html"])
+        self.assertIn(f"]({repo}) ", star["md"])
+        for core in (True, False):
+            with self.subTest(core=core), tempfile.TemporaryDirectory() as tmp:
+                p = self.finished(tmp, core)
+                o, s = p["output_dir"], p["session_dir"]
+                page = self.read(o, "Analysis_Report.html")
+                md = self.read(o, "Analysis_Report.md")
+                for text in (page, md):
+                    self.assertEqual(text.count("Found this report useful?"), 1)
+                self.assertEqual(page.count(star["html"]), 1)
+                self.assertEqual(md.count(star["md"]), 1)
+                if core:
+                    self.assertIn(star["html"] + '<p class="feedback">', page)
+                    self.assertIn("\n---\n\n" + star["md"] + "\n\n**How did we do?**", md)
+                else:
+                    self.assertIn(star["html"] + "</main>", page)
+                    self.assertTrue(md.endswith("\n---\n\n" + star["md"] + "\n"))
+                pdf = os.path.join(o, "Analysis_Report.pdf")
+                if shutil.which("pdftotext") and os.path.isfile(pdf):
+                    raw = subprocess.run(["pdftotext", pdf, "-"], capture_output=True,
+                                         text=True).stdout
+                    self.assertEqual(raw.count("Found this report useful?"), 1)
+                    self.assertIn(f"({repo})", raw)          # printed whole: no break at a hyphen
+                for doc in ("README.md", "README.html", "AGENTS.md"):
+                    self.assertNotIn("Found this report useful", self.read(s, doc), doc)
+
+    def test_an_invalid_podcast_json_is_no_podcast(self):
+        # review of f18d95e: "... and the podcast" was decided by podcast.json existing; an
+        # invalid one gets no Listen card, so it is no podcast (make_podcast.has_podcast)
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            o = os.path.join(s, "output")
+            with open(os.path.join(o, "AI_Analysis_Report.md"), "w") as fh:
+                fh.write("# Analysis\n\ntext\n")
+            os.makedirs(os.path.join(o, "podcast"))
+            with open(os.path.join(o, "podcast", "podcast.json"), "w") as fh:
+                fh.write("{")
+            attach_fixture(s)
+            r = run("make_analysis_html.py", "--session", s, "--out",
+                    os.path.join(o, "Analysis_Report.html"), "--no-pdf")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            written = session_docs.write_docs(s)
+            for path in (os.path.join(o, "Analysis_Report.html"),
+                         os.path.join(o, "Analysis_Report.md"), written["readme"]):
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+                self.assertIn("How did we do?", text, path)
+                self.assertNotIn("and the podcast", text, path)
+
+    def test_a_block_naming_no_submission_is_not_core_anywhere(self):
+        # verification of cba30b0: session.json {"coreomics": {...}} naming no submission, with
+        # no record file, put the survey in the report AND README/AGENTS.md
+        for i, block in enumerate(({}, {"foo": 1}, {"internal_id": "hello"}, {"note": "n/a"})):
+            with self.subTest(block=block), tempfile.TemporaryDirectory() as tmp:
+                s = make_session(tmp)
+                with open(os.path.join(s, "output", "AI_Analysis_Report.md"), "w") as fh:
+                    fh.write("# Analysis\n\ntext\n")
+                with open(session_mod.paths_for(s)["session_json"], "w") as fh:
+                    json.dump({"coreomics": block}, fh)
+                out = os.path.join(s, "output", "Analysis_Report.html")
+                r = run("make_analysis_html.py", "--session", s, "--out", out, "--no-pdf")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                written = session_docs.write_docs(s)
+                for path in (out, os.path.splitext(out)[0] + ".md", written["readme"],
+                             written["agents"]):
+                    with open(path, encoding="utf-8") as fh:
+                        text = fh.read()
+                    self.assertNotIn(SURVEY.split("/")[2], text, path)
+                    self.assertNotIn("How did we do", text, path)
+
+    def test_a_non_core_report_has_no_survey_whatever_submission_is_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            with open(os.path.join(s, "output", "AI_Analysis_Report.md"), "w") as fh:
+                fh.write("# Analysis\n\ntext\n\n## Overview\n\nmore\n")
+            out = os.path.join(s, "output", "Analysis_Report.html")
+            # --submission feeds the Submission section only; the survey asks the session
+            # (option a), so even a real record there, unattached, gives none -- as README
+            for extra in (["--submission", "PROT_9234"],
+                          ["--submission", os.path.join(tmp, "nonexistent", "record.json")],
+                          ["--submission", FIXTURE]):
+                r = run("make_analysis_html.py", "--session", s, "--out", out, "--no-pdf", *extra)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for path in (out, os.path.splitext(out)[0] + ".md"):
+                    with open(path, encoding="utf-8") as fh:
+                        text = fh.read()
+                    self.assertNotIn(SURVEY.split("/")[2], text, (extra, path))
+                    self.assertNotIn("How did we do", text, (extra, path))
+            with open(out, encoding="utf-8") as fh:           # the last: the real record's
+                self.assertIn('id="submission"', fh.read())   # Submission section is as it was
+            attach_fixture(s)                                 # then damage session.json
+            with open(session_mod.paths_for(s)["session_json"], "w") as fh:
+                fh.write("{")
+            r = run("make_analysis_html.py", "--session", s, "--out", out, "--no-pdf")
+            with open(out, encoding="utf-8") as fh:
+                self.assertNotIn(SURVEY.split("/")[2], fh.read())
+            written = session_docs.write_docs(s)
+            for key in ("readme", "agents"):
+                with open(written[key], encoding="utf-8") as fh:
+                    self.assertNotIn(SURVEY.split("/")[2], fh.read(), key)
+
+
+# ----------------------------------------------------------------- who prepared --
+class TestPreparedBy(unittest.TestCase):
+    def test_the_form_answers(self):
+        self.assertEqual(sr.prepared_by(sr.sanitize(fixture()))[0], "lab")
+        core = sr.sanitize({"sample_prep": "I want the proteomics core to prepare my samples"})
+        self.assertEqual(sr.prepared_by(core)[0], "core")
+        self.assertEqual(sr.prepared_by(sr.sanitize({"prot_or_pep": "peptides"}))[0], "lab")
+        self.assertIsNone(sr.prepared_by(sr.sanitize({"prot_or_pep": "Intact Proteins"}))[0],
+                          "intact proteins do not say who extracted them")
+        self.assertEqual(sr.prepared_by(sr.sanitize({}))[0], None)
+
+    def test_a_contradictory_form_is_not_resolved_by_guessing(self):
+        rec = sr.sanitize({"sample_prep": "I have prepped my samples, they are peptides and ready "
+                                          "to analyzed by LC-MSMS", "prot_or_pep": "Intact Proteins"})
+        self.assertIsNone(sr.prepared_by(rec)[0])
+        self.assertIn("prep_unclear", notes_by_id(rec))
+
+
+class TestMethods(unittest.TestCase):
+    def methods(self, s):
+        out = os.path.join(s, "output", "methods.md")
+        p = run("make_methods.py", "--raw", "/nowhere/a.d", "--instrument", "timsTOF HT",
+                "--acquisition", "DIA", "--out", out, "--submission", s)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out) as fh:
+            text = fh.read()
+        return text[text.index("## Sample preparation"):text.index("## Liquid chromatography")]
+
+    def test_peptides_from_the_lab_are_the_labs_preparation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            attach_fixture(s)
+            sec = self.methods(s)
+            self.assertIn("prepared by the submitting laboratory", sec)
+            self.assertIn("as peptides ready for LC-MS/MS (CoreOmics submission PROT_9756)", sec)
+            self.assertNotIn("confirm]", sec, "no Core-side placeholder the Core could never fill")
+            self.assertNotIn("chemically", sec)
+            self.assertIn("“The samples are in 50 mM Ammonium Bicarbonate", sec)
+
+    def test_peptides_only_when_the_form_says_peptides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            sr.attach(s, {"internal_id": "PROT_9756", "sample_prep": "lab"})
+            sec = self.methods(s)
+            self.assertIn("prepared by the submitting laboratory", sec)
+            self.assertNotIn("peptides", sec)
+            self.assertIn("details given by the user", sec)
+
+    def test_multi_line_buffer_text_stays_out_of_the_pride_protocol(self):
+        import make_deposit
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            r = fixture()
+            r["submission_data"]["buffer"] = "50 mM ABC\nwashed in RIPA *twice*"
+            attach_fixture(s, r)
+            sec = self.methods(s)
+            note = [ln for ln in sec.splitlines() if "own protocol" in ln]
+            self.assertEqual(len(note), 1)
+            self.assertIn("\u201c50 mM ABC washed in RIPA twice\u201d", note[0])
+            sample, _ = make_deposit.build_protocols(os.path.join(s, "output", "methods.md"))
+            self.assertNotIn("RIPA", sample)
+            self.assertNotIn("own protocol", sample)
+
+    def test_a_methods_file_from_before_the_attach_is_not_enough(self):
+        import make_deposit
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            f = {"p": session_mod.paths_for(s), "srec": {}, "params": None, "search_prov_path": None,
+                 "de_prov": None}
+            self.assertNotIn("Sample preparation", make_deposit.required_sections(f))
+            attach_fixture(s)
+            self.assertIn("Sample preparation", make_deposit.required_sections(f))
+
+    def test_core_prepared_samples_keep_a_placeholder_for_the_core(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            r = fixture()
+            r["submission_data"].update(sample_prep="I want the proteomics core to prepare my samples",
+                                        prot_or_pep="Intact Proteins")
+            attach_fixture(s, r)
+            sec = self.methods(s)
+            self.assertIn("prepared by the UC Davis Proteomics Core", sec)
+            self.assertIn("[not recorded — confirm]", sec)
+
+    def test_the_deposit_protocol_uses_it_instead_of_the_to_fill(self):
+        import make_deposit
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            attach_fixture(s)
+            self.methods(s)
+            sample, _data = make_deposit.build_protocols(os.path.join(s, "output", "methods.md"))
+            self.assertTrue(sample.startswith("Samples were prepared by the submitting laboratory"))
+            self.assertNotIn("TO-FILL", sample)
+            self.assertNotIn("own protocol", sample, "the author's note is not protocol text")
+
+    def test_without_a_submission_nothing_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "m.md")
+            p = run("make_methods.py", "--raw", "/nowhere/a.d", "--instrument", "timsTOF HT", "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out) as fh:
+                self.assertNotIn("## Sample preparation", fh.read())
+
+    def test_the_analysis_brief_quotes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp)
+            attach_fixture(s)
+            de = os.path.join(tmp, "tables")
+            os.makedirs(de)
+            out = os.path.join(tmp, "PROMPT.md")
+            p = run("analysis_prompt.py", "--de-dir", de, "--out", out, "--submission", s)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out) as fh:
+                brief = fh.read()
+            self.assertIn("## The submission (PROT_9756) — quote it, add nothing", brief)
+            self.assertIn("already lists these notes, so do not copy them", brief)
+            self.assertIn("The submitting lab prepared the samples and sent peptides", brief)
+            self.assertIn("Pairing in the sample sheet", brief)
+
+
+# ------------------------------------------------------------------------- notes --
+class TestNotes(unittest.TestCase):
+    def session(self, tmp, raws=tuple(RUNS.values()), groups=by_age_and_ip, batch=None,
+                fasta=({"organism": "Mus musculus", "taxid": 10090},), extra_col="Batch", prov=None):
+        conds = [[RUNS[u], groups(u)] + ([batch(u)] if batch else []) for u in RUNS]
+        s = make_session(tmp, raws=list(raws), conditions=conds, fasta=fasta[0] if fasta else None,
+                         extra_col=extra_col, prov=prov)
+        attach_fixture(s)
+        return s
+
+    def test_prot9756_pairing_is_surfaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            n = notes_by_id(sr.load(s), s)
+            self.assertIn("pairing", n)
+            for part in ("carry the mouse each sample came from (Mouse 1–6)",
+                         "Each mouse gave samples under all 5 of JPH3, JPH4, Kv2.1, RyR, IgG",
+                         "within-mouse (paired)", "Old vs Young differs between mice "
+                         "(Old: Mouse 1–3; Young: Mouse 4–6)", "10 groups of 3",
+                         "No column the DE reads from input/conditions.csv (Group, Batch, Covariate1, "
+                         "Covariate2) identifies the mouse, so as set up it will treat the samples as "
+                         "independent"):
+                self.assertIn(part, n["pairing"])
+            self.assertEqual(set(n) & {"conditions_differ", "sheet_ids_without_raw",
+                                       "raw_without_sheet_id", "organism_mismatch"}, set())
+
+    def test_a_design_column_that_carries_the_mouse_is_recognised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, batch=lambda u: "m" + sheet()[u].split("Mouse")[1].strip())
+            self.assertIn("includes the mouse as “Batch”, a fixed effect",
+                          notes_by_id(sr.load(s), s)["pairing"])
+
+    def test_restarted_numbering_is_not_read_as_pairing(self):
+        """Old Mouse 1-3 and Young Mouse 1-3: are they six mice or three? The sheet cannot say."""
+        for fmt in ("{age} - Mouse {n}", "Mouse {n} - {age}"):
+            r = fixture()
+            r["submission_data"]["samples"] = [
+                {"unique_id": f"S{i}", "sample_name": f"S{i}", "condition_name": fmt.format(age=age, n=n)}
+                for i, (age, n) in enumerate([(a, n) for a in ("Old", "Young") for n in (1, 2, 3)])]
+            n = notes_by_id(sr.sanitize(r))
+            self.assertIn("does not say whether Mouse 1 under Old and under Young is the same mouse",
+                          n["pairing"], fmt)
+            self.assertNotIn("(paired)", n["pairing"])
+            self.assertNotIn("not independent", n["pairing"])
+
+    def test_one_sample_per_mouse_is_no_pairing(self):
+        r = fixture()
+        r["submission_data"]["samples"] = [
+            {"unique_id": f"S{n}", "sample_name": "", "condition_name": f"{'Old' if n < 4 else 'Young'} - Mouse {n}"}
+            for n in range(1, 7)]
+        self.assertNotIn("pairing", notes_by_id(sr.sanitize(r)))
+
+    def test_replicate_indexes_are_replicate_groups(self):
+        for fmt in ("{g} - Rep {n}", "{g} {n}", "{g}_{n}"):
+            r = fixture()
+            r["submission_data"]["samples"] = [
+                {"unique_id": f"S{g}{n}", "sample_name": "", "condition_name": fmt.format(g=g, n=n)}
+                for g in ("Control", "Treated") for n in (1, 2, 3)]
+            rec = sr.sanitize(r)
+            n = notes_by_id(rec)
+            self.assertNotIn("sheet_conditions_unique", n, fmt)
+            self.assertNotIn("pairing", n, fmt)
+            self.assertEqual(set(sr.sheet_groups(rec).values()), {"Control", "Treated"}, fmt)
+
+    def test_a_sample_outside_the_pattern_keeps_the_pairing_note(self):
+        r = fixture()
+        r["submission_data"]["samples"].append({"unique_id": "LRS200", "sample_name": "LRS200",
+                                                "condition_name": "Pool"})
+        n = notes_by_id(sr.sanitize(r))
+        self.assertIn("1 sample(s) do not follow this naming and are not part of this reading (LRS200)",
+                      n["pairing"])
+        self.assertNotIn("sheet_conditions_unique", n)
+
+    def test_a_reinjected_sample_is_not_left_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conds = [[RUNS[u], by_age_and_ip(u)] for u in RUNS]
+            conds.append(["08202026__60SPD_DIA-LRS-96_rerun_S3-A1_1_23999", by_age_and_ip("LRS96")])
+            s = make_session(tmp, conditions=conds)
+            attach_fixture(s)
+            self.assertNotIn("conditions_differ", notes_by_id(sr.load(s), s))
+
+    def test_a_run_carrying_two_sheet_ids_says_nothing_about_groups(self):
+        r = fixture()
+        r["submission_data"]["samples"] = [
+            {"unique_id": u, "sample_name": "", "condition_name": c}
+            for u, c in (("AB12", "Old"), ("CD34", "Young"), ("EF56", "Old"), ("GH78", "Young"))]
+        with tempfile.TemporaryDirectory() as tmp:
+            s = make_session(tmp, conditions=[["x_AB12_CD34", "Old"], ["x_EF56", "Old"], ["x_GH78", "Young"]])
+            attach_fixture(s, r)
+            self.assertNotIn("conditions_differ", notes_by_id(sr.load(s), s))
+
+    def test_only_columns_the_de_models_count_as_carrying_the_mouse(self):
+        mouse = lambda u: sheet()[u].split("Mouse")[1].strip()        # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, batch=mouse, extra_col="Mouse")
+            self.assertIn("input/conditions.csv carries the mouse as \u201cMouse\u201d: the DE models "
+                          "it only when run with --block Mouse", notes_by_id(sr.load(s), s)["pairing"],
+                          "run_de.R reads a Mouse column only with --block")
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, prov={"design": "~ 0 + groups", "n_samples": 30,
+                                        "block": {"applied": False,
+                                                  "note": "no --block: samples modelled as independent"}})
+            n = notes_by_id(sr.load(s), s)["pairing"]
+            self.assertIn("The design analysed (~ 0 + groups) has no term for the mouse, so it "
+                          "treated the 30 samples as independent.", n)
+            self.assertNotIn("blocked", n, "{'applied': false} is an unblocked run, not a block")
+
+    # run_de.R's block record (feat/skill-de-block, blocking.R block_record): `block` is an
+    # object, `block_column` exists only when the design is blocked.
+    BLOCKED_RANDOM = {"design": "~ 0 + groups", "n_samples": 30, "block_column": "Mouse",
+                      "block": {"applied": True, "column": "Mouse", "effect": "random",
+                                "consensus_correlation": 0.412,
+                                "contrast_structure": {"Old_JPH3-Old_IgG": "within",
+                                                       "Old_JPH3-Young_JPH3": "between"}}}
+
+    def test_a_random_block_on_the_mouse(self):
+        mouse = lambda u: sheet()[u].split("Mouse")[1].strip()        # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, batch=mouse, extra_col="Mouse", prov=self.BLOCKED_RANDOM)
+            n = notes_by_id(sr.load(s), s)["pairing"]
+            self.assertIn("blocked on the mouse (\u201cMouse\u201d, a random effect; consensus "
+                          "within-mouse correlation 0.41).", n)
+            self.assertIn("1 comparison(s) (Old_JPH3-Young_JPH3) set different mice against each "
+                          "other: their evidence is the number of mice", n)
+            self.assertNotIn("samples as independent", n)
+
+    def test_a_fixed_block_on_the_mouse(self):
+        mouse = lambda u: sheet()[u].split("Mouse")[1].strip()        # noqa: E731
+        prov = {"design": "~ 0 + groups + Mouse", "n_samples": 30, "block_column": "Mouse",
+                "block": {"applied": True, "column": "Mouse", "effect": "fixed",
+                          "consensus_correlation": None}}
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, batch=mouse, extra_col="Mouse", prov=prov)
+            self.assertIn("modelled the mouse (\u201cMouse\u201d) as a fixed effect (--block), so "
+                          "every comparison is made within each mouse",
+                          notes_by_id(sr.load(s), s)["pairing"])
+
+    def test_a_record_from_before_block_says_not_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, prov={"design": "~ 0 + groups", "n_samples": 30})
+            n = notes_by_id(sr.load(s), s)["pairing"]
+            self.assertIn("Whether the analysis modelled the mouse is not recorded", n)
+            self.assertNotIn("treated the 30 samples as independent", n)
+
+    def test_block_given_but_every_contrast_between_mice(self):
+        prov = {"design": "~ 0 + groups", "n_samples": 30,
+                "block": {"applied": False, "column": "Mouse",
+                          "note": "--block Mouse given, but every contrast compares different "
+                                  "Mouse levels"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, prov=prov)
+            n = notes_by_id(sr.load(s), s)["pairing"]
+            self.assertIn("treated the 30 samples as independent (--block Mouse given, but every "
+                          "contrast compares different Mouse levels).", n)
+
+    def test_blank_uniprot_is_a_note(self):
+        self.assertIn("uniprot_blank", notes_by_id(sr.sanitize(fixture())))
+
+    def test_organism_against_the_search_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, fasta=({"organism": "Homo sapiens", "taxid": 9606},))
+            self.assertIn("but the search database is Homo sapiens (taxid 9606)",
+                          notes_by_id(sr.load(s), s)["organism_mismatch"])
+        r = fixture()
+        r["submission_data"]["organism"] = ""
+        self.assertIn("organism_missing", notes_by_id(sr.sanitize(r)))
+
+    def test_an_abbreviated_genus_is_the_same_organism(self):
+        """A form's "<abbreviated genus> <species> <strain> (<a remark>)" against the
+        database's spelled-out name read as "could not be matched automatically"."""
+        r = fixture()
+        r["submission_data"]["organism"] = "S. enterica serovar Typhimurium LT2 (attenuated)"
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, fasta=({"organism": "Salmonella enterica subsp. enterica "
+                                                      "serovar Typhimurium str. LT2",
+                                          "taxid": 99287},))
+            attach_fixture(s, r)
+            notes = notes_by_id(sr.load(s), s)
+            self.assertEqual(sr.load(s)["organism"],
+                             "S. enterica serovar Typhimurium LT2 (attenuated)")
+            self.assertNotIn("organism_unchecked", notes)
+            self.assertNotIn("organism_mismatch", notes)
+        self.assertTrue(sr.same_species("S. aureus", "Staphylococcus aureus USA300"))
+        self.assertFalse(sr.same_species("E. coli", "Enterococcus faecalis"))
+        self.assertFalse(sr.same_species("S. aureus", "Escherichia aureus"))
+
+    def test_sample_ids_against_the_raw_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raws = [v for k, v in RUNS.items() if k != "LRS125"] + ["08142026__60SPD_DIA-QC-HeLa_S3-A1_1_1"]
+            s = self.session(tmp, raws=raws)
+            n = notes_by_id(sr.load(s), s)
+            self.assertIn("1 of 30 sample IDs on the sheet match no raw file analysed here (LRS125)",
+                          n["sheet_ids_without_raw"])
+            self.assertIn("08142026__60SPD_DIA-QC-HeLa_S3-A1_1_1.d", n["raw_without_sheet_id"])
+
+    def test_conditions_that_differ_from_the_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, groups=lambda u: by_age_and_ip(u).split("_")[0])
+            self.assertIn("group “Old” pools the sheet's Old - IgG, Old - JPH3",
+                          notes_by_id(sr.load(s), s)["conditions_differ"])
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp, groups=lambda u: "Young_JPH3" if u == "LRS96" else by_age_and_ip(u))
+            self.assertIn("“Young_JPH3” pools the sheet's Old - JPH3, Young - JPH3",
+                          notes_by_id(sr.load(s), s)["conditions_differ"])
+
+    def test_a_sheet_with_no_groups_says_so(self):
+        r = fixture()
+        for i, smp in enumerate(r["submission_data"]["samples"]):
+            smp["condition_name"] = f"sample {i}"
+        self.assertIn("sheet_conditions_unique", notes_by_id(sr.sanitize(r)))
+
+    def test_beads_left_blank_for_an_affinity_experiment(self):
+        r = fixture()
+        r["submission_data"]["magbead_yes_no"] = ""
+        self.assertIn("beads_blank", notes_by_id(sr.sanitize(r)))
+
+
+# ------------------------------------------- the sheet vs the runs staff located --
+class TestSheetVsLocatedRuns(unittest.TestCase):
+    """Staff's `locate` assignment is the sample <-> run record where it assigned a run; name
+    matching covers the rest.
+
+    A staff report (PROT_0000, skill 2.11.2): sheet IDs S01..S09, runs named DIA-S1..S9 (no
+    leading zero). Staff assigned each run with `locate --files-from ... --choose S0N=<file>` and
+    sample_files.tsv had every sample matched, yet the report's Submission section and
+    ANALYSIS_PROMPT said "9 of 9 sample IDs on the sheet match no raw file" and "9 of 9 raw files
+    carry no sample ID": _sheet_vs_raw re-matched by name and never read the locate result."""
+    N = 9
+
+    def record(self, ids=None):
+        r = fixture()
+        r["submission_data"]["samples"] = [
+            {"unique_id": uid, "sample_name": f"X{n}", "condition_name": f"cond {n % 3}"}
+            for n, uid in enumerate(ids or [f"S{n:02d}" for n in range(1, self.N + 1)], 1)]
+        return r
+
+    def run_name(self, n):
+        return f"01012026_DIA-S{n}_1_{100 + n}"
+
+    def session(self, tmp, runs=None, ids=None):
+        s = make_session(tmp, raws=runs or [self.run_name(n) for n in range(1, self.N + 1)])
+        attach_fixture(s, self.record(ids))
+        return s
+
+    def locate_json(self, folder, assigned, via="--choose", runs=None, uid=None, prot=None):
+        """locate.json as core_submission.py writes it: one row per (sample, run)."""
+        rows = []
+        for n in range(1, self.N + 1):
+            u = (uid or (lambda k: f"S{k:02d}"))(n)
+            if n in assigned:
+                run = (runs or [self.run_name(k) for k in range(1, self.N + 1)])[n - 1]
+                rows.append({"unique_id": u, "sample_key": u, "status": "matched",
+                             "file": f"/data/JUL26/{run}.d", "chosen_by": via})
+            else:
+                rows.append({"unique_id": u, "sample_key": u, "status": "needs_choice", "file": ""})
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "locate.json")
+        with open(path, "w") as fh:
+            json.dump({"internal_id": prot, "mode": "files_from",
+                       "accepted": {"reinjections": "ask"}, "samples": rows}, fh)
+        return path
+
+    def write_decisions(self, s, decisions):
+        with open(os.path.join(s, "input", "locate_decisions.json"), "w") as fh:
+            json.dump(decisions, fh)
+
+    def test_name_matching_is_the_fallback_and_misses_these_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            n = notes_by_id(sr.load(s), s)
+            self.assertIn("9 of 9 sample IDs on the sheet match no raw file", n["sheet_ids_without_raw"])
+
+    def test_the_located_runs_are_the_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            self.write_decisions(s, sr.locate_decisions(
+                self.locate_json(os.path.join(tmp, "fetch"), set(range(1, self.N + 1)))))
+            n = notes_by_id(sr.load(s), s)
+            self.assertNotIn("sheet_ids_without_raw", n)
+            self.assertNotIn("raw_without_sheet_id", n)
+            self.assertNotIn("weak_sample_ids", n)
+
+    def test_automatic_matches_count_too(self):
+        """A run locate matched by itself (no --choose) is assigned just as much."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            self.write_decisions(s, sr.locate_decisions(
+                self.locate_json(os.path.join(tmp, "fetch"), set(range(1, self.N + 1)), via="")))
+            n = notes_by_id(sr.load(s), s)
+            self.assertNotIn("sheet_ids_without_raw", n)
+            self.assertNotIn("raw_without_sheet_id", n)
+
+    def test_a_sample_staff_did_not_locate_is_still_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            self.write_decisions(s, sr.locate_decisions(
+                self.locate_json(os.path.join(tmp, "fetch"), set(range(1, self.N)))))
+            n = notes_by_id(sr.load(s), s)
+            self.assertIn("1 of 9 sample IDs on the sheet", n["sheet_ids_without_raw"])
+            self.assertIn("(S09)", n["sheet_ids_without_raw"])
+            self.assertIn("1 of 9 raw files", n["raw_without_sheet_id"])
+            self.assertIn(self.run_name(9) + ".d", n["raw_without_sheet_id"])
+
+    def test_a_partial_or_empty_locate_record_keeps_the_name_matches(self):
+        """Review of 2.13.2 (M6): runs whose names DO carry the sheet ids; locate matched 6 of 9
+        (3 needs_choice, resolved by hand into the run list), or nothing. The runs locate did
+        not assign are matched by name, never "assigned to no sample"."""
+        ids = [f"P{n:02d}" for n in range(1, self.N + 1)]
+        runs = [f"2026_P{n:02d}_DIA_{100 + n}" for n in range(1, self.N + 1)]
+        for assigned in (set(range(1, 7)), set()):
+            with self.subTest(assigned=len(assigned)), tempfile.TemporaryDirectory() as tmp:
+                s = self.session(tmp, runs=runs, ids=ids)
+                self.assertEqual({k for k in notes_by_id(sr.load(s), s)
+                                  if "sheet" in k or "raw" in k}, set())     # names alone: none
+                self.write_decisions(s, sr.locate_decisions(self.locate_json(
+                    os.path.join(tmp, "fetch"), assigned, runs=runs,
+                    uid=lambda k: f"P{k:02d}")))
+                n = notes_by_id(sr.load(s), s)
+                self.assertNotIn("sheet_ids_without_raw", n)
+                self.assertNotIn("raw_without_sheet_id", n)
+
+    def test_an_older_record_with_staff_choices_only(self):
+        """locate_decisions.json from skill 2.13.1 and older has no assignment list: its
+        staff choices still settle those samples, name matching the rest."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            self.write_decisions(s, {"reinjections_policy": "ask", "reinjections": {},
+                                     "staff_choices": [{"sample": f"S{n:02d}",
+                                                        "file": self.run_name(n) + ".d",
+                                                        "by": "--choose"}
+                                                       for n in range(1, self.N + 1)],
+                                     "accept_ambiguous": False, "allow_partial": False})
+            n = notes_by_id(sr.load(s), s)
+            self.assertNotIn("sheet_ids_without_raw", n)
+            self.assertNotIn("raw_without_sheet_id", n)
+
+    def test_attach_carries_the_assignment_and_a_later_locate_wins(self):
+        """PROT_0000 attached at 12:15 and re-ran locate with --choose at 12:18: the session's
+        copy said nothing was matched. A newer locate.json beside the record is read instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            fetch = os.path.join(tmp, "fetch")
+            loc = self.locate_json(fetch, set())                     # the first locate: no match
+            with open(os.path.join(fetch, "submission.json"), "w") as fh:
+                json.dump(self.record(), fh)
+            p = run("submission_report.py", "attach", "--session", s, "--record", fetch)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(os.path.join(s, "input", "locate_decisions.json")) as fh:
+                self.assertEqual(json.load(fh)["assignments"], [])
+            self.assertIn("9 of 9", notes_by_id(sr.load(s), s)["sheet_ids_without_raw"])
+            self.locate_json(fetch, set(range(1, self.N + 1)))      # staff's --choose, later
+            st = os.stat(loc)
+            os.utime(loc, (st.st_atime, st.st_mtime + 60))
+            n = notes_by_id(sr.load(s), s)
+            self.assertNotIn("sheet_ids_without_raw", n)
+            self.assertNotIn("raw_without_sheet_id", n)
+            self.assertIn("staff_run_choices", n)                    # the same record, read once
+
+    def test_a_later_locate_for_another_submission_is_not_read(self):
+        """Review of 2.13.2 (L7): the fetch folder's locate.json reused for another submission."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.session(tmp)
+            fetch = os.path.join(tmp, "fetch")
+            loc = self.locate_json(fetch, set(), prot=sr.load(s)["internal_id"])
+            self.write_decisions(s, sr.locate_decisions(loc))
+            self.locate_json(fetch, set(range(1, self.N + 1)), prot="PROT_9002")
+            st = os.stat(loc)
+            os.utime(loc, (st.st_atime, st.st_mtime + 60))
+            self.assertIn("9 of 9", notes_by_id(sr.load(s), s)["sheet_ids_without_raw"])
+
+
+if __name__ == "__main__":
+    unittest.main()

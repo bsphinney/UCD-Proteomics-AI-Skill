@@ -1,0 +1,1398 @@
+#!/usr/bin/env python3
+"""
+analysis_prompt.py  --  Build the analysis brief the agent follows to interpret
+the results. Faithful, complete port of DE-LIMP's "Export Prompt for Claude"
+(R/server_ai.R), so the report is as thorough as the DE-LIMP app's AI export.
+
+In DE-LIMP the prompt is shipped to an external Claude/Gemini. Here the agent IS
+Claude (Claude Code / Desktop), so this writes ANALYSIS_PROMPT.md and the agent
+reads it + the data files + the figures and writes a complete, figure-rich,
+expert AI_Analysis_Report.md (then make_analysis_html.py renders it into
+Analysis_Report.html, the report of record; no Word copy of the report is made).
+
+The pipeline self-description and the educational/stats sections are chosen from
+the actual engine + DE method (from de_provenance.json), never hardcoded (rule #1).
+
+Usage:
+  python3 analysis_prompt.py --out ANALYSIS_PROMPT.md \
+      --de-dir output/tables --report output/search/report.parquet \
+      --conditions input/conditions.csv --figures-dir output/figures \
+      [--qc QC_Metrics.csv] [--gsea GSEA_Results.csv] \
+      --engine diann --acquisition DIA --instrument "Orbitrap Astral" \
+      --workflow-manifest input/wf/workflow.manifest.json --session <session dir>
+"""
+import sys, os, json, glob, argparse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# ONE test for "the matrix is complete by construction", ONE contrast display form, ONE
+# direction sentence and ONE default tag, shared with the HTML report.
+from make_analysis_html import (matrix_complete, SUPPRESS_WHEN_COMPLETE,  # noqa: E402
+                                contrast_label, LOGFC_DIRECTION, DEFAULT_TAG, background_flag,
+                                _make_names, read_figures_json, APPENDIX, APPENDIX_FIGURES,
+                                load_record, read_text, csv_text, _UNREADABLE, gene_label,
+                                HOW_MADE_TITLE)
+# what the DE columns mean -- session_docs' own (which groups are pull-down controls is
+# experiment_type.pulldown_design's).
+from session_docs import COLUMNS as DE_COLUMNS  # noqa: E402
+from session_docs import precursor_count_column  # noqa: E402  NPrec (limpa >= 1.4) / NPeptides
+# the caveat for conditions with no DE: one wording, shared with the README and AGENTS.md
+from session_docs import no_de_condition_caveat  # noqa: E402
+import csv  # noqa: E402
+
+# Abundant ER proteins that ride along in almost any membrane pull-down: background, not
+# interactors (HGNC symbols; the mouse genes are the same names in title case).
+ER_BACKGROUND = ("HSPA5", "HSP90B1", "CANX", "CALR", "P4HB", "PDIA3", "PDIA4", "PDIA6")
+# The names of run_de.R's `Evidence` categories (its EVIDENCE_LABELS: every run of every group
+# measured / never measured in a group / otherwise, "partly" + the record's zero_means word /
+# measured in no compared group, so not tested -- 2.12.0).
+# They name the tiers; what they mean is quoted from de_provenance.json when the run recorded it.
+EVIDENCE = ("measured in both", "presence call", "partly", "not measured in either group")
+# figures.json types the brief places by name; any other is placed by its caption
+PLACED_TYPES = ("volcano", "pca", "qc", "heatmap", "violin", "pvalue")
+
+
+def submission_brief(w, source):
+    """The CoreOmics submission, quoted for the writer: the report must describe the samples in
+    the submitter's words. A report once turned the record's "cross-linked" into "chemically
+    cross-linked"; every added word like that is a claim about the lab's samples nobody made."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import submission_report as sr
+    rec, session = sr.resolve(source)
+    if rec is None:
+        return
+    who, why = sr.prepared_by(rec)
+    w(f"## The submission ({sr.label(rec)}) — quote it, add nothing")
+    w("The HTML report opens with this record (make_analysis_html.py renders it from the "
+      "session). Wherever you describe the samples, how they were prepared or what the study "
+      "is, use the submission's own words and add no detail it does not state (if it says "
+      "\"cross-linked\", do not write \"chemically cross-linked\"). Never copy a contact or "
+      "billing detail into the report.")
+    w({"lab": "- **The submitting lab prepared the samples"
+              + (" and sent peptides" if sr.sent_as_peptides(rec) else "") + ".** Any Sample "
+              "Preparation note must say so; do not describe extraction, reduction, alkylation "
+              "or digestion as work the Core did.",
+       "core": "- **The Core prepared the samples.** Their protocol belongs in the Methods "
+               "(methods.md); do not invent one here."}.get(
+        who, f"- **Who prepared the samples is not clear** ({why}). Say so; do not guess."))
+    notes = sr.quality_notes(rec, session)
+    if notes:
+        w("- The HTML report's Submission section already lists these notes, so do not copy "
+          "them. In **Data Quality Notes**, say what each one means for THESE results (e.g. "
+          "whether paired samples were analysed as independent):")
+        for n in notes:
+            w(f"  - {n['text']}")
+    w("")
+    w(sr.render_markdown(rec, (), heading="### The record, as submitted"))
+
+
+def sample_type_brief(w, session):
+    """What the samples are, as the user stated it (sample_type.py, the session's one record) --
+    or NOT STATED, and never to be guessed. A draft report once named a tissue from an
+    abbreviation in the file names, and the data did not support it (a staff report, 2.10)."""
+    import sample_type as st
+    try:
+        rec = st.load(session) if session else None
+    except (OSError, ValueError) as e:
+        print(f"[analysis_prompt] the sample-type record could not be read: {e}", file=sys.stderr)
+        rec, unreadable = None, str(e)
+    else:
+        unreadable = None
+    w("## What the samples are — as the user stated it")
+    w(f"- **Sample type: {st.describe(rec)}**"
+      + (f" (its record could not be read: {unreadable})" if unreadable else ""))
+    if rec and rec.get("stated"):
+        w("- Describe the samples in these words, adding nothing they do not state (a tissue "
+          "region, a cell type, a disease state).")
+        w("- Check it against the data: if the most abundant proteins or the sample-quality "
+          "panels (SAMPLE_QUALITY.md) point to a different tissue or biofluid (e.g. muscle, "
+          "plasma or skin proteins dominating a sample stated as brain), say so in **Data "
+          "Quality Notes** as a question for the user; do not resolve it either way yourself.")
+    elif rec and rec.get("source") == st.NOT_ASKED:
+        w("- Core staff were not asked (no step's choice depended on it). Describe the samples "
+          "as the attached submission record does, when there is one, or else by their groups "
+          "only; do not name a "
+          f"tissue, cell type or biofluid it does not state; {st.NEVER_INFER}. Nothing about "
+          "the sample type goes in Data Quality Notes unless the data contradict the record.")
+    else:
+        w("- Do not name a tissue, cell type or biofluid anywhere in the report or Methods; "
+          f"{st.NEVER_INFER}. Say in **Data Quality Notes** that the sample type was not stated, "
+          "and describe the samples by their groups only. If the data suggest one (e.g. muscle "
+          "proteins dominating), you may say what the proteins suggest, as an observation, "
+          "never as the sample's identity.")
+    w("")
+
+
+def normalisation_brief(w, prov, etype, etype_err, design):
+    """The experiment type, the quantities the DE read, and the normalisation check -- quoted
+    from run_de.R's record (de_provenance.json normalization_check), never re-judged here."""
+    nc = prov.get("normalization_check") if isinstance(prov.get("normalization_check"), dict) else {}
+    w("## Experiment type and normalisation — as recorded")
+    w(f"- **Experiment type:** " + (f"{etype['label']} ({etype['source']})" if etype else
+                                    "NOT RECORDED" + (f" (its record could not be read: {etype_err})"
+                                                      if etype_err else " -- do not assume one")))
+    w(f"- **Pull-down design:** {'yes' if design['pulldown'] else 'no'} ({design['source']})"
+      + (f". **Raise with the user:** {design['note']}" if design.get("note") else ""))
+    w(f"- **Quantities the DE read:** {prov.get('normalisation') or 'NOT RECORDED'}")
+    from normalization_check import not_applicable_reason
+    na_reason = not_applicable_reason(nc)
+    if na_reason:
+        # the pipeline's own record of why there is no between-run normalisation to check
+        w(f"- **Normalisation check:** not applicable to this pipeline -- {na_reason}")
+    elif nc.get("status") != "decided":
+        w("- **Normalisation check: NOT RUN.** Say in Data Quality Notes that whether "
+          "normalisation suited this experiment was not checked.")
+    else:
+        d = nc.get("decision") or {}
+        w(f"- **Normalisation check:** default {nc.get('default', {}).get('quantities')} for this "
+          "type; the data check " + ("agreed." if not nc.get("tripped") else
+                                    "did NOT agree (" + "; ".join(nc.get("trips") or []) +
+                                    f"); {d.get('by')} chose {d.get('quantities')}: {d.get('reason')}."
+                                    " Say so in Data Quality Notes."))
+        vol = (nc.get("volcano") or {}).get(nc.get("quantities_applied") or "") or {}
+        for c, v in (vol.get("contrasts") or {}).items():
+            if "n" not in v:
+                continue
+            ctr = "n/a" if v.get("centre_nonsig") is None else f"{v['centre_nonsig']:+.2f}"
+            w(f"  - Volcano {c}: centre (non-significant) {ctr} log2, "
+              f"{v['up']} up : {v['down']} down"
+              + (f", bait rank {v['bait']['rank']}" if (v.get("bait") or {}).get("rank") else "")
+              + ". Caption this contrast's volcano with the centre shift and the up:down ratio.")
+    w("")
+
+
+def brief_engine(a, session, prov, wfman):
+    """(engine key, version, note) the brief names. With a session: session.search_engine through
+    the page's own reader (make_analysis_html._engine_facts), so the brief, the page header and
+    the Methods agree -- a record's null version stays unrecorded, and records with none chosen
+    say so (C2 biologist M4). Without one, or when the session names no engine: --engine, else
+    the workflow manifest's pin, tagged as the pin, whose version goes only with its own engine."""
+    if session:
+        import session as sess
+        from make_analysis_html import _engine_facts, search_not_recorded_text
+        e = _engine_facts(session, prov)
+        if e.get("engine"):
+            pinned = e.get("source") == sess.ENGINE_PIN_SOURCE
+            return (e["engine"], e.get("version") or "",
+                    " (the workflow manifest's pin; the search's own record is not here)"
+                    if pinned else "" if e.get("version") else " (version not recorded)")
+        if sess.search_unchosen(e.get("choice") or {}):
+            # records, none chosen: never one of them, and never --engine by hand (T44 F5)
+            return "", "", f"not recorded ({search_not_recorded_text(session, prov)})"
+    pin = wfman.get("engine") if isinstance(wfman.get("engine"), dict) else {}
+    pin_name = str(pin.get("name") or "").lower()
+    eng = (a.engine or pin_name).lower()
+    ver = str(pin.get("version") or "") if eng and eng == pin_name else ""
+    return eng, ver, (" (the workflow manifest's pin)" if ver else
+                      " (as given; no search record)" if eng and session else "")
+
+
+def engine_shown(engine, ver, note):
+    """The engine as the brief prints it: "diann 2.7.0", or the note when none is named."""
+    if not engine:
+        return note.strip() or "unknown"
+    return f"{engine}{' ' + ver if ver else ''}{note}"
+
+
+def _runs_per_group(conditions):
+    """{group: number of runs} from conditions.csv (File.Name, Group), or {} when unreadable."""
+    if not conditions or not os.path.exists(conditions):
+        return {}
+    n = {}
+    try:
+        for r in csv.DictReader(csv_text(conditions)):
+            g = (r.get("Group") or "").strip()
+            if g:
+                n[g] = n.get(g, 0) + 1
+    except (OSError, csv.Error) as e:
+        print(f"[analysis_prompt] {conditions} could not be read: {e}", file=sys.stderr)
+        return {}
+    return n
+
+
+def search_files(session, report):
+    """(the search folder, its search_provenance.json as a dict, quantified, a few words on the
+    choice or None) for a no-DE brief: the session's search (session.search_folder, the one
+    answer to "which search"), else --report's folder. quantified: sage_lfq_check.
+    search_quantified, the predicate the DE gate shares."""
+    import sage_lfq_check
+    folder, why = None, None
+    if session:
+        import session as sess
+        p = sess.paths_for(session)
+        c = sess.search_choice(p)
+        folder = sess.search_folder(p, c)
+        why = c.get("why") if sess.search_unchosen(c) else None
+    elif report:                  # records and none chosen: never --report's folder in its place
+        folder = os.path.dirname(os.path.abspath(report))
+    if not folder or not os.path.isdir(folder):
+        # no search to ask: whether it quantified is not known, so None -- never True by default
+        # (C2 verify: with records and none chosen the brief said "the search quantified")
+        return None, {}, None, why
+    sp = load_record(os.path.join(folder, "search_provenance.json"))
+    return folder, sp, sage_lfq_check.search_quantified(folder), why
+
+
+def semi_specific_brief(w, folder, manifest=None):
+    """The brief's line for a semi-specific search: cleavage_rules.SEMI_SPECIFIC_CAVEAT (the one
+    wording; the Methods and the report's callout quote it too), from the search's parameters as
+    make_methods.search_record reads them (C2 bio M3). Nothing for any other digest."""
+    if not folder:
+        return
+    import cleavage_rules
+    import make_methods
+    sp = os.path.join(folder, "search_provenance.json")
+    if not os.path.isfile(sp):
+        return
+    try:
+        rec = make_methods.search_record(None, sp, manifest)
+    except (OSError, ValueError) as e:
+        print(f"[analysis_prompt] {sp} could not be read for its digest: {e}", file=sys.stderr)
+        w(f"- Digest: the search record could not be read here ({e}); do not describe the "
+          "digest's specificity.")
+        return
+    semi = cleavage_rules.semi_specific_caveat((rec or {}).get("cleavage"))
+    if semi:
+        w(f"- **Semi-specific search (say this in Data Quality Notes, and wherever you give "
+          f"peptide counts):** {semi}")
+
+
+def report_parquet_what(sp):
+    """What report.parquet is, for the file list: a FragPipe DDA search's is a protein-group x run
+    table (run_search.adapt_fragpipe_dda; columns fragpipe_quant.dda_report_columns, the one
+    list), every other engine's a precursor report."""
+    sp = sp if isinstance(sp, dict) else {}
+    fq_rec = sp.get("fragpipe_quantity")
+    if str(sp.get("engine") or "").lower() == "fragpipe" and isinstance(fq_rec, dict) \
+            and fq_rec.get("status") == "ok":
+        import fragpipe_params
+        import fragpipe_quant
+        cols = fragpipe_quant.dda_report_columns(fq_rec.get("companion_column"))
+        pfdr = fragpipe_params.recorded_protein_fdr(fq_rec)
+        # what FragPipe's filter did at the protein level, from the search's record (C2
+        # proteomics H1: a --prot 1 search was called "already FDR-filtered")
+        if fragpipe_params.no_protein_fdr(pfdr):
+            fdr = ("FragPipe's Philosopher filter set the PSM and peptide FDR, but the protein "
+                   f"groups in these rows carry NO protein-level FDR ({pfdr['protein_filter']})")
+        elif pfdr:
+            fdr = ("the rows passed FragPipe's Philosopher filter, protein level included "
+                   f"({pfdr['protein_filter']})")
+        else:
+            fdr = ("FragPipe's Philosopher filter is the identification rule; whether it set a "
+                   "protein-level FDR is not in this search's record, so give no protein count as "
+                   "an FDR-controlled result")
+        return ("the search's protein report: one row per protein group and run, NOT per "
+                f"precursor (columns: {', '.join(cols)}; Genes and Protein.Names only where "
+                f"FragPipe's table had them). PG.MaxLFQ holds the protein quantity "
+                f"({fq_rec.get('quantity') or 'see fragpipe_quantity'}); the q-value columns are "
+                f"0.0 placeholders, so never read them as q-values: {fdr}")
+    return ("the search's precursor report: one row per precursor and run "
+            "(Run, Protein.Group, Q.Value, PG.Q.Value, and the precursor quantities)")
+
+
+def no_de_body(L, a, session, engine, eng_ver, eng_note, acq, embed, failed, fig_error,
+               fdir_rel):
+    """The body of the brief for a session with no differential expression (C2 biologist H1 +
+    statistician M3): the search's own files and record, identification depth and QC, no
+    comparison, significance rule, normalisation check or DE Methods -- the route
+    references/no-de-route.md describes. -> the index of its data-file heading (where records
+    that could not be read are listed)."""
+    w = L.append
+    folder, sp, quantified, unchosen = search_files(session, a.report)
+    base = os.path.abspath(session) if session else os.getcwd()
+
+    def rel(path):
+        r = os.path.relpath(path, base)
+        return path if r.startswith("..") else r.replace(os.sep, "/")
+
+    import dda_first_pass
+    first_pass = dda_first_pass.caution(sp, methods=True)
+    ids_rec = None
+    for name in ("sage_identifications.json", "fragpipe_identifications.json"):
+        if folder and os.path.isfile(os.path.join(folder, name)):
+            ids_rec = (name, load_record(os.path.join(folder, name)))
+            break
+    w("## The search (authoritative — describe it exactly this way)")
+    w(f"- Engine: `{engine_shown(engine, eng_ver, eng_note)}`; acquisition: `{acq or 'unknown'}`.")
+    if unchosen:
+        w(f"- **Which search: not recorded** ({unchosen}). Do not describe one of them as the "
+          "search; say in Data Quality Notes that the session holds several and none was chosen.")
+    if quantified is False:
+        w("- **Identifications only: no quantities.** The search ran no quantification, so there "
+          "are no protein or peptide amounts and no comparison between samples. Never write "
+          "that anything was quantified, more or less abundant, up or down.")
+    elif quantified:
+        w("- The search quantified precursors, but **no differential expression was run**: there "
+          "are no fold changes, p-values or significant proteins. Intensities may describe a run; "
+          "never compare them between conditions as a finding.")
+    else:
+        # no search chosen or found: what it did is not recorded, so nothing is said about it
+        w("- **No differential expression was run**: there are no fold changes, p-values or "
+          "significant proteins. Whether the search quantified anything is not recorded here; "
+          "say nothing about quantities.")
+    rule = None                                   # the identification rule, as recorded
+    # a FragPipe identifications record whose protein groups rest on no protein-level FDR
+    # (fragpipe_params.protein_fdr_record; the Nonspecific workflows' --prot 1, Ruling 120): no
+    # protein-group count is a result. Only a record that says so -- an older one keeps the brief
+    # -- or a quantified search's fragpipe_quantity record (C2 proteomics H1): one predicate
+    import fragpipe_params
+    pfdr = fragpipe_params.recorded_protein_fdr(
+        ids_rec[1] if ids_rec else None, (sp or {}).get("fragpipe_quantity"))
+    no_protein_fdr = fragpipe_params.no_protein_fdr(pfdr)
+    contaminant_summary = (ids_rec[1].get("contaminant_summary")
+                           if ids_rec and isinstance(ids_rec[1], dict) else None)
+    if ids_rec and isinstance(ids_rec[1], dict):
+        r = ids_rec[1]
+        rule = r.get("methods_sentence") if isinstance(r.get("methods_sentence"), str) else None
+        for key, label in (("methods_sentence", "Identification rule"),
+                           ("kept_rule", "Kept"), ("protein_filter", "Protein-level filter"),
+                           ("row_unit", "Rows")):
+            if isinstance(r.get(key), str) and r[key].strip():
+                w(f"- {label}: {r[key].strip()}")
+    elif folder:
+        # a quantifying search: its FDR rule from its record, in the Methods' own words
+        # (make_methods.search_fdr_sentence, the one sentence) -- or said not to be recorded
+        import make_methods
+        srec = make_methods.search_record(None, os.path.join(folder, "search_provenance.json"),
+                                          a.workflow_manifest)
+        sent = make_methods.search_fdr_sentence(srec)
+        rule = sent if sent and make_methods.NOT_RECORDED not in sent else None
+        w(f"- Identification rule: {rule}" if rule else
+          "- Identification rule: **not recorded** in the search record. Say so, and state no "
+          "FDR threshold.")
+        if no_protein_fdr:
+            w(f"- Protein-level filter: {pfdr['protein_filter']}")
+    semi_specific_brief(w, folder, a.workflow_manifest)
+    if first_pass:
+        w(f"- **First-pass report (say this in Overview and Data Quality Notes):** {first_pass}")
+    w("- The instrument's QC check around this project (`logs/qc_bracket.*`) is STAFF-ONLY: "
+      "do not mention its verdict, the QC runs, IPS or that check in this report.")
+    w("")
+    sample_type_brief(w, session)
+    if a.submission:
+        submission_brief(w, a.submission)
+    groups = _runs_per_group(a.conditions)
+    caveat = no_de_condition_caveat(groups, acq)
+    if caveat:
+        w("## Conditions without a comparison — say this in Data Quality Notes")
+        w(f"- {caveat}")
+        w("")
+
+    unread_at = len(L)
+    w("## Attached data files — read these")
+    listed = []
+    if folder:
+        for name, what in (
+                ("identifications.tsv", "the identifications: the search's only result table"
+                 + (f" ({ids_rec[1]['row_unit']})" if ids_rec and isinstance(ids_rec[1], dict)
+                    and ids_rec[1].get("row_unit") else "")
+                 + " — count peptides, not rows"),
+                ("sage_identifications.json", "how the identifications were filtered: the rule, "
+                 "what was kept and dropped per run, and the totals"),
+                ("fragpipe_identifications.json", "how the identifications were built: the "
+                 "Philosopher filter, the tables read, what was kept per run"),
+                ("report.parquet", report_parquet_what(sp)),
+                ("report.stats.tsv", "the engine's per-run statistics"),
+                ("report.pg_matrix.tsv", "the engine's protein-group matrix (per run)"),
+                ("search_provenance.json", "what ran: the engine, its version and settings")):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and (quantified is not False
+                                         or not name.startswith("report.")):
+                w(f"- `{rel(path)}` — {what}.")
+                listed.append(name)
+    if not listed:
+        import session as _sess
+        if unchosen and unchosen.startswith(_sess.FAIMS_SPLIT_WHY):
+            # a split search has output -- in one folder per group, none chosen for this brief
+            w(f"- **No single search is chosen for this brief**: {unchosen}. Say that this "
+              "report covers none of the groups' results until one is chosen (`session.py "
+              "choose-search`); do not report identification numbers you cannot read from a file.")
+        else:
+            w("- **No search output was found** for this session"
+              + (f" ({unchosen})" if unchosen else "") + ". Say so; do not report identification "
+              "numbers you cannot read from a file.")
+    if a.conditions:
+        w(f"- `{a.conditions}` — the runs and their conditions (File.Name → Group).")
+    if a.qc and os.path.exists(a.qc):
+        w(f"- `{a.qc}` — per-sample QC metrics.")
+    w("")
+    w("Compute everything you cite directly from these files:")
+    w("- per run: the identifications "
+      + ("at the search's recorded FDR (the identification rule above)" if rule else
+         "(the FDR rule they rest on is not recorded: say so)")
+      + (" — PSMs and distinct peptides. The protein groups have no protein-level FDR (the "
+         "record's protein-level filter above), so report PSMs and peptides only — never a "
+         "protein-group count as a result, per run or in total; name proteins only as presence, "
+         "with their peptides"
+         if no_protein_fdr else
+         " — precursors or PSMs, distinct peptides and protein groups" + (
+             "; with Sage's list, protein groups at `protein_q` ≤ 0.01 are those identified at 1% "
+             "protein-level FDR, and the rest are listed without a protein-level filter — say "
+             "which you count" if ids_rec and ids_rec[0].startswith("sage") else "")) + ";")
+    w("- how consistent the identification depth is between runs, and any run far below the "
+      "others;")
+    if isinstance(contaminant_summary, str) and contaminant_summary.strip():
+        # the search's own count by the skill's contaminant classifier (run_search.
+        # adapt_fragpipe_ids): quoted, so the share is never re-derived by hand (Ruling 120)
+        w(f"- contaminant entries, as the identifications record counts them: "
+          f"{contaminant_summary.strip()} Report that share separately, and keratin entries "
+          f"among the contaminants.")
+    else:
+        w("- contaminant (`Cont_`) and keratin entries among the identifications.")
+    w("Use gene names where available; a protein with no gene name goes by its UniProt entry "
+      "name, not its accession. **Never fabricate a value, protein, pathway, or citation you "
+      "cannot ground in the data or established biology.**")
+    w("")
+    # step 8b (the figures) is the DE's: a no-DE session's figures/ is empty by design, so a
+    # missing figures.json is no news here -- one that exists and cannot be read still is
+    if fig_error == "not found":
+        fig_error = None
+    if embed or failed or fig_error:
+        w("## Figures")
+        if fig_error:
+            w(f"`{fdir_rel}/figures.json` {fig_error}: no figures are listed. Do not embed image "
+              "files by guessing their names.")
+        for fig in embed:
+            w(f"- `{fdir_rel}/{fig['file']}` ({fig['type']}) — {fig['caption']} Embed it in **QC "
+              "Assessment** with an interpretation for THIS dataset.")
+        for f in failed:
+            w(f"- Not drawn: `{fdir_rel}/{f['file']}` — {f.get('reason') or 'no reason recorded'}"
+              ". Do not embed it.")
+        w("")
+
+    w("## OUTPUT — write `" + a.report_out + "` with ALL of these sections (markdown)")
+    w("Use markdown headers and tables for numbers. Be scientific but accessible. This report "
+      "is about what was identified and how well — there is no comparison between groups in it.")
+    w("")
+    w("### Overview")
+    w("What was searched (runs, acquisition, engine) and the overall identification depth"
+      + (", saying plainly that the search was for identifications only (no quantities)"
+         if quantified is False else "") + ", and that no differential expression was run.")
+    w("")
+    w("### Identification depth per run")
+    w("One table: per run, the identifications at the recorded FDR (as computed above). Say "
+      "which FDR rule they rest on, in the record's words.")
+    w("")
+    w("### QC Assessment")
+    w("Consistency of identification depth across runs, any outlier run, contaminants and "
+      "keratins" + (", and the figures" if embed else "") + ". Do not judge whether the data are "
+      "fit for differential analysis: none was run.")
+    w("")
+    w("### Notable proteins")
+    w("Proteins identified, as presence only: the most confidently identified, protein families "
+      "or complexes represented, and what they say about the sample. For each protein you name, "
+      "give its evidence from the identifications, per run: its distinct peptides (and PSMs or "
+      "precursors where the table has them)" + (", and its `protein_q`"
+                                                if ids_rec and ids_rec[0].startswith("sage")
+                                                else "")
+      + ". No abundance comparison between runs or conditions, and never \"unique to\" a "
+      "condition as a finding.")
+    w("")
+    w("### How This Analysis Works")
+    w("For a biologist with no MS background, in plain language: LC-MS/MS (digestion into "
+      "peptides, chromatography, MS1 mass and MS2 fragments), "
+      + ("DIA (every peptide in m/z windows, every cycle)" if acq == "DIA" else
+         "DDA (the instrument picks the most abundant precursors to fragment, so low-abundance "
+         "peptides are under-sampled and differ from run to run)" if acq == "DDA" else
+         "the acquisition mode")
+      + ", the database search, and what \"identified at 1% FDR\" means (target-decoy "
+      "q-values). No differential-expression statistics: there are no fold changes, p-values "
+      "or volcano plots in this analysis.")
+    w("")
+    w("### Data Quality Notes")
+    w("The caveats above, each said once: " + "; ".join(x for x in (
+        "identifications only, no quantities" if quantified is False else None,
+        "no protein-level FDR on the protein groups, so no protein count" if no_protein_fdr
+        else None,
+        "the first-pass report" if first_pass else None,
+        "conditions without a comparison" if caveat else None,
+        "the sample type as stated (or not stated)") if x) + ".")
+    w("")
+    w("### Methods (publication-ready)")
+    w("A concise paragraph in third-person past tense, drawn from `search_provenance.json` and "
+      "the identification record above: the search engine and version, database, enzyme and "
+      "modifications, the identification FDR rule in the record's words"
+      + (", that no quantification was run" if quantified is False else "")
+      + ", and that no differential expression was run. Nothing about normalisation, "
+      "statistical tests or multiple-testing correction: none ran.")
+    w("")
+    w("### Next steps")
+    w("What would answer a question this analysis cannot: for a comparison between conditions, "
+      "biological replicates (three or more per condition) and a differential-expression "
+      "analysis" + ("; for amounts, a search that quantifies" if quantified is False else "")
+      + ". Then point the reader to `README.html` at the top of the results folder.")
+    if a.instrument:
+        w("")
+        w("### Instrument & Acquisition")
+        w(f"Instrument detected: **{a.instrument}**. Write a short Data Acquisition note "
+          "(instrument model, acquisition type) for the Methods, in third-person past tense.")
+    w("")
+    return unread_at
+
+
+def brief_footer(w, a, extra=""):
+    """The closing rules every brief carries: the sections the HTML report adds itself, and
+    how to write for the reader. `extra`: words after the first sentence (the DE brief's
+    "Embed every figure.")."""
+    w("---")
+    w("Reference specific proteins from the files to support every claim. " + extra
+      + "Do not invent data, "
+      "pathways, or citations you cannot ground in the attached files or established biology. "
+      "After writing the report, it is rendered into Analysis_Report.html (the report of "
+      "record).")
+    w("Do not write an \"Audit & caveats\" section: the HTML report adds it as a plain-language "
+      "table from AUDIT.json, one row per check. Discuss a caution that bears on a finding next "
+      "to that finding and in Data Quality Notes.")
+    w(f"Do not write a \"{HOW_MADE_TITLE}\" section: the HTML report adds it from the run's "
+      "records (the software and versions, that Claude ran the pipeline and wrote the text, the "
+      "podcast, the expert review) with a link to the Core's public page on how these reports "
+      "are made. A section of that title in your report would replace it.")
+    # the peak check (skyline_peaks.py, step 8f): the page adds its section; the writer's words
+    # about it follow the one rule (references/skyline.md)
+    import skyline_peaks
+    pk = skyline_peaks.load_record(os.path.join(os.path.dirname(os.path.abspath(a.de_dir)),
+                                                "skyline"))
+    if pk:
+        w(f"Do not write a \"{skyline_peaks.SECTION_TITLE}\" section: the HTML report adds it from "
+          "`skyline/skyline_provenance.json`"
+          + (f" (it was not run: {pk.get('reason')})." if pk.get("status") == "skipped" else ".")
+          + " When you mention it, it is a visual check of DIA-NN's peaks: Skyline reuses "
+          "DIA-NN's peak edges by default, so a matching peak is not independent confirmation. "
+          "Never write that Skyline confirmed, validated or verified a result. A checked protein "
+          "where Skyline picked a different peak (`skyline/disagreements.tsv`) is worth naming "
+          "next to its finding, as a peak to look at.")
+    w("Write for a reader who sees only this finished report: never narrate drafts, earlier "
+      "versions or corrections of it (\"the first draft\", \"was wrong ... corrected\", \"now "
+      "says\"). An Expert Review Notes section states, in the present tense, what was checked "
+      "and where the report deals with it; the review history goes in logs/decisions.md.")
+    w("")
+
+
+def write_brief(a, L, unread_at):
+    """ANALYSIS_PROMPT.md, with the records that could not be read listed at `unread_at`."""
+    if _UNREADABLE:
+        L[unread_at:unread_at] = (
+            ["## Records that could not be read — say so, do not fill in"]
+            + [f"- `{p}` {why}" for p, why in _UNREADABLE.items()]
+            + ["What these records hold (a cutoff, a contaminant caveat, a study fact) may be "
+               "missing from this brief. Say in Data Quality Notes which could not be read; never "
+               "describe what they would have said. The HTML report says so too.", ""])
+    with open(a.out, "w", encoding="utf-8") as fh:        # "≥", "—": not cp1252-safe
+        fh.write("\n".join(L) + "\n")
+
+
+def _detection(de_dir, conditions):
+    """-> (per-sample detection {protein: {run: bool}}, groups {group: [runs]}) from
+    Detection_Matrix.csv + conditions.csv, or ({}, {}) when either is missing."""
+    path = os.path.join(de_dir, "Detection_Matrix.csv")
+    det, groups = {}, {}
+    if not (os.path.exists(path) and conditions and os.path.exists(conditions)):
+        return det, groups
+    rd = csv.reader(csv_text(path))
+    head = next(rd)
+    for rec in rd:
+        det[rec[0]] = {head[i]: _on(rec[i]) for i in range(1, len(rec))}
+    for r in csv.DictReader(csv_text(conditions)):
+        groups.setdefault((r.get("Group") or "").strip(), []).append(
+            (r.get("File.Name") or "").strip())
+    return det, groups
+
+
+def _on(v):
+    try:
+        return float(v) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _k_of_n(row, group, det, groups):
+    """(k measured, n) for one protein in one group: the DE table's own Detected_<group>
+    column when present, else Detection_Matrix.csv. None when neither can say."""
+    v = row.get(f"Detected_{group}")
+    if v and "/" in v:
+        k, n = v.split("/", 1)
+        try:
+            return int(k), int(n)
+        except ValueError:
+            pass
+    d = det.get(row.get("Protein.Group"))
+    if d is not None and group in groups:
+        return sum(d.get(s, False) for s in groups[group]), len(groups[group])
+    return None
+
+
+def never_in_control(de_dir, de_file, contrast, control, adjp, det, groups, k=15):
+    """Significant, enriched proteins of a bait-vs-control contrast that were never measured
+    in the control -> (count, [gene names by adj.P]), or None when detection is unknown."""
+    rows, known = [], False
+    with csv_text(os.path.join(de_dir, de_file)) as fh:
+        for r in csv.DictReader(fh):
+            try:
+                p, lfc = float(r.get("adj.P.Val")), float(r.get("logFC"))
+            except (TypeError, ValueError):
+                continue
+            kn = _k_of_n(r, control, det, groups)
+            known = known or kn is not None
+            if p < adjp and lfc > 0 and kn is not None and kn[0] == 0:
+                if not background_flag(r.get("Genes"), r.get("Protein.Group"),
+                                       r.get("Protein.Names")):
+                    rows.append((p, gene_label(r)))
+    if not known:
+        return None
+    rows.sort()
+    return len(rows), [g for _, g in rows[:k]]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--out", default="ANALYSIS_PROMPT.md")
+    ap.add_argument("--de-dir", default=None,
+                    help="the DE tables folder (output/tables). Optional: a session with no "
+                         "differential expression has none, and the brief is then the no-DE "
+                         "brief. Default: <session>/output/tables, or ./output/tables")
+    ap.add_argument("--report")
+    ap.add_argument("--conditions")
+    ap.add_argument("--figures-dir")
+    ap.add_argument("--qc")
+    ap.add_argument("--gsea")
+    ap.add_argument("--engine", default="")
+    ap.add_argument("--acquisition", default="")
+    ap.add_argument("--instrument", default="")
+    ap.add_argument("--workflow-manifest")
+    ap.add_argument("--report-out", default="AI_Analysis_Report.md")
+    ap.add_argument("--submission", help="the session dir: its CoreOmics submission "
+                                         "(submission_report.py) is quoted in the brief")
+    ap.add_argument("--session", help="the session dir: its sample-type record "
+                                      "(sample_type.py) is quoted in the brief. Default: "
+                                      "--submission when that is a session dir")
+    a = ap.parse_args()
+    if a.de_dir is None:
+        # X8 F8: the no-DE brief needs no DE folder; the loaders below read what is there and
+        # find nothing in a folder that does not exist
+        sess = a.session or (a.submission if a.submission and os.path.isdir(
+            os.path.join(a.submission, "input")) else None)
+        a.de_dir = os.path.join(sess or ".", "output", "tables")
+
+    # the page's loaders: UTF-8 whatever the locale, and a record that exists but cannot be
+    # read is said (stderr + a line in this brief), never a silent {}
+    prov = load_record(os.path.join(a.de_dir, "de_provenance.json"))
+    wfman = load_record(a.workflow_manifest) if a.workflow_manifest else {}
+    method = prov.get("method") or (wfman.get("de", {}) or {}).get("method", "")
+    session = a.session or (a.submission if a.submission and os.path.isdir(
+        os.path.join(a.submission, "input")) else None)
+    # the engine and version by the one rule (session.search_engine, through the page's reader):
+    # the brief, the page header and the Methods name the same search (C2 biologist M4)
+    engine, eng_ver, eng_note = brief_engine(a, session, prov, wfman)
+    acq = (a.acquisition or wfman.get("acquisition", "")).upper()
+    de_files = sorted(os.path.basename(f) for f in glob.glob(os.path.join(a.de_dir, "DE_*.csv")))
+    contrasts = prov.get("contrasts") or []
+
+    def recorded(key):
+        v = prov.get(key)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    # As recorded, or said to be unrecorded (rule 2): never a silent 0.01 / 1.0 / 0.05.
+    q_cut, lfc, adjp_rec = recorded("q_cutoff"), recorded("logfc"), recorded("adjp")
+    adjp = adjp_rec if adjp_rec is not None else 0.05
+    adjp_txt = f"{adjp:g}" if adjp_rec is not None else f"{adjp:g} {DEFAULT_TAG}"
+    groups_all = list((prov.get("groups") or {}).keys()) if isinstance(prov.get("groups"), dict) else []
+    # THE pull-down decision (experiment_type.pulldown_design): from the session's experiment
+    # type when one is recorded -- the same record that set the DE's quantities -- else from the
+    # group names, said so. The brief and the DE cannot disagree about the design.
+    import experiment_type as etm
+    try:
+        etype, etype_err = etm.load(session), None
+    except (OSError, ValueError) as e:
+        etype, etype_err = None, str(e)
+        print(f"[analysis_prompt] the experiment-type record could not be read: {e}",
+              file=sys.stderr)
+    design = etm.pulldown_design(etype, groups_all, contrasts)
+    controls, vs_control, pulldown = design["controls"], design["vs_control"], design["pulldown"]
+    det, det_groups = _detection(a.de_dir, a.conditions)
+    has_detmat = os.path.exists(os.path.join(a.de_dir, "Detection_Matrix.csv"))
+    zero_word = ("missing" if (prov.get("detection_matrix") or {}).get("zero_means") == "missing"
+                 else "inferred")
+
+    # A pipeline whose rows are not run_de.R's (run_silac.R: ratios measured in both channels)
+    # says how to read them; the brief then leaves out the measured-vs-inferred tiers, the CVs
+    # and the tiered next steps, which describe run_de.R's tables (rule 1: from the record).
+    own_reading = prov.get("evidence_reading") if isinstance(prov.get("evidence_reading"), str) else None
+    own_steps = [x for x in (prov.get("next_steps") or []) if isinstance(x, str) and x.strip()]
+    spread = prov.get("spread") if isinstance(prov.get("spread"), str) else None
+    de_cols_rec = prov.get("de_columns") if isinstance(prov.get("de_columns"), dict) else {}
+    smx = prov.get("sample_matrix") if isinstance(prov.get("sample_matrix"), dict) else {}
+    desc_line = prov.get("display_label") or "the configured quantification + limma pipeline"
+    rollup = prov.get("rollup_method", "")
+    de_engine = prov.get("de_engine", "")
+    missing_policy = prov.get("missing_policy", "")
+    citation = prov.get("citation", "")
+
+    # figures: make_figures.R's figures.json, through the reader the HTML report uses (both
+    # the 2.8.0 object {"figures", "failed"} and an older session's bare list)
+    figs, failed, fig_error = [], [], None
+    fdir_rel = ""
+    if a.figures_dir and os.path.isdir(a.figures_dir):
+        fjd = read_figures_json(a.figures_dir)
+        figs, failed = fjd["figures"], fjd["failed"]
+        fig_error = fjd["error"] or (None if fjd["found"] else "not found")
+        if fig_error:
+            print(f"[analysis_prompt] WARNING: {a.figures_dir}/figures.json {fig_error}: the "
+                  f"brief lists no figures", file=sys.stderr)
+        fdir_rel = os.path.basename(a.figures_dir.rstrip("/")) or "figures"
+
+    # A complete-by-construction matrix (DPC/limpa) makes "proteins quantified per sample" a
+    # row of identical bars: never ask the writer to embed or describe it -- make_analysis_html
+    # drops it, and a paragraph written about it, anyway (the same test, one definition).
+    complete, complete_why = matrix_complete(a.de_dir, prov)
+    if complete:
+        figs = [f for f in figs if not str(f.get("file", "")).startswith(SUPPRESS_WHEN_COMPLETE)]
+    # The p-value panel is a calibration check: the HTML report adds it as its appendix, so the
+    # narrative does not embed it (or interleave per-contrast p-value plots with the findings).
+    appendix = [f for f in figs if f["file"].startswith(APPENDIX_FIGURES)]
+    embed = [f for f in figs if f not in appendix]
+    legacy_pv = [f for f in embed if f["file"].startswith("pvalue_")]
+
+    # the QC figures this run drew, by type -- never one it did not (a SILAC run has no PCA)
+    types = {f.get("type") for f in embed}
+    heatmap_by_variance = any(f.get("type") == "heatmap" and "chosen by variance" in
+                              str(f.get("caption") or "") for f in embed)
+    qc_named = (["PCA"] if "pca" in types else []) + (
+        [("detected-vs-inferred" if complete else "per-sample counts")] if "qc" in types else [])
+    has_qc = bool(a.qc and os.path.exists(a.qc))
+    has_gsea = bool(a.gsea and os.path.exists(a.gsea))
+    is_dia = acq == "DIA" or engine == "diann"
+
+    L = []
+    w = L.append
+
+    # A session with no differential expression -- no DE record (report_files.DE_RECORD, the
+    # record session.has_de reads) and no DE table -- is briefed for what it has: the
+    # identifications and their QC, never "differential expression" (T14, I03).
+    import report_files
+    has_de = bool(de_files) or os.path.isfile(os.path.join(a.de_dir, report_files.DE_RECORD))
+    w("# Analysis brief — proteomics differential expression" if has_de else
+      "# Analysis brief — proteomics identification and QC (no differential expression)")
+    w("")
+    what = (f"the differential expression results from this **{desc_line}** run" if has_de else
+            "the identification and QC results from this run (no differential expression was "
+            "run)")
+    w("**You are a senior proteomics and systems biology consultant.** Write a "
+      f"comprehensive, publication-grade analysis of {what} (engine: "
+      f"`{engine_shown(engine, eng_ver, eng_note)}`, acquisition: `{acq or 'unknown'}`). "
+      "Be rigorous and specific — this report goes to the scientist who generated "
+      "the data. Read every data file and figure below, then write the full report "
+      "described under OUTPUT. Do not produce a short summary; produce the complete "
+      "multi-section report.")
+    w("")
+    if not has_de:
+        # the brief for what the session has: its search's files, identification depth and QC --
+        # no contrast, significance rule, normalisation check or DE Methods (C2 biologist H1)
+        unread_at = no_de_body(L, a, session, engine, eng_ver, eng_note, acq, embed, failed,
+                               fig_error, fdir_rel)
+        brief_footer(w, a)
+        write_brief(a, L, unread_at)
+        print(json.dumps({
+            "prompt": os.path.abspath(a.out), "report_to_write": a.report_out,
+            "engine": engine, "engine_version": eng_ver, "acquisition": acq,
+            "differential_expression": False,
+            "figures": [f["file"] for f in figs], "n_figures": len(embed),
+            "figures_failed": [f["file"] for f in failed], "figures_error": fig_error,
+            "records_unreadable": dict(_UNREADABLE),
+            "next": f"Read {a.out} + the search files it names, then write {a.report_out} (ALL "
+                    "sections), then render it with make_analysis_html.py into "
+                    "Analysis_Report.html.",
+        }, indent=2))
+        return
+
+    w("## Pipeline (authoritative — describe it exactly this way)")
+    w(f"- Quantification: {rollup or '(see methods.txt)'}")
+    w(f"- DE engine: {de_engine or '(see methods.txt)'}")
+    if missing_policy:
+        w(f"- Missing values: {missing_policy}")
+    if citation:
+        w(f"- Citation: {citation}")
+    # what the pipeline itself says a reader must know about its numbers (de_provenance.json
+    # `brief_notes`; run_silac.R: centred vs uncentred ratios, the presence/absence caveat ...)
+    for note in prov.get("brief_notes") or []:
+        if isinstance(note, str) and note.strip():
+            w(f"- **Read the numbers this way:** {note.strip()}")
+    # run_de.R's contaminant record -- stated as recorded, never assumed.
+    cont = prov.get("contaminants") if isinstance(prov.get("contaminants"), dict) else {}
+    if cont.get("policy") == "removed":
+        from make_methods import _count_of          # the record's unit, singular for one
+        n_items, were = _count_of(cont.get("n_precursors"), cont)
+        w(f"- Contaminants: {n_items} mapping to a {cont.get('tag')} "
+          f"entry {were} removed before quantification ({cont.get('n_protein_groups')} contaminant "
+          f"protein groups); they are NOT in the DE tables or "
+          + (f"`{smx['file']}`." if smx.get("file") else "the expression matrix."))
+    elif cont.get("policy") == "kept":
+        w(f"- Contaminants: KEPT (--keep-contaminants) — {cont.get('n_protein_groups')} "
+          f"{cont.get('tag')} protein groups are in the DE tables; call any that are "
+          f"significant contamination, not biology.")
+    elif prov and not cont:
+        w("- Contaminants: not recorded by this DE run (older run_de.R, which did NOT remove "
+          "them) — any `Cont_` protein in the DE tables is contamination, not biology.")
+    if cont.get("database_risk") is True:
+        w(f"- **Contaminant-filter caveat (say this in Data Quality Notes, naming the proteins):** "
+          f"{cont.get('database_note')}")
+    # A keratin sample (hair, wool, feather, skin, nail): make_methods' sentence is its one
+    # description. Keratins are the analyte there -- never call them contamination.
+    from make_methods import de_keratin_sentence
+    ker = de_keratin_sentence(cont)
+    if ker and (cont.get("keratin_sample") or {}).get("value") is not True:
+        w(f"- Keratin: {ker} Say so in Data Quality Notes if keratins matter to the question.")
+    elif ker:
+        kn = (cont.get("keratin_sample") or {}).get("note")
+        w(f"- Keratin sample: {ker} Keratins in the results are the ANALYTE -- do not call them "
+          f"contamination." + (f" Caveat (say it in Data Quality Notes): {kn}"
+                               if (cont.get("keratin_sample") or {}).get("caution") is True
+                               and kn else ""))
+    # run_de.R's block record (--block): make_methods' sentence is its one description.
+    blk = prov.get("block") if isinstance(prov.get("block"), dict) else {}
+    if blk.get("applied") is True:
+        from make_methods import de_block_sentence
+        w(f"- Blocking: {de_block_sentence(prov)}")
+        for warn in blk.get("warnings") or []:
+            w(f"- **Blocking caveat (say this in Data Quality Notes):** {warn}")
+    elif blk.get("column") and blk.get("note"):
+        w(f"- Blocking: none used — {blk['note']}")
+    # run_de.R's covariate record (--numeric-covariates): make_methods' sentence is its one
+    # description. Only a numeric covariate is said here; a factor is the design's term.
+    from make_methods import de_covariate_sentence
+    cov = de_covariate_sentence(prov)
+    if cov:
+        w(f"- Continuous covariate: {cov} Describe every group difference as adjusted for it.")
+        cov_rec = prov.get("covariates") if isinstance(prov.get("covariates"), dict) else {}
+        for warn in cov_rec.get("warnings") or []:
+            w(f"- **Covariate caveat (say this in Data Quality Notes):** {warn}")
+    # make_methods' reading (one definition): the pipeline's own FDR statement, and the q-value
+    # columns only when they really filtered (never a Sage report's DIA-NN-shaped placeholders)
+    from make_methods import identification_filter
+    id_fdr = "; ".join(x for x in identification_filter(prov) if x) or "not recorded"
+    if adjp_rec is not None:
+        w(f"- Significance rule: adj.P.Val < {adjp:g} (Benjamini-Hochberg within each contrast) "
+          f"— the adjusted p-value ALONE (identification FDR: {id_fdr}). "
+          "**No fold-change filter is applied.**"
+          + (f" |log2FC| = {lfc:g} ({2 ** float(lfc):.3g}-fold) is drawn on the volcano as a "
+             f"reference line only." if lfc is not None else ""))
+        w("- Do not re-impose a fold-change cutoff when you count or describe significant "
+          "proteins, and never call a result significant \"because it is ≥2-fold\". The test "
+          "was of H0: fold change = 0, so that is the claim the error rate covers. You may say "
+          "how many significant proteins also exceed the reference line — as a description of "
+          "effect size, not as a second significance criterion.")
+    else:
+        w(f"- Significance rule: **not recorded** (de_provenance.json has no adjp). Count at "
+          f"adj.P.Val < {adjp_txt} and say in the report that this cutoff is a default, not the "
+          f"rule the DE applied. Do not claim that no fold-change filter was used unless "
+          f"`methods.txt` says so.")
+    # a FragPipe search whose protein groups rest on no protein-level FDR (--prot 1; the record
+    # adapt_fragpipe_dda writes, fragpipe_params.no_protein_fdr the one predicate): the DE tests
+    # those groups, so a protein count is not an FDR-controlled result (C2 proteomics H1)
+    import fragpipe_params
+    _sfolder, _sp, _q, _w = search_files(session, a.report)
+    de_pfdr = fragpipe_params.recorded_protein_fdr((_sp or {}).get("fragpipe_quantity"))
+    if fragpipe_params.no_protein_fdr(de_pfdr):
+        w(f"- **No protein-level FDR (say this in Data Quality Notes):** the protein groups the DE "
+          f"tested come from a search whose protein level was not FDR-filtered "
+          f"({de_pfdr['protein_filter']}). Its peptides passed the search's FDR; the protein "
+          "groups they map to did not. Never give the number of protein groups (tested, "
+          "identified or quantified) as an FDR-controlled result, and describe each protein you "
+          "name with its peptide evidence.")
+    semi_specific_brief(w, _sfolder, a.workflow_manifest)
+    w(f"- Contrasts — name each exactly this way everywhere (text, tables, figure notes): "
+      + "; ".join(f"`{c}` = **{contrast_label(c)}**" for c in contrasts)
+      + f". {LOGFC_DIRECTION}" if contrasts else f"- {LOGFC_DIRECTION}")
+    w("- The exact, self-describing methods text is in `tables/methods.txt` — do not "
+      "contradict it or invent a different pipeline.")
+    # qc_bracket.py's verdict is staff-only (Brett, 2026-10-01): the writer of a client report
+    # must not carry it over from logs/ or from what staff were told
+    w("- The instrument's QC check around this project (`logs/qc_bracket.*`) is STAFF-ONLY: "
+      "do not mention its verdict, the QC runs, IPS or that check in this report.")
+    w("")
+
+    # the sample type, as the user stated it -- or NOT STATED, which forbids a guess
+    sample_type_brief(w, session)
+    normalisation_brief(w, prov, etype, etype_err, design)
+    if a.submission:
+        submission_brief(w, a.submission)
+
+    unread_at = len(L)                       # records that could not be read: listed here, last
+    w("## Attached data files — read these")
+    heads = {}                               # each DE table's own header: its own groups
+    for f in de_files:
+        try:
+            heads[f] = next(csv.reader(csv_text(os.path.join(a.de_dir, f))))
+        except (OSError, StopIteration):
+            heads[f] = []
+    de_cols = [c for f in de_files for c in heads[f]]
+    det_cols = [c for c in de_cols if c.startswith("Detected_")]
+    has_evidence = "Evidence" in de_cols
+    # run_de.R's own descriptions of Detected_<group> / Evidence (de_provenance.json): read,
+    # never restated -- session_docs' AGENTS.md quotes the same record.
+    dm_rec = prov.get("detection_matrix") if isinstance(prov.get("detection_matrix"), dict) else {}
+    de_col_desc = dm_rec.get("de_columns") if isinstance(dm_rec.get("de_columns"), dict) else {}
+    for f in de_files:
+        own = [c for c in heads[f] if c.startswith("Detected_")]
+        if de_cols_rec:              # the pipeline's own columns (run_silac.R de_columns)
+            w(f"- `tables/{f}` — DE results for one comparison; its columns are described below.")
+            continue
+        w(f"- `tables/{f}` — DE results for one comparison: Protein.Group, logFC, "
+          "AveExpr, t, P.Value, adj.P.Val (BH within the contrast), B, gene annotation"
+          + ((f", PropObs/{precursor_count_column(heads[f])} (limpa)"
+              if precursor_count_column(heads[f]) else ", PropObs (limpa)")
+             if "PropObs" in heads[f] else "")
+          + (f", per-group detection {', '.join(f'`{c}`' for c in own)} (k/n samples measured)"
+             if own else "")
+          + (", `Evidence`" if "Evidence" in heads[f] else "") + ".")
+    if de_cols_rec:
+        w("  The DE tables' columns, as recorded in `de_provenance.json` (`de_columns`):")
+        for col, desc in de_cols_rec.items():
+            w(f"  - `{col}`: {desc}")
+    for col, desc in (("Detected_<group>", de_col_desc.get("Detected_<group>")),
+                      ("Evidence", de_col_desc.get("Evidence"))):
+        if desc and (det_cols if col.startswith("Detected_") else has_evidence):
+            w(f"  - `{col}`: {desc} (as recorded in `de_provenance.json`).")
+    if os.path.exists(os.path.join(a.de_dir, "Expression_Matrix.csv")) or not smx:
+        w("- `tables/Expression_Matrix.csv` — log2 protein abundance per sample"
+          + (" (complete: every cell has a value, measured OR inferred)." if complete else "."))
+    if smx.get("file"):
+        w(f"- `tables/{smx['file']}` — {smx.get('values') or 'per-sample values'}"
+          + (f" (the samples: `tables/{smx['samples']}`)" if smx.get("samples") else "") + ".")
+    if has_detmat:
+        w(f"- `tables/Detection_Matrix.csv` — per protein x sample: precursors observed; "
+          f"**0 = {zero_word}** (not measured in that sample). Same rows and columns as the "
+          f"expression matrix. This, not the expression matrix, says what was measured.")
+    if os.path.exists(os.path.join(a.de_dir, "QC_detected_vs_inferred.csv")):
+        w("- `tables/QC_detected_vs_inferred.csv` — per sample: proteins measured vs inferred.")
+    w("- `tables/methods.txt`, `tables/de_provenance.json` — methods + exact versions.")
+    if cont.get("share_table"):
+        w(f"- `tables/{cont['share_table']}` — per-run contaminant share of "
+          f"{cont.get('intensity_column')} (QC): report a high or group-confounded share in "
+          f"Data Quality Notes.")
+    if cont.get("removed_table"):
+        w(f"- `tables/{cont['removed_table']}` — the protein groups the contaminant filter "
+          f"removed (or trimmed) before quantification.")
+    if a.conditions:
+        w(f"- `{a.conditions}` — experimental design (File.Name → Group [+ Batch/Covariates]).")
+    if has_qc:
+        w(f"- `{a.qc}` — per-sample QC metrics.")
+    if has_gsea:
+        w(f"- `{a.gsea}` — Gene Set Enrichment results (gene-permutation GSEA: exploratory, see "
+          "below).")
+    # run_sets.R: its record, its tables, its own reading rules -- quoted, not restated
+    sets_rec = load_record(os.path.join(a.de_dir, "sets_provenance.json"))
+    if sets_rec:
+        w("- `tables/Sets_<contrast>.csv` — protein-set tests per comparison (camera + fry, the "
+          "run-depth check, presence-call fractions); `tables/sets_provenance.json` — their "
+          "record and methods" + ("; `tables/Sets_baitnorm_<contrast>.csv` — the pulldown's "
+                                  "tests relative to each bait's complex"
+                                  if (sets_rec.get("pulldown") or {}).get("baits") else "") + ".")
+        cols = sets_rec.get("columns") if isinstance(sets_rec.get("columns"), dict) else {}
+        for col, desc in cols.items():
+            w(f"  - `{col}`: {desc}")
+    elif (prov.get("set_tests") or {}).get("suggested_for"):
+        w(f"- Protein-set tests were suggested by run_de for "
+          f"{', '.join(prov['set_tests']['suggested_for'])} (few significant proteins) but have "
+          "not been run: say so if the report discusses pathways, and do not stand in for them "
+          "by eye.")
+    w("")
+    w("Compute everything you cite directly from these files:")
+    w(f"- significant proteins per contrast (adj.P.Val < {adjp_txt} only) and the up/down split;")
+    w("- the top up/down proteins per contrast **ranked by adj.P.Val (ties by P.Value) — never "
+      "by |logFC|**" + (";" if own_reading else
+                        ": where a group was never measured, the largest fold changes are "
+                        "detection events set by the missing-value model, not the strongest "
+                        "effects;"))
+    w("- proteins significant in ≥2 contrasts;")
+    if spread:
+        w(f"- reproducibility: {spread}.")
+    else:
+        w("- reproducibility (CV) per group — on the **linear** scale (2^value), from **measured "
+          "values only** (Detection_Matrix.csv > 0 for that protein and sample); skip a group "
+          "with fewer than 2 measured values, and call a protein with no measured value in a "
+          "group *all-inferred* there. Never compute a CV from inferred values: a group never "
+          "measured gets near-identical model values, which reads as CV ≈ 0 — \"most stable\" — "
+          "when nothing was measured"
+          + ("." if has_detmat else ". **Detection_Matrix.csv is not attached, so you cannot "
+                                    "tell measured from inferred: do not report CVs as "
+                                    "reproducibility.**"))
+    w("Use gene names where available; a protein with no gene name goes by its UniProt entry "
+      "name (`Protein.Names`, e.g. HVM51_MOUSE)"
+      + (", and with neither (a database that is not UniProt's) by its `Description`"
+         if "Description" in de_cols else "")
+      + ", not its accession, as the HTML report's "
+      "tables do. **Never fabricate a value, protein, pathway, or citation you cannot ground "
+      "in the data or established biology.**")
+    w("")
+    # measured vs inferred: how to tier, and what PropObs is NOT -- or, for a pipeline that
+    # records its own rule (run_silac.R evidence_reading), that rule
+    ev_all, ev_none, ev_part = EVIDENCE[0], EVIDENCE[1], f"{EVIDENCE[2]} {zero_word}"
+    if own_reading:
+        w("## How to read a hit — as the pipeline records it")
+        w(f"- {own_reading}")
+    else:
+        w("## Measured vs inferred — how to tier hits")
+        if "PropObs" in de_cols:
+            # the precursor count the tables really have (limpa 1.4 renamed NPeptides NPrec)
+            n_col = precursor_count_column(de_cols)
+            per = f"{n_col} (precursors)" if n_col else "the protein's number of precursors"
+            w(f"- `PropObs`: {DE_COLUMNS['PropObs']}. It is limpa's rowMeans(n.observations) / "
+              f"{per} over **all runs of the study** — study-wide, not per comparison. **Never "
+              "tier hits by PropObs and never describe it as detection in either group of a "
+              "comparison.**")
+        source = ("the DE tables' `Evidence` column" if has_evidence else
+                  "the DE tables' `Detected_<group>` columns (k/n samples measured)" if det_cols else
+                  "Detection_Matrix.csv + conditions.csv (count each group's runs with the protein "
+                  "measured, > 0)" if has_detmat else None)
+        recorded_ev = has_evidence and bool(de_col_desc.get("Evidence"))
+        if source is None:
+            w("- Per-group detection is not available in this run — say so rather than guessing, "
+              "and do not sort hits into measured and detection-event tiers.")
+        else:
+            w(f"- Tier each hit by **per-group detection**, from {source}"
+              + ("" if has_evidence else
+                 ", sorted into the three categories run_de.R writes as `Evidence`") + ":")
+            w(f"  - **{ev_all}**"
+              + ("" if recorded_ev else " (measured in every run of every group in the contrast)")
+              + ": the fold change is a measured ratio;")
+            w(f"  - **{ev_none}**"
+              + ("" if recorded_ev else " (never measured in at least one group)")
+              + ": a detection event — present vs absent. Report presence, not the size of the fold "
+                f"change (the absent side is {zero_word});")
+            w(f"  - **{ev_part}**" + ("" if recorded_ev else " (every other case)")
+              + ": a measured ratio with gaps — give each group's k/n.")
+            if has_evidence and prov.get("not_measured"):
+                w(f"  - **{EVIDENCE[3]}**: measured only in other groups of the study, so NOT TESTED "
+                  "in that comparison (no logFC or p-value; left out of its BH correction). Never a "
+                  "hit, never a 'tested' protein: count tested proteins per comparison as the rows "
+                  "with a P.Value (`de_provenance.json` de_tables n_tested).")
+    w("")
+    if pulldown:
+        w("## Pull-down design — enrichment over a control")
+        w(f"Control group(s), by name: {', '.join(controls)}. Contrasts against them "
+          f"({', '.join(contrast_label(c) for c in vs_control)}) measure **enrichment over the "
+          "control**, not abundance change.")
+        w("- Do NOT write a blanket sentence such as \"the IgG value is a model-inferred floor\". "
+          "Name the proteins that were never measured in the control, per contrast:")
+        for c in vs_control:
+            ctrl = c.split("-", 1)[1]
+            f = next((x for x in de_files if x.endswith(f"_{_make_names(c)}.csv")), None)
+            res = never_in_control(a.de_dir, f, c, ctrl, adjp, det, det_groups) if f else None
+            w(f"  - {contrast_label(c)}: "
+              + ("detection in the control not recorded — say so." if res is None else
+                 f"{res[0]} significant enriched protein{'' if res[0] == 1 else 's'} never "
+                 f"measured in {contrast_label(ctrl)}"
+                 + (f" (top by adj.P: {', '.join(res[1])})" if res[1] else "") + "."))
+        w("- Background, not interactors: the antibody's own Ig heavy/light chains, "
+          "contaminant (`Cont_`) entries, and abundant ER proteins (" + ", ".join(ER_BACKGROUND)
+          + "). The HTML report's top-protein tables flag Ig chains and contaminants.")
+        w("")
+
+    # ---- figures ----
+    if figs or failed or fig_error:
+        w("## Figures — embed and interpret each one")
+    if fig_error:
+        w(f"**No figure list:** `{fdir_rel}/figures.json` {fig_error}, so no figures are listed "
+          "here. Do not embed image files by guessing their names; say in QC Assessment that the "
+          "figures are not available.")
+        w("")
+    if embed:
+        w(f"These publication-quality figures were generated for you in `{fdir_rel}/`. "
+          "**Embed every figure** in the relevant section using markdown image syntax "
+          f"(e.g. `![caption]({fdir_rel}/<file>)`) so it renders in the HTML report, "
+          "and **write an expert interpretation of what each shows for THIS dataset** — "
+          "not a generic caption. Available figures:")
+        for fig in embed:
+            w(f"- `{fdir_rel}/{fig['file']}` ({fig['type']}) — {fig['caption']}")
+        w("")
+        # where each figure goes, for the figures this run drew (figures.json types)
+        place = []
+        if "volcano" in types:
+            place.append("each volcano in **Key Findings Per Comparison**")
+        if qc_named:
+            place.append(" + ".join(qc_named) + " in **QC Assessment**")
+        if "heatmap" in types and heatmap_by_variance:
+            # make_figures.R's fallback: the most variable proteins, not the DE's -- its caption
+            # says it is no evidence of a group difference, so it is QC (C2 biologist L6)
+            place.append("the heatmap (the most variable proteins, chosen by variance, not by "
+                         "the DE test) in **QC Assessment**, never as evidence of a difference "
+                         "between groups")
+        elif "heatmap" in types:
+            place.append("the heatmap in "
+                         + ("**Specificity**" if pulldown else "**Cross-Comparison Biomarkers**")
+                         + " or **Biological Interpretation**")
+        others = [f["file"] for f in embed if f["type"] not in PLACED_TYPES]
+        if others:
+            place.append("the others (" + ", ".join(f"`{x}`" for x in others) + ") where their "
+                         "captions say they belong: a channel, mixing or QC figure in **QC "
+                         "Assessment**, a comparison's figure with that comparison")
+        w("Placement: " + "; ".join(place) + ".")
+        if any(f["type"] == "violin" for f in embed):
+            w(f"Place each `{fdir_rel}/violin_top_<contrast>.png` in that comparison's section, "
+              "right after its volcano. Call it the **top-protein plot**: a group with few runs "
+              "is drawn as its points and a mean bar, not a violin. Add one line on how to read "
+              "it, in its caption's words (filled points were measured in that run; the caption "
+              "says how unmeasured values are shown). Name every protein its subtitle flags as "
+              "never measured in one group: that fold change is a detection event (seen in one "
+              "group, not the other), not a measured magnitude, so do not quote its size as an "
+              "effect. If the figure says detection status was not recorded, say so; never "
+              "describe those points as measured.")
+        if legacy_pv:
+            w(f"The per-contrast p-value histograms (`{fdir_rel}/pvalue_<contrast>.png`) are a "
+              "calibration check, not findings: embed them together in a final "
+              f"`## {APPENDIX}` section, never in the per-comparison sections.")
+        if complete:
+            w(f"Do NOT embed, reference or describe a proteins-quantified-per-sample plot "
+              f"(`qc_protein_counts.png`): {complete_why}, so every sample shows the same "
+              f"count and the plot says nothing. Per-sample depth is the *detected* part of "
+              f"`qc_detected_vs_inferred.png`.")
+        w("")
+    for fig in appendix:
+        w(f"**Appendix figure — do not embed:** `{fdir_rel}/{fig['file']}` — {fig['caption']} "
+          f"The HTML report adds it as its last section (*{APPENDIX}*). In **QC Assessment**, "
+          "name any contrast whose histogram is not flat with a peak near 0 (skewed toward 1, "
+          "a hump mid-range or a U shape) and point the reader to the appendix; if all look "
+          "well calibrated, say so in one sentence.")
+        w("")
+    if failed:
+        w("**Not drawn in this run** (make_figures.R's `failed` list) — do not embed or refer "
+          "to these as images. Where the report would have used one, say in one line that it "
+          "is not available and why (the HTML report also lists them at the top):")
+        for f in failed:
+            w(f"- `{fdir_rel}/{f['file']}`" + (f" ({f['type']})" if f["type"] else "")
+              + (f" — {f['reason']}" if f["reason"] else " — no reason recorded"))
+        w("")
+
+    w("## OUTPUT — write `" + a.report_out + "` with ALL of these sections (markdown)")
+    w("Use markdown headers, tables for numbers, and embed the figures. Be scientific "
+      "but accessible. Reference specific proteins/genes throughout.")
+    w("")
+    w("### Overview")
+    w("Number of comparisons analyzed and the overall picture. The HTML report's **Results at "
+      "a glance** already shows significant / up / down per contrast (counted from the DE "
+      "tables) — **do not add a second per-contrast table**; refer to it. Overall assessment of "
+      "the experiment's quality, depth (proteins measured, not merely quantified), and scope.")
+    w("")
+    w("### QC Assessment")
+    qc_figs = [f["file"] for f in embed if f["type"] in ("pca", "qc")
+               or (f["type"] not in PLACED_TYPES and "channel" in f["type"])]
+    w("Evaluate technical quality. Use "
+      + (("the " + ", ".join(f"`{x}`" for x in qc_figs) + " figure(s), and ") if qc_figs
+         else "")
+      + "the QC metrics if present. Comment on consistency of identifications across "
+      "replicates and groups"
+      + (", whether replicates cluster" if "pca" in types else "")
+      + ", and flag any outlier samples or "
+      "systematic biases (e.g. a group quantifying far fewer proteins). State clearly "
+      "whether the data are fit for differential analysis.")
+    w("")
+    w("### Key Findings Per Comparison")
+    w("For each comparison: embed its volcano plot, then highlight the top up- and "
+      "down-regulated proteins **ranked by adj.P** (use gene names; give logFC, adj.P and each "
+      "group's detection, k/n measured)."
+      + ("" if own_reading else " Say which are detection events.")
+      + " Note any comparison with unusually few or many hits"
+      + (f", and name it if its p-value histogram (*{APPENDIX}*) looks miscalibrated — no "
+         "p-value figure in this section." if appendix or legacy_pv else "."))
+    w("")
+    if pulldown:
+        w("### Specificity: bait-specific, shared, background")
+        w("Sort the enriched proteins into three groups, naming them: **bait-specific** "
+          "(enriched over the control for one bait only), **shared across baits** (enriched for "
+          "two or more — complex partners, or common background), and **background** (Ig "
+          "chains, contaminants, abundant ER proteins). For each bait-specific or shared "
+          "protein, give its detection in the bait and control groups (k/n measured). Embed the "
+          "heatmap here if there is one.")
+        w("")
+    else:
+        w("### Cross-Comparison Biomarkers")
+        w("Proteins significant in several comparisons are worth listing, with their direction "
+          "in each (always up, always down, or mixed) — but being significant in many "
+          "comparisons is **not** by itself higher confidence: comparisons that share a group "
+          "(e.g. several treatments against one control) are not independent, so one noisy "
+          "shared group can make a protein \"significant everywhere\"."
+          + ("" if heatmap_by_variance or "heatmap" not in types else
+             " Embed the heatmap and use it to show which proteins drive the separation.")
+          + " (If there is only one comparison, say so.)")
+        w("")
+        w("### High-Confidence Findings")
+        if own_reading:
+            w("Pick the strongest findings by the reading rule above, not by fold change"
+              + (f"; where you quote reproducibility, {spread}" if spread else "")
+              + ". Discuss known functions and pathway involvement of the genes you recognize.")
+        else:
+            w("Pick the strongest findings by the tier rule above — significant AND measured in "
+              "both groups first — not by fold change. Where you quote reproducibility, use the "
+              "CV from measured values only. Discuss known functions and pathway involvement of "
+              "the genes you recognize, and state for each whether it is a measured change or a "
+              "detection event.")
+        w("")
+    if has_gsea:
+        w("### Pathway & Gene Set Enrichment Analysis")
+        # gseGO / fgsea permute GENES: they treat a set's proteins as independent -- the flaw
+        # that keeps limma's geneSetTest out of run_sets.R (Dog CSF, 2026-09-21)
+        w("The GSEA file comes from gene-permutation GSEA (gseGO / fgsea), which treats a set's "
+          "proteins as independent: co-regulated proteins are not, so its p-values are too small "
+          "for exactly the sets that matter.")
+        if sets_rec:
+            w("Do not summarise it as findings, and do not put it beside the protein-set tests as "
+              "if it were a second test: the protein-set tests (camera + fry, above) are the "
+              "result. Mention the GSEA file at most as exploratory, with that caveat.")
+        else:
+            w("Summarise it only as exploratory, with that caveat stated: the top pathways by "
+              "|NES|, each connected to the DE proteins it rests on. Never as a finding on its own.")
+        w("")
+    if sets_rec:
+        fdr_rec = ((sets_rec.get("settings") or {}).get("fdr") or {}).get("value")
+        w("### Protein-set tests")
+        w("The HTML report adds its own 'Protein-set tests' section from `sets_provenance.json` "
+          "(counts, the sets significant in both tests, the pulldown table, the methods). In your "
+          "text, interpret; do not re-tabulate. Per comparison, from the `Sets_*.csv` tables "
+          f"(significant = FDR < {fdr_rec if fdr_rec is not None else 'not recorded'}):")
+        w("- start from the record's own reading of each comparison (below): use its words, and "
+          "do not make it stronger — 'not detectable in this design' never becomes 'unchanged', a "
+          "broad shift that cannot be separated from run depth never becomes a named signature, "
+          "and where camera has little power its count of zero is not a finding;")
+        w("- lead with sets significant in BOTH camera and fry that hold with run depth in the "
+          "model, whose fry call holds on every reference basis and that are not mostly presence "
+          "calls; name their proteins from the DE table;")
+        w("- a one-test result is reported as such (which test, and what that means below), never "
+          "as a pathway finding.")
+        w("The record's reading of each comparison:")
+        for cn, c in (sets_rec.get("contrasts") or {}).items():
+            if c.get("reading"):
+                w(f"- {contrast_label(cn)}: {c['reading']}")
+        for b, r in ((sets_rec.get("pulldown") or {}).get("baits") or {}).items():
+            for cn, c in (r.get("contrasts") or {}).items():
+                if c.get("reading"):
+                    w(f"- {b}, relative to its complex, {contrast_label(cn)}: {c['reading']}")
+        if (sets_rec.get("pulldown") or {}).get("direction_bias"):
+            w("Relative to a bait's complex, what is not found is not evidence of no loss: "
+              + sets_rec["pulldown"]["direction_bias"] + " Never write that the complex lost nothing.")
+        w("Read them by run_sets.R's own rules:")
+        for rule in sets_rec.get("reading") or []:
+            w(f"- {rule}")
+        w("")
+    w("### Biological Interpretation")
+    w("Synthesize what biological processes or pathways are affected based on the protein "
+      "lists. Name well-known protein families, complexes, or signaling cascades that are "
+      "represented. If the data tell a coherent biological story, describe it — and state "
+      "your confidence and the caveats (sample size, missingness, single comparison, etc.).")
+    w("")
+    w("### How This Analysis Works")
+    w("Write an educational background a biologist with no MS/bioinformatics background "
+      "can follow, using analogies. Cover, in plain language:")
+    w("- **LC-MS/MS**: proteins are digested into peptides, separated by liquid "
+      "chromatography (sorting by 'stickiness'), then ionized and weighed; MS1 measures "
+      "intact peptide mass, MS2 fragments them to read the sequence.")
+    if is_dia:
+        w("- **Data-Independent Acquisition (DIA)**: vs DDA (picks the loudest signals one "
+          "at a time), DIA systematically scans all peptides in m/z windows every cycle — "
+          "more complete, reproducible quantification; it needs specialized software to "
+          "deconvolve the complex spectra.")
+        if engine == "diann":
+            w("- **DIA-NN**: turns the raw DIA data into protein quantities per sample, using "
+              "neural networks to score identifications and a library-free predicted spectral "
+              "library (it predicts what peptides should look like rather than needing a "
+              "pre-built library).")
+    else:
+        w("- **Data-Dependent Acquisition (DDA)**: the instrument repeatedly picks the most "
+          "abundant precursors to fragment, which under-samples low-abundance peptides and "
+          "makes quantification less reproducible run-to-run.")
+        if engine == "sage":
+            w("- **Sage**: a very fast database search engine that matches each MS2 spectrum to "
+              "peptides from the FASTA, with target-decoy FDR control and label-free quant.")
+    if prov.get("plain_language"):
+        # the pipeline's own words for itself (build_maxlfq.R descriptor), never a guess from
+        # the --method flag: a Sage DE runs --method maxlfq and is not MaxLFQ
+        w(f"- {prov['plain_language']}")
+    elif method == "dpc":
+        w("- **LIMPA / limma (DPC-Quant)**: limma borrows information across all proteins for "
+          "better variance estimates (empirical Bayes moderation), which is powerful with the "
+          "few replicates typical in proteomics; limpa adds a detection-probability model so "
+          "missing precursors are modelled rather than imputed or dropped.")
+    elif method == "maxlfq":
+        w("- **MaxLFQ + limma**: MaxLFQ reconstructs protein quantities from peptide signals; "
+          "limma then tests for differences with empirical-Bayes-moderated statistics. Missing "
+          "values are left in place and handled per protein.")
+    w("- **Key statistical concepts** — define each in plain language with an example from "
+      "THIS dataset:")
+    w("  - **log2 fold change (logFC)**: how much a protein goes up/down between groups "
+      "(logFC 1 = doubled, −1 = halved).")
+    w("  - **p-value**: if the protein did not truly change, the probability of a difference "
+      "at least this large from measurement noise alone.")
+    w("  - **adjusted p-value (FDR, Benjamini–Hochberg)**: p-values corrected for testing "
+      "thousands of proteins at once — BH within each contrast; explain the multiple-testing "
+      "problem with an intuitive coin-flip example.")
+    w("  - **volcano plot**: why it's volcano-shaped and how to read it (x = effect size, "
+      "y = significance).")
+    if spread:
+        w(f"  - **reproducibility**: {spread}.")
+    else:
+        w("  - **coefficient of variation (CV)**: SD / mean on the linear scale, from measured "
+          "values only — lower is more reproducible; an inferred value is not a measurement.")
+    w("  - **normalization**: why raw intensities need correcting (sample loading differences) "
+      "and, briefly, how this pipeline normalizes.")
+    w("Keep the tone approachable and encouraging; define jargon when unavoidable.")
+    w("")
+    w("### Methods (publication-ready) & Reproducibility")
+    w("Write a concise Methods paragraph in third-person past tense suitable for a journal, "
+      "drawn from `methods.txt` and `de_provenance.json`: the search engine + version, FASTA "
+      "database, enzyme/missed cleavages and modifications if available, mass-accuracy "
+      "settings, FDR threshold, quantification method, normalization, the statistical test, "
+      "and multiple-testing correction. Cite the pipeline appropriately (the citation above).")
+    if is_dia and engine == "diann":
+        w("Cite DIA-NN (Demichev et al., Nature Methods, 2020).")
+    w("Note that a full reproducibility bundle accompanies this analysis "
+      "(`output/reproducibility/`): which skill produced it and how it was installed, a "
+      "pinned conda environment lock, R sessionInfo, exact tool versions, input/output "
+      "checksums, and a runnable `reproduce.sh`. State that the analysis was produced by the "
+      "**UC Davis Proteomics Core pipeline** Claude skill and can be reproduced from that "
+      "bundle (see `reproducibility/REPRODUCE.md`).")
+    w("")
+    w("### Next steps")
+    if own_steps:
+        w("Close with what to do next, using the pipeline's own tiers (as recorded in "
+          "`de_provenance.json`), and name the proteins in each (top few by adj.P):")
+        for i, step in enumerate(own_steps, 1):
+            w(f"{i}. {step.strip()}")
+    else:
+        w("Close with what to do next, using this explicit tier rule (the detection categories "
+          "above), and name the proteins in each tier (top few by adj.P):")
+        w(f"1. **Follow up first** — significant and *{ev_all}*: a measured ratio.")
+        w(f"2. **Check the counts** — significant and *{ev_part}*: give each group's k/n; those "
+          "measured in most runs of both groups come first.")
+        w(f"3. **Confirm presence** — significant with a *{ev_none}*: a detection event; confirm "
+          "with an orthogonal method (western, targeted MS) before quoting a fold change"
+          + (" — for a pull-down, these are the interactor candidates, those seen in most bait "
+             "runs first." if pulldown else "."))
+        w("Whatever its tier, a hit measured in fewer than half the runs of every group is a "
+          "lead only.")
+    w("Then point the reader to `README.html` at the top of the results folder for where every "
+      "file is and how to reuse them.")
+    if a.instrument:
+        w("")
+        w("### Instrument & Acquisition")
+        w(f"Instrument detected: **{a.instrument}**. Write a short Sample Preparation & Data "
+          "Acquisition note (instrument model, acquisition type) for the Methods, in "
+          "third-person past tense.")
+    w("")
+    brief_footer(w, a, "Embed every figure. ")
+    write_brief(a, L, unread_at)
+
+    print(json.dumps({
+        "prompt": os.path.abspath(a.out),
+        "report_to_write": a.report_out,
+        "engine": engine, "engine_version": eng_ver, "acquisition": acq, "de_method": method,
+        "de_files": de_files, "contrasts": contrasts,
+        "figures": [f["file"] for f in figs], "n_figures": len(embed),
+        "figures_appendix": [f["file"] for f in appendix],
+        "figures_failed": [f["file"] for f in failed], "figures_error": fig_error,
+        "has_qc": has_qc, "has_gsea": has_gsea, "records_unreadable": dict(_UNREADABLE),
+        "next": f"Read {a.out} + the data files + figures, then write {a.report_out} "
+                f"(ALL sections, embed all {len(embed)} figures, expert interpretation), "
+                "then render it with make_analysis_html.py into Analysis_Report.html "
+                "(no Word copy of the report).",
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

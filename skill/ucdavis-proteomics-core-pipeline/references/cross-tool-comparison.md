@@ -1,0 +1,222 @@
+# Comparing two search engines — the method, not just the script
+
+`make_comparison_report.py` regenerates the artifact. This file records **how to reach a
+defensible answer**, and the interpretation patterns that a bake-off keeps producing.
+Written after the first real DIA-NN vs FragPipe/diaTracer comparison (9 mouse dia-PASEF
+files); every pattern below was actually observed in that data.
+
+<!-- contents: tests/test_skill_structure.py --toc -->
+**Contents** (section: line)
+- 20: Get the design right before computing anything
+- 47: Interpretation patterns that recur
+- 93: Building the report
+- 115: Charts: load the `dataviz` skill first
+- 140: Deliver the HTML
+- 145: 4b. Offering the bake-off (step 4b)
+- 158: 11a. Comparing two searches of the same files (step 11a)
+- 183: 11c. The cross-tool report (step 11c)
+<!-- /contents -->
+
+## Get the design right before computing anything
+
+**Run both engines through the SAME downstream pipeline.** Identical `run_de.R --method`,
+identical contrasts, identical thresholds. Otherwise you are comparing search × DE
+method and cannot attribute the difference. `run_de.R --format tsv` reads a FragPipe
+`report.tsv` directly, and a `conditions.csv` written for the DIA-NN route works
+unchanged because the `Run` column carries the original `.d` basenames.
+
+**Name every uncontrolled difference out loud, in the report, not just in your head.**
+The big one for this pair: FragPipe 24 bundles **DIA-NN 1.8.2 beta 8** while the
+`diann_*` workflows pin **2.x**. Both routes end in DIA-NN, so part of any gap is two
+major versions of quant engine, not the approach under test. A head-to-head that omits
+this silently attributes version lag to the method. State it: the skill's FragPipe searches
+always quantify with FragPipe's bundled DIA-NN, so the gap cannot be controlled within the skill
+(`references/search-engines.md`, "FragPipe's DIA quantification is its bundled DIA-NN").
+
+**Compare at both levels; they answer different questions.**
+
+| Tool | Question it answers |
+|---|---|
+| `compare_searches.py` | What did each engine *find*, in how many runs, how reproducibly |
+| `compare_analyses.R` | Which proteins actually come out *changed* |
+| `QC_detected_vs_inferred.csv` (both sessions) | How much of each matrix was *measured* vs modelled |
+
+A search-level win does not imply a DE-level win. In the reference case DIA-NN found 20%
+more protein groups yet **lost** the subtle contrast on DE count.
+
+## Interpretation patterns that recur
+
+### More precursors, fewer proteins → protein inference, not sensitivity
+diaTracer identified up to **25% more precursors** than DIA-NN on the weakest samples
+while returning **fewer protein groups in every run**. That combination is not "detected
+less" — it is a parsimony difference (ProteinProphet collapsing shared peptides vs
+DIA-NN's own grouping). Always check precursor counts alongside protein counts before
+calling one engine less sensitive. Reporting only the protein number inverts the story.
+
+### logFC correlation vs intensity correlation → how far to trust magnitude
+Intensity agreement on shared proteins was r = **0.879**; fold-change agreement was only
+**0.637–0.718**. Ratios amplify disagreement because the errors do not cancel when you
+divide. When intensity r is high and logFC r is much lower, the honest statement is:
+**direction is trustworthy, magnitude is engine-dependent.** Report both correlations —
+quoting only the intensity one overstates agreement.
+
+### Effect size determines how much the engine matters
+On a large contrast (Urea vs Beads) 708 of 1,866 DE calls overlapped. On a subtle one
+(S-Trap vs Beads) only **91 of 382** did — two-thirds of that DE list depended on which
+engine ran. **The weaker the effect you are chasing, the more the search engine
+determines your answer.** Say this explicitly when the study's contrast is subtle; it is
+the difference between "engine choice is a detail" and "engine choice is the result".
+
+### Read the 3×3 matrix by cell type
+- **Diagonal** (Up/Up, Down/Down, NS/NS) — agreement.
+- **NS ↔ significant** off-diagonals — *detection* differences. Almost always where the
+  disagreement lives, and the benign kind.
+- **Up ↔ Down corners** — genuine direction disagreement. Should be near-empty; 9 of 708
+  in the reference case. A populated corner is a red flag, not a curiosity.
+
+### Completeness advantage tends to track sample quality
+diaTracer's detected fraction was 5–7 points higher on all three urea (worst) runs and
+*lower* on the strongest S-Trap runs. An empirical library built from the data helps most
+where signal is scarce. Break the QC panel down by sample quality rather than reporting a
+single mean — the mean hides the pattern that explains the mechanism.
+
+### Protein-group identifiers are not perfectly comparable across tools
+`compare_searches.py` compares each group on its first accession, without the FASTA header
+around it or an isoform suffix (`protein_ids.normalize_protein_id`): DIA-NN's `P12345;Q67890`,
+FragPipe's `P12345` and Sage's `sp|P12345|ALBU_HUMAN` are all `P12345`. Before this, a FragPipe
+DDA search shared 0 proteins with DIA-NN on the same files. That fixes the spelling, not the
+grouping: different parsimony rules mean a protein can appear "unique to engine X" purely because
+it was merged into a differently-named group. Some fraction of every unique list is
+grouping, not detection. **Warn about this before anyone reads biology into a unique
+set**, and check per-protein claims at peptide level first.
+
+## Building the report
+
+Follow the structure DE-LIMP's Run Comparator prompt defines
+(DE-LIMP's `https://github.com/bsphinney/DE-LIMP/blob/main/docs/AI_PROMPTS.md` §1) — `make_comparison_report.py` emits it as a skeleton:
+
+1 Factual Observations · 2 Sources of Disagreement · 3 Case for A · 4 Case for B ·
+5 Settings Audit · 6 Concordant Proteins · 7 Synthesis · 8 Recommended Follow-ups
+
+Its guidelines are load-bearing, not decoration:
+
+- **Neither tool is inherently superior.** Sections 3 and 4 exist so you argue *both*
+  sides properly before section 7 weighs them. Write 3 and 4 before you know your verdict.
+- **Every claim carries a number from the data or a literature citation.**
+- **Label speculation** — "one possible explanation is…", never stated as fact.
+- **If the evidence does not clearly favour one tool, say so.** Do not force a
+  recommendation. The reference case concluded *complementary, not ranked*, and that was
+  the correct answer, not a hedge.
+- Section 8 wants **one follow-up probing each pipeline** — not two aimed at the same tool.
+
+**The generator writes the numbers; you write the judgement.** Fill each `TODO(model)`
+block from the data. Never invent a figure to complete a sentence.
+
+## Charts: load the `dataviz` skill first
+
+The HTML template's palette and mark choices are not taste — they came from the dataviz
+method, and a future chart must re-derive them the same way:
+
+- **Run the validator, don't eyeball it.** The dataviz skill's palette validator (its
+  `validate_palette.js`, when that skill is installed): `"<hex,hex>" --mode light` and again
+  `--mode dark`. The two-series pair shipped in `make_comparison_report.py`
+  (`#2a78d6` / `#eb6834` light, `#3987e5` / `#d95926` dark) passes all six checks in both
+  modes. Changing a colour obliges re-running it.
+- **Form follows the data's job.** Grouped bars for magnitude across categories;
+  **dumbbell** for two paired values per sample (it shows the *gap*, which is the point,
+  and needs one row per sample rather than two); a **sequential single-hue ramp** for
+  counts in the 3×3 matrix, with agreement cells on the accent hue and direction-flip
+  cells on the warning hue so the eye lands on the cell that matters.
+- **Hover by default.** An HTML chart is interactive; every mark gets a tooltip naming
+  the run, the value, and what the cell *means* ("both agree", "OPPOSITE DIRECTION").
+- **Theme-aware under both scopes** — the `prefers-color-scheme` media query and the
+  `data-theme` attribute, so a viewer's toggle wins either way. Redraw the SVGs on toggle;
+  CSS variables alone will not repaint canvas-computed geometry.
+- **Colour is never the only encoding** — legend always present for two series, direct
+  value labels beside the marks.
+- Self-contained: no CDN, no external fonts, inline SVG. It has to open from a file path
+  on a cluster with no browser network access.
+
+## Deliver the HTML
+
+`COMPARISON_REPORT.html` is the report: one self-contained page. No Word copy is made — Word
+mangled the figures (2026-09-24) — and `COMPARISON_REPORT.md` is the same text for editing.
+
+## 4b. Offering the bake-off (step 4b)
+
+After they pick, **offer the bake-off**: run two or three routes on the same files
+and compare which performed better. Say roughly what it costs (each route is a full
+search; Radiant is **serial** across files) so it's an informed choice.
+
+If they accept: run each route into its **own session**, then compare with
+`compare_searches.py` + `make_comparison_report.py` (step 11c). **Hold everything
+except the search constant** — same FASTA, same organism, same conditions, and push
+every engine's report through `run_de.R` with identical `--method`, contrasts, and
+thresholds, so the search is the only variable. Name the version gap out loud:
+FragPipe 24 bundles DIA-NN 1.8.2 beta 8, two majors behind what `diann_*` pins.
+
+## 11a. Comparing two searches of the same files (step 11a)
+
+When the same raw files have been searched more than once — DIA-NN library-free vs
+FragPipe/diaTracer, two engine versions, two parameter sets — compare the **searches**,
+not just the DE tables:
+
+```
+python3 scripts/compare_searches.py --out <session>/output/search_comparison --q 0.01 \
+  --search "DIA-NN:<sessA>/output/search/report.parquet" \
+  --search "diaTracer:<sessB>/output/search/report.parquet"
+```
+
+Writes `SEARCH_COMPARISON.md` + CSVs: protein groups and per-run depth, how many proteins
+survive in **every** run, median CV across runs, the shared/unique split with Jaccard, and
+the per-run correlation of log2 intensity on shared proteins. Unique-to-one-search proteins
+are listed in full.
+
+**Do not report "engine X found more proteins" as the verdict.** Depth, completeness and CV
+have to be read together — a search can identify more while quantifying them less
+reproducibly or in fewer runs. Two caveats to state whenever you present this: the CV is
+computed across all runs with no group labels, so it only measures precision when those runs
+are replicates; and the comparison assumes protein-group identifiers are comparable, which
+fails if the searches used different FASTAs or inference rules. Then run 11b on the DE output
+to see whether any of it changes which proteins come out significant.
+
+## 11c. The cross-tool report (step 11c)
+
+Comparing two search engines on the same raw files is a distinct deliverable from a DE
+re-analysis. `compare_searches.py` compares the SEARCHES (what each found, in how many
+runs, how reproducibly); `compare_analyses.R` compares the finished DE TABLES (which
+proteins actually change). Run both, then build the report:
+
+```
+python3 scripts/make_comparison_report.py --out <session>/output/comparison_report \
+  --search-comparison <dir from compare_searches.py> \
+  --de-comparison     <dir from compare_analyses.R> \
+  --qc "EngineA:<sessionA>/output/tables/QC_detected_vs_inferred.csv" \
+  --qc "EngineB:<sessionB>/output/tables/QC_detected_vs_inferred.csv" \
+  --instrument "<detected instrument>" --title "<A> vs <B>"
+```
+
+(No Word copy of the comparison report: the HTML/Markdown it writes is the report.)
+**Read the sections above BEFORE interpreting the output** — they hold
+the design rules (both engines through the same DE pipeline; name every uncontrolled
+difference) and the interpretation patterns a bake-off keeps producing: more precursors
+with fewer proteins means protein *inference*, not sensitivity; a high intensity r with a
+much lower logFC r means direction is trustworthy and magnitude is not; and the subtler
+the contrast, the more the engine choice decides the answer. They also say to **load the
+`dataviz` skill and re-run its palette validator** before changing any chart.
+
+It emits an **interactive standalone HTML** (metric toggles, hover tooltips, a 3x3
+concordance matrix, sortable tables, theme-aware, no CDN) plus a markdown skeleton in
+the section order DE-LIMP's Run Comparator prompt defines — `https://github.com/bsphinney/DE-LIMP/blob/main/docs/AI_PROMPTS.md` §1:
+Factual Observations, Sources of Disagreement, Case for A, Case for B, Settings Audit,
+Concordant Proteins, Synthesis, Follow-ups. **The generator writes every number; you
+write the judgement** — fill each `TODO(model)` block from the data and never invent a
+figure. Follow the prompt's guidelines: neither tool is inherently superior, every claim
+carries a number or a citation, speculation is labelled as such.
+
+**To compare engines fairly, run BOTH through the same DE method.** Push each engine's
+report through `run_de.R` with identical `--method`, contrasts and thresholds, so the
+search is the only variable. `run_de.R --format tsv` reads a FragPipe `report.tsv`
+directly. Also state any engine-VERSION gap out loud — FragPipe 24 bundles DIA-NN
+1.8.2 beta 8, two majors behind what the `diann_*` workflows pin, and that alone moves
+the numbers.

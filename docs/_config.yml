@@ -1,0 +1,4 @@
+# GitHub Pages: Settings -> Pages -> Deploy from a branch -> main, folder /docs.
+# The HTML pages have no front matter, so Jekyll copies them unchanged (as in DE-LIMP).
+title: "UC Davis Proteomics AI Skill"
+description: "The UC Davis Proteomics Core pipeline, as a skill for Claude."

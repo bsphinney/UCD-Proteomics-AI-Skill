@@ -1,0 +1,218 @@
+# Anomaly checks, expert review & analysis principles
+
+The UC Davis Proteomics Core's data-analysis methodology, ported into the skill. Apply
+it during **step 8c (audit)** and **step 9 (write the report)**. `audit_results.py` and
+`sample_quality.py` automate the deterministic checks; **you apply the judgment branches
+below** on the tables/figures you already have. Anything you flag goes into the report's
+**Data Quality Notes** section and — if it changes a conclusion — is surfaced to the user
+immediately, not buried.
+
+<!-- contents: tests/test_skill_structure.py --toc -->
+**Contents** (section: line)
+- 20: Core principles
+- 37: Anomaly-check decision tree — run only the branches that apply
+- 79: Contamination diagnostics — `sample_quality.py`
+- 145: Conditional expert review — spawn only on triggers
+- 185: Collaborator deliverable — 3 reproduction options
+- 193: 8d. The expert review (step 8d)
+<!-- /contents -->
+
+## Core principles
+
+- **Ask before assuming.** Experimental design, instrument, organism, reagents, and the
+  biological question are confirmed with the user *before* analysis. Filenames are not
+  authoritative ("SM2"/"SM4" could be cross-linkers, samples, or instruments). A 30-second
+  clarification prevents hours of rework. (This is golden rule #1 — it applies here too.)
+- **Verify tool flags against the binary, not memory.** Order of trust: `tool --help` on
+  the exact binary → official docs for the exact version → source → third-party guides.
+  Don't assume a flag exists because a sibling tool has it.
+- **Flag anomalies as they appear**, in a **5-part format**: *what* (the specific anomaly)
+  · *where* (rows/columns/files/samples) · *why it matters* (impact on the result) ·
+  *likely cause* · *suggested fix*.
+- **Trust observation over documentation.** If a path/convention here conflicts with what
+  `ls`/`head`/the file shows, trust the file.
+- **Every report gets a "Data Quality Notes" section**, even if it just says "nothing
+  anomalous observed."
+
+## Anomaly-check decision tree — run only the branches that apply
+
+**Always (any dataset):**
+- Missing values — pattern (random vs. systematic per condition), count per sample,
+  unexpected NAs. *(automated: `audit_results.py` missingness)*
+- Intensity distributions — one sample far off in median/spread ⇒ failed injection or
+  loading error. *(judgment: read the signal-distribution / per-sample figures)*
+- Identifier sanity — organism match, deprecated accessions, mixed naming, duplicate IDs.
+- Contaminants in the top-20 by intensity (keratin, trypsin autolysis, BSA) ⇒ prep issue.
+  *(automated: `audit_results.py` contamination; deeper: `sample_quality.py`)*
+- File-format sanity — delimiter, encoding, column-count consistency, header alignment
+  across files meant to be compared.
+
+**If multiple files / conditions:**
+- Replicate ID overlap < 60%, or between-condition overlap < 40% ⇒ investigate before DE.
+- Systematic mass / RT / CCS shifts between files ⇒ different reagent or method, **not**
+  biology — flag immediately.
+- **Batch confounded with condition** (all treatment day 1, all control day 2) ⇒ DE is
+  invalid. *(automated: `audit_results.py` confounding — a FAIL)*
+- Unbalanced group sizes (e.g. 5 vs 2) ⇒ note the power implication. *(automated: group_balance)*
+
+**If statistical testing (DE, enrichment):**
+- P-value distribution shape — flat = no signal; spike at 0 **and** 1 = model problem.
+- Largest fold-changes all in low-abundance proteins ⇒ noise-driven.
+- log2FC > 5 in a non-knockout experiment ⇒ probably imputation or single-replicate artifact.
+- No FDR correction reported ⇒ flag.
+- PCA/MDS shows a sample clustering with the wrong group ⇒ possible **sample swap** — flag
+  immediately. *(judgment: read the PCA figure vs. conditions)*
+- ORA/GSEA without an explicit background ⇒ inflated significance.
+
+**If XL-MS:** bridge mass consistent across files? (same pair, different mass = different
+cross-linker) · decoy-implied FDR > ~10% is too hot even for XL-MS · one lysine in
+disproportionately many links = hyperreactive site, not many true contacts · structure-mapped
+distance violations > 30% = problem.
+
+**If phospho / PTM:** localization probability < 0.75 ⇒ don't report as confidently
+assigned · non-phosphopeptides dominant ⇒ enrichment failed · known active-pathway sites
+absent ⇒ sanity-check the experiment.
+
+**If non-model organism:** using human/mouse GO/KEGG without ortholog mapping ⇒ annotation
+mismatch (map orthologs first).
+
+## Contamination diagnostics — `sample_quality.py`
+
+Beyond lab contaminants (keratin/trypsin), the **sample-level biological contaminations**
+that repeatedly produce wrong-but-plausible DE:
+```
+python3 scripts/sample_quality.py --matrix de_results/Expression_Matrix.csv \
+    --conditions conditions.csv --report search_out/report.parquet --out SAMPLE_QUALITY.md
+```
+- **HEMOLYSIS** (plasma/serum RBC lysis: hemoglobin, carbonic anhydrase, catalase,
+  peroxiredoxin, spectrin) — drove artefactual plasma DE in real cases.
+- **SKELETAL_MUSCLE** (muscle debris in a non-muscle biopsy: myosins, troponins, CK-M,
+  myoglobin) — in one cow-liver study, uniform muscle contamination of one breed's biopsies
+  produced 3,045 "DE" proteins that were contamination, not biology.
+- **EPIDERMIS** (skin/hair squames).
+
+The panels are human gene symbols matched case-insensitively, which covers mouse and rat
+for every marker except the adult globins (mouse `Hba`/`Hbb-bs`/`Hbb-b1`…, rat
+`Hba-a*`/`Hbb-b1`/`Hbbl1`): those come from `PANEL_ORTHOLOGS`, keyed on the organism's taxid
+(from `--fasta-meta`, or `--taxid`). Read each panel's `status`:
+- `assessed` — markers matched; the z scores mean something.
+- `none_detected` — this panel matched nothing but others did, for an organism whose names
+  are verified: a real absence at the depth reached.
+- `not_run` — **no** panel matched anything: the gene names did not match (no Genes
+  column, or an organism the table does not cover). "0 detected" then says nothing about
+  contamination — say the check could not run, never "no contamination".
+- `none_detected_unverified` — an organism outside human/mouse/rat: may be a naming mismatch.
+
+`Cont_`-tagged markers (bovine serum haemoglobin from an antibody prep, skin keratins) are
+listed as **contaminant, not sample** and never scored — including the ones `run_de.R`
+already removed (read from `contaminants_removed.csv` via `de_provenance.json`). Report them
+in the Data Quality Notes as a reagent/handling contamination, not as hemolysis.
+
+It scores each panel per sample (z across samples) and checks whether the score is
+**confounded with group** — a permutation test of the one-way between-group F statistic
+(9,999 relabellings, flagged at p < 0.01; `confound_p` in the JSON). It replaced a rule that
+compared only the highest and lowest group means, whose spread grows with the number of
+groups: on a 10-group design it flagged every panel by chance. With too few samples for any
+relabelling to reach 1% (3 vs 3), complete separation of the extreme groups is reported
+instead, and labelled so. Two hard-won lessons it encodes:
+- **A contamination panel that separates the groups is the danger signal** — DE between
+  those groups may be the contamination gradient. **Protein-level marker removal does NOT
+  fix a confounded contrast** (dropping muscle markers once *increased* the DE count); the
+  fix is at the sample/design level (drop/flag the confounded samples, or model it).
+- **The limpa/DPC-Quant "complete matrix" depth trap:** a DPC-Quant expression matrix has
+  ~no NAs (the detection model fills every cell), so counting non-empty cells gives a
+  **constant**, not per-sample depth. Real depth = detected protein groups per run
+  (`--report report.parquet`).
+
+### ⚠ Keratin-matrix samples — keratin is the ANALYTE, not a contaminant
+
+For **nail, hair, wool, skin, feather** (and other epidermal/keratinaceous) samples,
+keratins (KRT/KRTAP) are *what you are measuring* — **never flag them as contamination.**
+It is decided at SKILL.md step 3, before the database is built: `fetch_fasta.py fetch
+--keratin-sample` removes the keratin-family `Cont_` entries (left in, run_de.R's contaminant
+filter, and for DIA-NN also its `--cont-quant-exclude Cont_`, take the sample's keratin
+peptides out of quantification), `run_search.py --keratin-sample` refuses a database that
+still holds them, and the sidecar's `keratin_sample: true` reaches run_de.R and both auditors.
+With that sidecar as `--fasta-meta` (or `--keratin-sample` for a database that does not record
+it), the EPIDERMIS/keratin panel of `sample_quality.py` is reported for QC but excluded from
+contamination flags, and `audit_results.py` stops warning on KRT/KRTAP/keratin
+(trypsin/casein/BSA are still flagged).
+The generic "contaminants in the top-20 by intensity (keratin, trypsin, BSA)" check means
+prep contamination **only for non-keratin matrices**; on a keratin sample, keratin at the
+top is expected biology. (Blood/hemolysis and muscle panels still apply — a nail sample
+can still be blood-contaminated.)
+
+## Conditional expert review — spawn only on triggers
+
+Most analyses don't need a review panel. Spawn one when **any** trigger fires:
+- the session produces a **statistical claim going to a collaborator** (DE, enrichment,
+  interaction claims);
+- any **log2FC > 5** or **p < 1e-10** is reported;
+- a **new organism, instrument, or reagent** combination for this project;
+- **cross-tool discordance** surfaced (DIA-NN vs. Spectronaut, etc.);
+- the user asks for review.
+
+When triggered, spawn **three agents in parallel** (one message, three `Agent` calls),
+each given the report + input/output paths + experimental context. Each returns a bulleted
+list of *issue · severity (critical/warning/note) · suggested action*:
+- **Proteomics reviewer** — search-output interpretation, FDR/decoy handling, quantification
+  fit, instrument-specific artifacts, mass/RT/CCS consistency, acquisition-vs-processing match.
+- **Biology reviewer** — do the results make sense for this sample/organism? Expected proteins
+  present? Contradictions with known biology? **Could contamination explain the finding?**
+- **Statistics reviewer** — normalization fit, multiple-testing correction, confounding /
+  pseudoreplication, sample size, missing-value handling, test choice, PCA/MDS for swaps.
+
+Consolidate (dedupe, sort by severity) into a **`## Expert Review Notes`** section of the
+report; surface every **critical** issue to the user before finalizing.
+
+**Write it for a reader who never saw a draft.** The client receives only the finished report,
+so Expert Review Notes are not a changelog. For each point state, in the present tense, what
+was checked and where the report deals with it: "The statistics review checked whether the
+loading difference between groups explains the shift; it does not (Data Quality Notes)."
+Never draft history: "checked the first draft", "two protein names were wrong and have been
+corrected", "the categories were corrected", "an earlier version", "the report now says". It
+confuses a non-MS reader and makes a sound result look shaky. The review → fix history (what
+each reviewer found, what changed and why) goes in the staff-only `logs/decisions.md`
+(`log_decision.py`). The same applies to every other section, the audit and the podcast;
+`make_analysis_html.py` warns on the phrases (`scripts/client_text.py`, one list) and
+`make_podcast.py check` fails on the unambiguous ones and warns on the rest. **Skip review** for
+format conversion, single-column extraction, exploratory looks with no formal report, FASTA
+prep, and annotation correction against a single reference.
+
+(These three lenses also match the release-review agents the project runs; here they are
+gated to per-analysis triggers rather than run every time.)
+
+## Collaborator deliverable — 3 reproduction options
+
+The reproducibility bundle (step 10) is mandatory; when the deliverable is collaborator-facing,
+its `REPRODUCE.md` should offer **three** explicit paths: **(A)** re-fit the statistics only,
+**(B)** re-render every figure and rebuild the report, **(C)** inspect the raw data without
+re-running anything — plus background, headline findings, next steps, provenance (cluster
+paths/md5 for raw `.d`/`.raw`), and a contact email.
+
+## 8d. The expert review (step 8d)
+
+Most analyses don't need a panel. If **any** trigger fires — a statistical claim goes to a
+collaborator; any `log2FC > 5` or `p < 1e-10`; a new organism/instrument/reagent; cross-tool
+discordance; or the user asks — spawn **three reviewers in parallel** (one message, three
+`Agent` calls; each gets the report + data paths + context): **proteomics**, **biology**
+("could contamination explain this?"), **statistics**. Tell each to also write its findings to
+`<S>/logs/review_<proteomics|biology|statistics>.md` (hive_remote: locally, then `hive_exec.sh
+--put` it there) and to name that file in its answer: a
+review then survives a hand-back that fails (it has), and stays with the analysis record
+(`logs/` is Core-internal, never delivered). Consolidate their findings (dedupe,
+sort by severity) into a `## Expert Review Notes` section and surface every **critical**
+issue to the user before finalizing. Skip for format conversion / FASTA prep / exploratory
+looks with no formal report.
+**The client never saw a draft, so the deliverables carry no draft history.** Expert Review
+Notes state, in the present tense, what was checked and where the report deals with each
+point ("The review checked the protein names against UniProt (Key Findings) and whether a
+loading difference explains the shift (Data Quality Notes)"), never "checked the first draft",
+"two names were wrong ... corrected", "an earlier version" or "now". The same holds for every
+section, the audit and the podcast. The review → fix history (what a reviewer found and what
+changed) goes in `logs/decisions.md` (staff only), with `log_decision.py`. A staff report: a
+changelog-style Expert Review Notes, an audit line saying an earlier reason was "corrected" and
+a podcast saying "the first draft of this report fell for it" nearly reached a client.
+`make_analysis_html.py` warns on these phrases in `AI_Analysis_Report.md`, and `make_podcast.py
+check` fails on the unambiguous ones and warns on the rest (one list: `scripts/client_text.py`);
+rewrite every one they name.

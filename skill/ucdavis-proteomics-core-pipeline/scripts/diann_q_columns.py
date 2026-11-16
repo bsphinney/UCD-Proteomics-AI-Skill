@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+diann_q_columns.py -- ONE definition of DIA-NN's q-value columns for the skill.
+
+Fixes SKILL_OPEN_DEFECTS #2: the column set was hand-written in five files. That
+is how the dpc path in run_de.R drifted away from build_maxlfq.R and applied a
+different identification FDR to the same report for months (PR #48), and the same
+class of defect was later found in the DE-LIMP app itself.
+
+There are TWO distinct concepts here, and conflating them is a bug, not a
+simplification:
+
+  FDR_REQUIRED + FDR_OPTIONAL   the FILTER SET. Every one of these is applied,
+                               ANDed together, at the q-cutoff. Used by run_de.R
+                               (dpc) and build_maxlfq.R.
+
+  PROTEIN_Q_PREFERENCE         a PREFERENCE ORDER for picking ONE protein-level
+                               q-column to read for reporting or cross-tool
+                               comparison. The first available wins; the rest are
+                               ignored. Used by compare_searches.py and
+                               run_search.py.
+
+Applying the preference order as a filter would over-filter; filtering on only
+the first available column would under-filter. They are not interchangeable.
+
+COLUMN SEMANTICS -- from the DIA-NN 2.6 README, "Main output reference"
+(github.com/vdemichev/DiaNN@master; the 1.8 tag serves a much shorter, different
+README, so re-check against master):
+
+  Q.Value            L1242  run-specific precursor q-value
+  Global.Q.Value     L1244  global (experiment-wide) precursor q-value
+  Lib.Q.Value        L1245  library-entry q-value; 'global' when DIA-NN built the
+                            library, so NOT reliably run-level
+  PG.Q.Value         L1255  RUN-SPECIFIC protein-group q-value -- despite sitting
+                            beside the Global.* pair. Do not call it
+                            experiment-wide.
+  Global.PG.Q.Value  L1259  global protein-group q-value
+  Lib.PG.Q.Value     L1260  library-entry protein-group q-value
+
+Run-level q-values alone do not control FDR across an experiment: a union of
+run-level-passing IDs over N runs sits above the nominal cutoff and grows with N,
+and the inflated protein list also inflates the family size m that BH corrects
+over. Hence the Global.* pair is applied whenever present.
+
+Measured caveat on Lib.*: their values are not dependable across reports. On one
+2-run HeLa report both were identically 0.0 in 100% of rows (no filtering power
+at all); on a 399-run mouse report they filtered 0.56% / 0.19%. So neither "the
+Lib columns already give global control" nor "there is no global control" is true
+in general -- which is exactly why Global.* is named explicitly rather than
+assumed to be covered.
+
+The R mirror is diann_q_columns.R. The two are asserted identical by
+tests/test_q_columns.py, so drift is a CI failure rather than a silent
+divergence.
+"""
+
+# Required by both quant paths; a report lacking these is not a DIA-NN report.
+FDR_REQUIRED = ["Q.Value", "Lib.Q.Value", "Lib.PG.Q.Value"]
+
+# Applied additionally WHEN PRESENT. Optional only because older reports predate
+# them -- not because they are discretionary.
+FDR_OPTIONAL = ["PG.Q.Value", "Global.Q.Value", "Global.PG.Q.Value"]
+
+# DDA MS1 filters would go HERE, as a DDA-only set beside FDR_OPTIONAL -- they are not applied
+# today. DIA-NN's README recommends, for DDA quant, extra filtering on "Ms1.Global.Q.Value
+# (< 0.0001 - 0.01) and Ms1.Global.Quality (> 0.5 - 0.9), possibly with addition of
+# Ms1.Q.Value (< 0.01 - 0.5) and Averagine (> 0.1 - 0.9)". Those are NOT the column names
+# DIA-NN 2.7.0 writes: its DDA report.parquet has `Global.Ms1.Q.Value`, `Global.Ms1.Quality` and
+# `Ms1.Q.Value` (read from the SET28 test chain's step-5 report, HIVE 2026-09-29), and the chain's
+# first-pass report (step3_assembly.parquet) has none of the three. Filter on the names found in
+# the report, never the README's; and the R mirror (diann_q_columns.R) needs the same set.
+
+# Preference order for reading a SINGLE protein-level q-value. Most global and
+# most protein-specific first, degrading toward the run-level precursor q-value.
+PROTEIN_Q_PREFERENCE = [
+    "Global.PG.Q.Value",
+    "Global.Q.Value",
+    "Lib.PG.Q.Value",
+    "PG.Q.Value",
+    "Q.Value",
+]
+
+
+# Per-column cutoffs. DIA-NN's README recommends PG.Q.Value "at 0.01 to 0.05,
+# typically 0.05 is sufficient" and documents it as RUN-SPECIFIC, unlike the
+# Global.* pair -- so applying one uniform cutoff to all six was tighter than its
+# own author advises. Measured on a 373-run mouse report, holding the other five
+# at 0.01, PG.Q.Value at 0.01 vs 0.05 differs by two protein groups (6,564 vs
+# 6,566). Small there, but PG.Q.Value is the LARGEST single contributor to what
+# the six columns exclude on that report (22,465 rows, 20,447 uniquely), so it has
+# more room to matter on a less forgiving dataset.
+#
+# Anything not named here uses the run's --q-cutoff.
+COLUMN_CUTOFFS = {"PG.Q.Value": 0.05}
+
+# run_de.R's --q-cutoff default, for a Python reader that has to predict what the DE step will
+# keep before it runs (pass_comparison.py). tests/test_q_columns.py asserts it equals the
+# default in run_de.R's getarg("--q-cutoff", ...), so the two cannot drift.
+DEFAULT_Q_CUTOFF = 0.01
+
+
+def cutoff_for(column, q_cutoff, uniform=False):
+    """The cutoff to apply to `column` given the run's --q-cutoff.
+
+    A column listed in COLUMN_CUTOFFS uses its own value; everything else uses
+    q_cutoff. `uniform=True` disables the per-column map entirely, restoring the
+    pre-2026-08 behaviour of one cutoff for all six.
+
+    Note this deliberately does NOT try to be clever about a caller who tightened
+    --q-cutoff. The pipeline default (0.01) is already stricter than PG.Q.Value's
+    recommended 0.05, so any "never loosen what the caller asked for" rule would
+    prevent the recommendation from ever applying. --q-cutoff governs the other
+    five columns; pass uniform=True to make it govern all six.
+    """
+    if uniform:
+        return q_cutoff
+    return COLUMN_CUTOFFS.get(column, q_cutoff)
+
+
+def fdr_columns(available=None):
+    """The columns to FILTER on, restricted to those the report has.
+
+    `available` is any container of column names; None means "assume all present".
+    Never returns a column the report lacks -- limpa::readDIANN() errors on an
+    unknown name, and arrow silently returns ZERO ROWS when filtering a column
+    that was not selected.
+    """
+    if available is None:
+        return list(FDR_REQUIRED) + list(FDR_OPTIONAL)
+    have = set(available)
+    return [c for c in (FDR_REQUIRED + FDR_OPTIONAL) if c in have]
+
+
+# How run_de.R's filter treats a value, as limpa's EListFromLongFormatFile applies it:
+# `which(Report[[col]] > cutoff)` is dropped, so a row is dropped only when a value EXCEEDS its
+# cutoff -- a missing value and a NaN stay. The ONE Python reading of that rule, for parquet
+# (keep_expression) and for a text report (row_passes); pass_comparison.py, audit_results.py and
+# contaminant_competition.py read reports through them. The parquet readers used `<= cutoff OR
+# null`, which drops a NaN that limpa and the text reader keep (review of skill 2.14).
+def keep_expression(cuts):
+    """{column: cutoff} -> the pyarrow.dataset filter keeping the rows run_de.R keeps, or None
+    when there is no column to filter on."""
+    import pyarrow.dataset as pads
+    keep = None
+    for c, cut in cuts.items():
+        f = ~(pads.field(c) > cut) | pads.field(c).is_null()
+        keep = f if keep is None else keep & f
+    return keep
+
+
+def row_passes(row, cuts):
+    """The same rule for one row of a text report (a dict, as csv reads it): an empty, NA or NaN
+    value stays; a value that is not a number drops the row."""
+    for c, cut in cuts.items():
+        v = (row.get(c) or "").strip()
+        if v in ("", "NA", "NaN", "nan"):
+            continue
+        try:
+            if float(v) > cut:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def protein_q_column(available):
+    """The single best protein-level q-column present, or None."""
+    have = set(available)
+    for c in PROTEIN_Q_PREFERENCE:
+        if c in have:
+            return c
+    return None
+
+
+if __name__ == "__main__":  # tiny self-report, handy when debugging a report
+    import json
+    import sys
+    cols = sys.argv[1:] or None
+    print(json.dumps({
+        "fdr_columns": fdr_columns(cols),
+        "protein_q_column": protein_q_column(cols) if cols else None,
+    }, indent=2))
