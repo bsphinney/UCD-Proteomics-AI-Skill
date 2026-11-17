@@ -23,6 +23,10 @@ Install it as a Claude Code plugin (one line, in a terminal):
 claude plugin marketplace add https://github.com/bsphinney/UCD-Proteomics-AI-Skill.git && claude plugin install ucdavis-proteomics-core-pipeline@ucdavis-proteomics-core
 ```
 
+Using another agent (Codex, Gemini CLI, Cursor, Copilot, OpenCode, Goose)? Read
+[`docs/OTHER_AGENTS.md`](docs/OTHER_AGENTS.md) first: it lists what in the skill is specific to
+Claude Code, what happens without it, and where each agent looks for skills.
+
 Then follow `SKILL.md`. Do not hand-write a search job or a DIA-NN/Sage command line instead: the
 skill derives the parameters from the data, pins the engine version and records provenance.
 
