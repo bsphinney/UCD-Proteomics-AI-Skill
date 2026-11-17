@@ -1,5 +1,8 @@
 # UC Davis Proteomics AI Skill
 
+[![GitHub stars](https://img.shields.io/github/stars/bsphinney/UCD-Proteomics-AI-Skill?style=social)](https://github.com/bsphinney/UCD-Proteomics-AI-Skill)
+**Using the skill and finding it useful? [Give it a star on GitHub](https://github.com/bsphinney/UCD-Proteomics-AI-Skill)** (the ☆ Star button at the top right of this page). It takes one click and helps the Core show that the skill is used.
+
 **The UC Davis Proteomics Core pipeline, as a skill for Claude.** Give it a folder of raw mass-spec
 files (`.raw`, `.d` or `.mzML`) and say in your own words what the experiment is. It works out the
 acquisition type and instrument, derives the search parameters from them, and runs a pinned search
@@ -33,9 +36,11 @@ group. It runs in Claude Code and Claude Desktop. The plugin is `ucdavis-proteom
 *The skill searches timsTOF and Orbitrap DIA data
 ([watch on YouTube](https://www.youtube.com/watch?v=roHknILC-Ec)).*
 
-![The top of a real report: the run's summary and "Results at a glance"](docs/images/report-pxd063416.png)
+[![The top of a real report: the run's summary and "Results at a glance". Click to open the full report with its podcast.](docs/images/report-pxd063416.png)](https://bioshare.bioinformatics.ucdavis.edu/bioshare/download/3rxqjlo5rx3asty/PXD063416_4mz_analysis/output/Analysis_Report_with_audio.html)
 
-*The top of a real report: the skill's re-analysis of the public HeLa + yeast benchmark PXD063416 (PRIDE; Moschem et al., J Proteome Res 2025), at 4 m/z isolation windows. The whole report is one self-contained HTML file.*
+*The top of a real report: the skill's re-analysis of the public HeLa + yeast benchmark PXD063416 (PRIDE; Moschem et al., J Proteome Res 2025), at 4 m/z isolation windows. The whole report is one self-contained HTML file. **Click the picture to open that full report**, with its podcast (an
+audio overview) built in; it is about 25 MB. The [cross-window comparison](https://bioshare.bioinformatics.ucdavis.edu/bioshare/download/3rxqjlo5rx3asty/Window_Comparison_Report_with_audio.html) (2, 4, 6 and 10 m/z,
+also with its podcast) is in the same public share.*
 
 <!-- PLACEHOLDER-2.15-CLIP (TODO, Brett records it): replace this comment and the
      "(Video to follow.)" below with the 2.15 tutorial clip, a thumbnail linked to the video as
@@ -329,6 +334,8 @@ reference files are in
 - **Earlier audit.** An audit of defects found in the skill (August 2026) is in
   [docs/SKILL_OPEN_DEFECTS.md](docs/SKILL_OPEN_DEFECTS.md). Check the CHANGELOG for what has been
   fixed since.
+- **If the skill helped you.** A [star on GitHub](https://github.com/bsphinney/UCD-Proteomics-AI-Skill) helps the Core show that the
+  skill is used.
 
 ## Repository layout
 
