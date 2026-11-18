@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>How the Report Was Made</title>
-<meta name="description" content="How UC Davis Proteomics Core reports are made: which parts established proteomics software does, which parts Claude writes, which AI models are involved, and how your lab can run the same pipeline.">
+<meta name="description" content="How UC Davis Proteomics Core reports are made: the AI calls established proteomics software and fixed scripts instead of doing the analysis itself, so the numbers repeat from run to run. Which parts software does, which parts Claude writes, what people decide, and how your lab can run the same pipeline.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,500..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
@@ -16,7 +16,7 @@ body { margin: 0; }
 img { max-width: 100%; }
 [hidden]:not([hidden=until-found i]) { display: none !important; }
 
-/* Layout: one reading column (max 980px). Short answer first, then the pipeline as a numbered run sheet with a "who does it" tag per step, then models, checks, and how another lab sets it up. */
+/* Layout: one reading column (max 980px). Short answer first, then why calling tools is not the same as an AI doing the analysis (comparison, one real call, what repeats), the pipeline as a numbered run sheet with a "who does it" tag per step, the other routes, how to reproduce a result, then models, checks, and how another lab sets it up. */
 :root {
   --bg: #f4f6f9;
   --surface: #ffffff;
@@ -99,6 +99,7 @@ header { display: grid; gap: 18px; }
 .tag.local { background: var(--local-soft); color: var(--local); }
 .tag.soon { background: var(--warn-soft); color: var(--warn); }
 .tag.soon::before { display: none; }
+.tag.you { background: var(--accent-soft); color: var(--accent); }
 .opt-yes { color: var(--local); font-weight: 600; }
 .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; font-size: 0.88rem; color: var(--muted); }
 .legend span.item { display: inline-flex; gap: 8px; align-items: center; }
@@ -116,6 +117,24 @@ header { display: grid; gap: 18px; }
   .stages li { grid-template-columns: 2rem minmax(0, 1fr); }
   .stages .who { grid-column: 2; flex-direction: row; flex-wrap: wrap; }
 }
+
+/* Tool calls: the comparison, the loop and one real call */
+.compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.compare > div { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 18px 20px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+.compare > div.ours { border-color: var(--accent); box-shadow: inset 4px 0 0 var(--accent); }
+.compare p, .compare li { font-size: 0.94rem; }
+@media (max-width: 700px) { .compare { grid-template-columns: 1fr; } }
+.loop { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; counter-reset: loop; }
+.loop li { counter-increment: loop; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.loop li::before { content: counter(loop); font-family: var(--f-mono); font-size: 0.8rem; color: var(--muted); }
+.loop p { font-size: 0.9rem; }
+@media (max-width: 860px) { .loop { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .loop { grid-template-columns: 1fr; } }
+.call { border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); display: grid; }
+.call > div { padding: 12px 16px; display: grid; gap: 6px; min-width: 0; }
+.call > div + div { border-top: 1px solid var(--rule); }
+.call pre { margin: 0; font-family: var(--f-mono); font-size: 0.82rem; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.call p { font-size: 0.93rem; }
 
 /* Tables */
 .tw { overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
@@ -158,7 +177,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
 <header>
   <div class="eyebrow">UC Davis Proteomics Core · for colleagues who received a report</div>
   <h1>How the Report Was Made</h1>
-  <p class="lede">The analysis report you received, and its audio discussion if it has one, were produced with Claude, Anthropic's AI model, following a set of written instructions and scripts the Proteomics Core maintains. This page explains which parts were done by established proteomics software, which parts an AI wrote, which AI models were involved, and how your lab could run the same pipeline.</p>
+  <p class="lede">The analysis report you received, and its audio discussion if it has one, were produced with Claude, Anthropic's AI model, following a set of written instructions and scripts the Proteomics Core maintains. Claude did not do the analysis itself. It called established proteomics software and the Core's fixed scripts, step by step, and those made every number. This page explains the difference, why it keeps the results the same from run to run, which parts an AI wrote, what people decided, and how your lab could run the same pipeline.</p>
 </header>
 
 <section aria-labelledby="h-short">
@@ -167,12 +186,12 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
     <div>
       <span class="tag tool">Software</span>
       <h3>The numbers come from standard tools</h3>
-      <p>DIA-NN (DIA data) or Sage (DDA data) searched the raw files. R packages, usually limpa and limma, did the quantification and statistics; each report names the ones it used. Every number in the report comes from these, and the statistics can be re-run as plain R with no AI involved.</p>
+      <p>DIA-NN, FragPipe or Sage searched the raw files, depending on the data type. R packages, usually limpa and limma, did the quantification and statistics; each report names the ones it used. Every number in the report comes from these, and the statistics can be re-run as plain R with no AI involved.</p>
     </div>
     <div>
       <span class="tag claude">Claude</span>
       <h3>Claude ran the tools and wrote the words</h3>
-      <p>Claude, working in Claude Code, ran each step, read the tables and figures, and wrote the report text and, when there is one, the podcast script. Separate Claude reviewers check the podcast script, and the analysis too when it calls for an expert review.</p>
+      <p>Claude, working in Claude Code, ran each step by calling a script, read the tables and figures, and wrote the report text and, when there is one, the podcast script. It computes nothing itself (<a href="#h-tools">why that matters</a>). Separate Claude reviewers check the podcast script, and the analysis too when it calls for an expert review.</p>
     </div>
     <div>
       <span class="tag gemini">Gemini</span>
@@ -182,12 +201,101 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
   </div>
 </section>
 
+<section aria-labelledby="h-tools">
+  <div class="intro">
+    <h2 id="h-tools">An AI that calls tools is not an AI that does the analysis</h2>
+    <p>People often picture "AI analysed the data" as pasting a table into a chatbot and asking what changed. That is not what happens here, and the difference decides whether a result can be repeated.</p>
+  </div>
+  <div class="compare">
+    <div>
+      <h3>An AI doing the analysis itself</h3>
+      <p>The model reads the data and produces the answer from its own reasoning, or writes new analysis code each time it is asked.</p>
+      <ul class="plain">
+        <li>Ask twice and the method can differ: another filter, another normalisation, another test.</li>
+        <li>A different model, or a newer version of the same one, makes different choices.</li>
+        <li>A number can be misread, rounded or invented, and nothing flags it.</li>
+        <li>There is no fixed record of what was done, so nobody can re-run it.</li>
+      </ul>
+    </div>
+    <div class="ours">
+      <h3>An AI calling tools, as this pipeline does</h3>
+      <p>The model decides which step comes next and starts a program for it. The program does the work and writes the result to a file.</p>
+      <ul class="plain">
+        <li>The method lives in scripts that ship with the skill. The same script, input and settings give the same output.</li>
+        <li>The settings come from a table in the skill, chosen by the data type, not from the model's memory.</li>
+        <li>The engines are pinned to one version per release of the skill.</li>
+        <li>Every command, version, input checksum and decision is recorded, so the run can be repeated without any AI.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>What a tool call is</h3>
+  <p>A language model produces text. In Claude Code, some of that text is a request to run a program on the computer: a "tool call". Claude Code runs the program and hands the output back to the model. The model never calculates a q-value or a fold change; it starts the program that does, then reads what the program wrote.</p>
+  <ol class="loop">
+    <li><h3>Claude reads the procedure</h3><p>The skill is a written procedure. It names the script for each step and the rules Claude must follow.</p></li>
+    <li><h3>Claude calls the script</h3><p>One command, with the files and the answers you gave. The command is written to the run's log.</p></li>
+    <li><h3>The software does the work</h3><p>The script runs DIA-NN, R or another established tool, and writes tables, figures and a record of what ran.</p></li>
+    <li><h3>Claude reads the result</h3><p>It tells you what the script reported, passes on every warning, and moves to the next step.</p></li>
+  </ol>
+
+  <h3>One real call</h3>
+  <p>This is the step that picks the search settings for timsTOF DIA data, run for this page with skill 2.15.0. Claude does not choose 15 ppm. A script looks it up and says where the number came from.</p>
+  <div class="call">
+    <div><span class="tag claude">Claude calls</span><pre>python3 scripts/resolve_defaults.py --acquisition DIA --instrument "timsTOF HT" --dest ./wf</pre></div>
+    <div><span class="tag tool">The script answers</span><pre>"engine": { "name": "diann", "version": "2.7.0", ... "decided_by": "engine_choice.py" },
+"ms1_ppm": 15,
+"ms2_ppm": 15,
+"ppm_source": "DIA-NN README recommended settings (verified 2026-06)",
+"needs_confirmation": false</pre><p class="small muted">Part of the output. The script also writes the full record to a file, which the search and the Methods read later.</p></div>
+    <div><span class="tag you">You confirm</span><p>Claude shows these settings once, with their sources, and waits for your "go" before any computing starts.</p></div>
+  </div>
+  <p>Any Claude model, on any day, gets the same answer from that script, because the answer is in the skill and not in the model. The skill's own rule says a hand-written search command is never allowed, even for one quick search: the search always goes through the skill's search script, which records what ran.</p>
+</section>
+
+<section aria-labelledby="h-same">
+  <div class="intro">
+    <h2 id="h-same">What stays the same from run to run, and what does not</h2>
+    <p>Run the same skill version on the same files with the same answers, and the parts made by software repeat. The parts written by an AI are worded differently each time, which is why they are checked against the parts that do not change.</p>
+  </div>
+  <div class="tw">
+    <table>
+      <thead><tr><th scope="col">Part of the result</th><th scope="col">Who makes it</th><th scope="col">Same on a re-run?</th><th scope="col">What fixes it</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">Search settings</th><td><span class="tag tool">Software</span></td><td class="opt-yes">Yes</td><td>They are derived from the data type by scripts and ship with the skill, so the skill version fixes them. Each value carries its source.</td></tr>
+        <tr><th scope="row">Search engine</th><td><span class="tag tool">Software</span></td><td class="opt-yes">Yes</td><td>One pinned version per skill release (2.15.0: DIA-NN 2.7.0, FragPipe 24.0, Sage 0.14.7). The build that actually ran is recorded.</td></tr>
+        <tr><th scope="row">Protein database</th><td><span class="tag tool">Software</span></td><td>Yes for the same file. A database downloaded again later may differ by a few sequences</td><td>The UniProt release, the download address and a checksum of the file are recorded, so a change is visible.</td></tr>
+        <tr><th scope="row">Protein amounts, statistics, tables</th><td><span class="tag tool">Software</span></td><td class="opt-yes">Yes (<a href="#h-repro">to the last digit on the same kind of processor</a>)</td><td>One fixed R script. It also writes the whole analysis out as plain R with every value filled in.</td></tr>
+        <tr><th scope="row">Figures, the audit, the Methods</th><td><span class="tag tool">Software</span></td><td class="opt-yes">Yes</td><td>Scripts draw the figures, run the checks and write the Methods from the run's own records. What no record holds is marked for you to fill in, never guessed.</td></tr>
+        <tr><th scope="row">Organism, groups, enzyme, runs left out, normalised or not</th><td><span class="tag you">You</span></td><td>Yes, if you give the same answers</td><td>Claude asks; it does not decide these or guess them from file names. Each answer goes into the decisions log in your words.</td></tr>
+        <tr><th scope="row">Report text, the interpretation, the podcast script, reviewers' notes</th><td><span class="tag claude">Claude</span></td><td>No. The wording and the emphasis differ every time, and between models</td><td>The tables and figures sit beside the text in the same report. A script checks every number and name in the podcast script against the report (<a href="#h-trust">the checks</a>).</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>What keeps Claude on the path</h3>
+  <div class="checks">
+    <div class="check"><h3>The skill version is checked first</h3><p>Every conversation starts by checking which version of the skill is installed, and every report and bundle records the version that ran it.</p></div>
+    <div class="check"><h3>One confirmation before computing</h3><p>The engine and version, the mass accuracy and its source, the organism, the database, the design and the statistics are shown once. Nothing heavy runs before your "go".</p></div>
+    <div class="check"><h3>Judgement calls belong to people</h3><p>Which run is which sample, which runs to leave out, normalised or raw quantities: Claude asks, records your words, and never signs a decision itself.</p></div>
+    <div class="check"><h3>Warnings are passed on, failures stop the run</h3><p>Claude must relay every warning a script prints. A failed audit check stops the interpretation until it is resolved.</p></div>
+    <div class="check"><h3>Everything is logged</h3><p>Each command goes into <code>commands.log</code>, each decision into the decisions log, and the conversation itself is saved with the analysis, so a person or another AI can review what Claude did.</p></div>
+    <div class="check"><h3>The scripts are tested</h3><p>More than 6,000 automated tests run on every change to the skill. Before release 2.15, fresh Claude sessions ran the same request on the old and the new version on seven real datasets, and the results were compared.</p></div>
+  </div>
+  <p>In that comparison the two DIA datasets gave identical significant calls on both versions: five contrasts on a 15-run set, and a public benchmark with known ratios. A 77-run time course differed (one contrast went from 30 to 17 calls) and the cause was not isolated. The full table is in the <a href="https://github.com/bsphinney/UCD-Proteomics-AI-Skill/blob/main/CHANGELOG.md#how-it-was-checked">CHANGELOG, "How it was checked"</a>.</p>
+  <div class="note">
+    <h3>What this does not guarantee</h3>
+    <p>Claude still chooses which command to run and passes the answers into it, and it can make a mistake there, such as a wrong option or a skipped step. The skill cannot make that impossible. It makes it visible: the command log, the decisions log and the saved conversation show exactly what was run, and the bundle lets anyone run it again. Work done outside the skill's steps is recorded as such.</p>
+    <p>Nobody has yet run one dataset through the skill with several different AI models and compared the results. The design reason to expect the same numbers is above; a side-by-side test would be the proof.</p>
+  </div>
+</section>
+
 <section aria-labelledby="h-pipeline">
   <div class="intro">
     <h2 id="h-pipeline">Step by step</h2>
-    <p>The pipeline is a Claude Code "skill": a written procedure with dozens of helper scripts, which Claude follows in order.</p>
+    <p>The pipeline is a Claude Code "skill": a written procedure with about 130 scripts, which Claude follows in order. Every analysis goes through the same steps, with or without statistics.</p>
     <div class="legend">
       <span class="item"><span class="tag tool">Software</span> established tools and the skill's scripts</span>
+      <span class="item"><span class="tag you">You</span> asked of a person, never decided by the AI</span>
       <span class="item"><span class="tag claude">Claude</span> written or reviewed by an AI</span>
       <span class="item"><span class="tag gemini">Gemini</span> Google's cloud models</span>
       <span class="item"><span class="tag local">Local</span> the voice option that stays on campus</span>
@@ -195,31 +303,63 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
   </div>
   <ol class="stages">
     <li>
-      <div class="body"><h3>Read the raw files</h3><p>Scripts open the instrument files and work out the acquisition (DIA or DDA), the instrument and the m/z range. The search settings are derived from those, then confirmed once with the person running it.</p></div>
+      <div class="body"><h3>Check the skill and the computer</h3><p>A script checks that the installed skill is current and, on first use, installs the tools it needs without administrator rights. You say where the heavy work runs: your own computer or a cluster.</p></div>
       <div class="who"><span class="tag tool">Software</span></div>
     </li>
     <li>
-      <div class="body"><h3>Search the spectra</h3><p><a href="https://github.com/vdemichev/DiaNN">DIA-NN</a> 2.7.0 (DIA data, library-free, 1% FDR, match-between-runs) or <a href="https://github.com/lazear/sage">Sage</a> (DDA data). At the Core this runs as jobs on UC Davis's HIVE computing cluster.</p></div>
+      <div class="body"><h3>Read the raw files</h3><p>Scripts open the instrument files and work out the acquisition (DIA or DDA), the instrument, the m/z range and, for Orbitrap data, the resolution. If a script is not sure, it says so and you are asked.</p></div>
       <div class="who"><span class="tag tool">Software</span></div>
     </li>
     <li>
-      <div class="body"><h3>Quantify and test</h3><p><a href="https://bioconductor.org/packages/limpa">limpa</a> estimates each protein's amount and models missing values through a detection-probability curve instead of dropping or imputing them. <a href="https://bioconductor.org/packages/limma">limma</a> tests each comparison with Benjamini–Hochberg FDR. Re-tests on complete data and with per-group variance flag which hits are robust. For a non-model organism, protein names come from DIAMOND searches against Swiss-Prot.</p></div>
+      <div class="body"><h3>Ask what the files cannot say</h3><p>The organism, the type of experiment, the digestion enzyme, the sample type, and which sample belongs to which group. These are asked, never guessed from a folder or file name, and each answer is logged.</p></div>
+      <div class="who"><span class="tag you">You</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Derive the settings and confirm once</h3><p>Scripts pick the engine and the search settings from the data type. Each value carries its source: measured from your files, a published recommendation, or a default marked as a default. You see them once and say "go".</p></div>
+      <div class="who"><span class="tag tool">Software</span><span class="tag you">You</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Get the pinned engine and build the database</h3><p>A script installs the engine version this release of the skill pins. Another downloads the proteome for your organism from UniProt, adds a contaminant set, and records the release and a checksum.</p></div>
       <div class="who"><span class="tag tool">Software</span></div>
     </li>
     <li>
-      <div class="body"><h3>Audit for common mistakes</h3><p>A script checks the results for known pitfalls: too few replicates, a confounded design, mixed instruments, low depth, heavy missingness, contamination, unstable normalisation, implausibly large or empty results. Anything it finds goes into the report's "Audit &amp; caveats" section.</p></div>
+      <div class="body"><h3>Search the spectra</h3><p><a href="https://github.com/vdemichev/DiaNN">DIA-NN</a> 2.7.0 for DIA data (library-free, 1% FDR, match-between-runs); <a href="https://fragpipe.nesvilab.org/">FragPipe</a> 24.0 for timsTOF DDA-PASEF and for DDA with no enzyme rule; <a href="https://github.com/lazear/sage">Sage</a> 0.14.7 for other DDA. The search always goes through the skill's own search script, never a hand-written command. At the Core it runs as jobs on UC Davis's HIVE computing cluster.</p></div>
+      <div class="who"><span class="tag tool">Software</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Watch the search</h3><p>A watcher script polls the jobs to the end, recognises known failures and stalls, and names the fix. Claude applies it and resubmits only what failed. A search that was interrupted is picked up where it stopped, not started again.</p></div>
+      <div class="who"><span class="tag tool">Software</span><span class="tag claude">Claude</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Quantify and test</h3><p><a href="https://bioconductor.org/packages/limpa">limpa</a> estimates each protein's amount and models missing values through a detection-probability curve instead of dropping or imputing them. <a href="https://bioconductor.org/packages/limma">limma</a> tests each comparison with Benjamini–Hochberg FDR. Significance is the adjusted P value alone; there is no fold-change cutoff. Re-tests on complete data and with per-group variance flag which hits are robust. For a non-model organism, protein names come from DIAMOND searches against Swiss-Prot.</p><p class="small muted">A script first runs the statistics on normalised and on non-normalised quantities and compares them. When that check is not clear, a person decides which to use, not Claude.</p></div>
+      <div class="who"><span class="tag tool">Software</span><span class="tag you">You</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Protein-set tests and figures</h3><p>When a comparison has few significant proteins, set tests (camera and fry, side by side, on sets chosen beforehand) are offered. An R script draws the QC plots, PCA, volcano plots and the top proteins.</p></div>
+      <div class="who"><span class="tag tool">Software</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Audit for common mistakes</h3><p>A script checks the results for known pitfalls: too few replicates, a confounded design, mixed instruments, low depth, heavy missingness, contamination, unstable normalisation, implausibly large or empty results. Anything it finds goes into the report's "Audit &amp; caveats" section. A failed check stops the run until it is resolved.</p></div>
+      <div class="who"><span class="tag tool">Software</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Peak check</h3><p>Where it can run, <a href="https://skyline.ms">Skyline</a> draws DIA-NN's chromatogram peaks for the top proteins. It is a visual check of the peaks, not a second confirmation of the result.</p></div>
       <div class="who"><span class="tag tool">Software</span></div>
     </li>
     <li class="phase-claude">
-      <div class="body"><h3>Write the report</h3><p>Claude reads the tables, figures and audit, then writes the text: the overview, answers to the lab's own questions, findings per comparison, the biological interpretation and the methods. A script assembles it with the figures into one HTML file.</p></div>
+      <div class="body"><h3>Write the report</h3><p>A script writes Claude a brief listing every table and figure to read. Claude reads them and the audit, then writes the text: the overview, answers to the lab's own questions, findings per comparison and the biological interpretation. A script assembles it with the figures into one HTML file and adds the "How this report was made" section from the run's records.</p></div>
       <div class="who"><span class="tag claude">Claude</span></div>
     </li>
     <li class="phase-claude">
       <div class="body"><h3>Expert review</h3><p>When a statistical claim goes to a collaborator, a result looks extreme (log2FC above 5, p below 10<sup>−10</sup>) or the organism is new, three separate Claude agents review the analysis independently, as a proteomics expert, a biologist and a statistician. Their points become the "Expert Review Notes" section.</p></div>
       <div class="who"><span class="tag claude">Claude</span></div>
     </li>
+    <li>
+      <div class="body"><h3>Write the Methods</h3><p>A script writes the publication Methods from the instrument's own files and the run's records: the acquisition, the engine and the version that ran, the settings, the database, the statistics, and the instrument grant acknowledgment. A value no record holds is marked for you to confirm. Claude does not compose this text.</p></div>
+      <div class="who"><span class="tag tool">Software</span></div>
+    </li>
     <li class="phase-claude">
-      <div class="body"><h3>Write the podcast script</h3><p>Once the report is final, Claude writes a conversation between two fictional hosts, a cell biologist and a statistician. It covers the results, how the samples were measured, and the key terms. Anything said that is not in the report is listed at the end of the transcript.</p></div>
+      <div class="body"><h3>Write the podcast script</h3><p>Optional. Once the report is final, Claude writes a conversation between two fictional hosts, a cell biologist and a statistician. It covers the results, how the samples were measured, and the key terms. Anything said that is not in the report is listed at the end of the transcript.</p></div>
       <div class="who"><span class="tag claude">Claude</span></div>
     </li>
     <li>
@@ -235,16 +375,64 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
       <div class="who"><span class="tag gemini">Gemini</span><span class="tag local">or Local</span><span class="tag tool">Software</span></div>
     </li>
     <li>
-      <div class="body"><h3>Package it</h3><p>One HTML file with the figures built in, so it opens offline; when there is a podcast, a second copy has the audio and the transcript built in too. Alongside it go a PDF, the tables and a reproducibility bundle: a pinned software environment, the R session details, checksums, a <code>reproduce.sh</code> and the whole statistical analysis as one plain R script.</p></div>
+      <div class="body"><h3>Build the reproducibility bundle</h3><p>A script collects what is needed to run the analysis again: the skill version, the engine build, a pinned software environment, the R session details, the settings, checksums of the inputs and outputs, the command log and a <code>reproduce.sh</code>. It lists anything it could not capture instead of leaving it out silently (<a href="#h-repro">more below</a>).</p></div>
+      <div class="who"><span class="tag tool">Software</span></div>
+    </li>
+    <li>
+      <div class="body"><h3>Package it</h3><p>One HTML file with the figures built in, so it opens offline; when there is a podcast, a second copy has the audio and the transcript built in too. Alongside it go a PDF, the tables, a <code>README.html</code> that lists every file, an <code>AGENTS.md</code> for the next AI assistant or person who opens the folder, and the files a PRIDE or MassIVE deposit needs. If Claude tries to finish while any of these is missing, an automatic reminder lists what is left.</p><p class="small muted">For a Core project, staff then share the results with the collaborator, after a separate yes.</p></div>
       <div class="who"><span class="tag tool">Software</span></div>
     </li>
   </ol>
 </section>
 
+<section aria-labelledby="h-routes">
+  <div class="intro">
+    <h2 id="h-routes">What else the skill does</h2>
+    <p>The steps above are the standard analysis. The same scripts, records and rules apply to every other route.</p>
+  </div>
+  <div class="tw">
+    <table>
+      <thead><tr><th scope="col">You ask for</th><th scope="col">What runs</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">One search, no statistics</th><td>An identification list, a QC run or a benchmark. Every step runs except the statistics, and the report says "identified", never "quantified", where no amounts were made.</td></tr>
+        <tr><th scope="row">Another engine, or a comparison of engines</th><td>For DIA, FragPipe (with diaTracer for dia-PASEF) or Radiant can run instead of DIA-NN on request. Two engines can search the same files with the same database, groups and statistics; a script writes the comparison numbers and Claude writes the judgement.</td></tr>
+        <tr><th scope="row">SILAC</th><td>DIA-NN's plexDIA, analysed as ratios between the labels inside each run.</td></tr>
+        <tr><th scope="row">An unknown organism</th><td>De novo sequencing, a DIAMOND search of the peptides, and a lowest-common-ancestor call for the species, with the confidence threshold stated.</td></tr>
+        <tr><th scope="row">A re-analysis</th><td>A new session with other settings or another skill version, and a script that compares it with the earlier one and lists the differences.</td></tr>
+        <tr><th scope="row">"Show me the data for this protein"</th><td>A page with that protein's evidence from your own data. Facts about the protein are looked up in public databases when the page is built, never written from the AI's memory.</td></tr>
+        <tr><th scope="row">The LC-MS Methods only</th><td>The Methods section and the instrument acknowledgment, written by the script from the raw files.</td></tr>
+        <tr><th scope="row">"Is my search done?"</th><td>The skill finds the unfinished run, reports its state and continues from where it stopped. It never resubmits a search that is still running.</td></tr>
+        <tr><th scope="row">Core services (staff only)</th><td>Core staff also use the skill for submissions to the Core: locating a submission's files, high-throughput plates, the QC runs around a project, and delivery to the collaborator. These are listed with every other file in the <a href="https://github.com/bsphinney/UCD-Proteomics-AI-Skill/blob/main/docs/SKILL_INVENTORY.md">skill inventory</a>.</td></tr>
+      </tbody>
+      <caption>Which engine a data type gets by default is one table in the skill, not a choice the AI makes each time. You can ask for another engine; the skill uses it or says why it cannot.</caption>
+    </table>
+  </div>
+</section>
+
+<section aria-labelledby="h-repro">
+  <div class="intro">
+    <h2 id="h-repro">Re-running a result yourself</h2>
+    <p>Every analysis leaves two things that let you repeat it without Claude. A result without both is treated as unfinished.</p>
+  </div>
+  <div class="checks">
+    <div class="check"><h3>1. The analysis as plain R</h3><p><code>reproducibility_log.R</code> is the whole statistical analysis, top to bottom, with every value written out: the report it read, the cutoffs, the sample-to-group map, the design and the contrasts. It is written from the objects that actually ran, so it cannot describe a different analysis from the tables beside it. It needs only R with limpa and limma.</p></div>
+    <div class="check"><h3>2. The whole run, pinned</h3><p>The <code>reproducibility/</code> folder holds the skill version, the engine build that ran, a locked software environment, the settings and the conditions file, checksums of the raw files, the database, the search report and the result tables, the command log, and a <code>reproduce.sh</code> that runs the search and the statistics again from the raw files.</p></div>
+  </div>
+  <h3>How exact is "the same"?</h3>
+  <ul class="plain">
+    <li><strong>Same software, settings, inputs and kind of processor:</strong> the result tables match to the last digit.</li>
+    <li><strong>A different processor family:</strong> limpa's protein estimates can shift in about the third decimal place. In the Core's test across two processor families on its cluster, over 12 comparisons, no fold change moved by more than 0.0022 (log2) and no significance call changed. Each run records which processor it used.</li>
+    <li><strong>A different number of threads:</strong> DIA-NN and Sage give the same output for a fixed version and thread count; another thread count can shift intensities slightly, so the count is recorded.</li>
+    <li><strong>A database downloaded again later:</strong> UniProt will have moved on, and the entry count may differ by a few sequences. The recorded release and checksum show it.</li>
+    <li><strong>A different skill version:</strong> the settings or the engine version may have changed on purpose. The CHANGELOG says what changed, and the re-analysis route compares the two.</li>
+  </ul>
+  <p class="small muted">Detail: <a href="https://github.com/bsphinney/UCD-Proteomics-AI-Skill/blob/main/skill/ucdavis-proteomics-core-pipeline/references/reproducibility.md">the skill's reproducibility contract</a>.</p>
+</section>
+
 <section aria-labelledby="h-models">
   <div class="intro">
     <h2 id="h-models">The models involved</h2>
-    <p>Three kinds of model are at work, and only two are generative AI. The statistics (limpa, limma) are classical statistical models, not AI.</p>
+    <p>Three kinds of model are at work, and only two are generative AI. The statistics (limpa, limma) are classical statistical models, not AI. Changing the Claude model changes how the text reads, not the numbers, because the numbers are made by the software Claude calls (<a href="#h-same">what stays the same</a>).</p>
   </div>
   <div class="tw">
     <table>
@@ -287,14 +475,16 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
     <p>An AI can write a fluent sentence that is wrong. The pipeline is built around that risk.</p>
   </div>
   <div class="checks">
-    <div class="check"><h3>The AI does not make the numbers</h3><p>Claude runs the tools and reports their output. It does not compute statistics itself. The plain R script in the bundle re-creates every statistical result without Claude.</p></div>
+    <div class="check"><h3>The AI does not make the numbers</h3><p>Claude runs the tools and reports their output. It does not compute statistics itself (<a href="#h-tools">calling tools</a>). The plain R script in the bundle re-creates every statistical result without Claude.</p></div>
+    <div class="check"><h3>The factual sections are not AI-written</h3><p>The Methods, the audit table and each report's "How this report was made" section are written by scripts from the run's records. A fact no record holds is left out or marked, never filled in.</p></div>
+    <div class="check"><h3>The numbers sit beside the text</h3><p>Claude is told to take every number in the report text from the result tables. The tables and figures are in the same report, so any sentence can be checked against them.</p></div>
     <div class="check"><h3>Every hit is re-tested</h3><p>Each significant protein is tested again on complete data only, and again with each group allowed its own variability. The report leads with the hits that survive both.</p></div>
     <div class="check"><h3>Independent reviewers</h3><p>The expert reviewers and the podcast's meaning check are separate Claude agents, not the one that wrote the text, so they do not share its assumptions.</p></div>
     <div class="check"><h3>Claude writes the script, a tool checks it</h3><p>An early version let a model write the podcast straight from the report. It passed a number check yet still invented facts, such as calling limpa "our Core's custom extension to limma". Now Claude writes the script from the report it has read, and a script checks every number and name against the report.</p></div>
   </div>
   <div class="note">
     <h3>What the checks cannot catch</h3>
-    <p>The checks find invented numbers and names, not every wrong sentence. That is why the report and the audio both say the written report is the record. The audio is a guide to reading the report, not a replacement for it.</p>
+    <p>The checks find invented numbers and names, not every wrong sentence. The automatic number check covers the podcast script; the report text has the rule and the reviewers, not a script. That is why the report and the audio both say the written report is the record. The audio is a guide to reading the report, not a replacement for it.</p>
   </div>
 </section>
 
@@ -319,6 +509,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
       <p>Point Claude at a folder of raw files, for example:</p>
       <div class="cmd"><pre id="cmd-ask">Analyze the proteomics data in /data/my_experiment. It's mouse liver, knockout vs wild type, four of each.</pre><button type="button" class="copy" data-copy="cmd-ask">Copy</button></div>
       <p>Claude checks the files, asks about the organism and design, confirms the search settings once, then runs the search, statistics, figures, audit and report.</p>
+      <p class="small muted">Using another coding agent instead of Claude Code? Most of the skill is plain scripts that any agent able to run commands can follow, but this has not been tested. See <a href="https://github.com/bsphinney/UCD-Proteomics-AI-Skill/blob/main/docs/OTHER_AGENTS.md">what is specific to Claude Code</a>.</p>
     </div></li>
     <li><div class="body">
       <h3>Add the podcast, if you want it</h3>
@@ -355,13 +546,13 @@ footer { border-top: 1px solid var(--rule); padding-top: 20px; display: grid; ga
     <li><strong>Raw files</strong> are searched on your own computer or cluster. The files themselves are not sent to any AI service; Claude sees the scripts' summaries of them.</li>
     <li><strong>Claude</strong> sees what it reads while working: results tables, figures, logs and the report. Those go to Anthropic under the terms of your Claude plan. Check your institution's guidance for unpublished data.</li>
     <li><strong>Gemini</strong> receives only the podcast transcript, and then the audio for the listen-back check, and only if you make a podcast with Gemini voices. With the local voice or macOS <code>say</code>, nothing goes to Google.</li>
-    <li><strong>Everything is recorded:</strong> each run keeps a log of the commands, the software versions and which models made the audio, so you can say exactly what was done.</li>
+    <li><strong>Everything is recorded:</strong> each run keeps a log of the commands, the decisions, the software versions and which models made the audio, so you can say exactly what was done.</li>
   </ul>
 </section>
 
 <footer>
   <p>Questions about the pipeline: Brett Phinney, UC Davis Proteomics Core. The skill's source, including every script and the written procedure Claude follows, is on <a href="https://github.com/bsphinney/UCD-Proteomics-AI-Skill/tree/main/skill/ucdavis-proteomics-core-pipeline">GitHub</a>.</p>
-  <p>Details on this page are taken from the skill's release 2.15.0 and the Core's voice trial of 16–20 October, as of 12 November 2026. What was done for a particular report is in that report's own "How this report was made" section, its methods and its podcast transcript.</p>
+  <p>Details on this page are taken from the skill's release 2.15.0 and the Core's voice trial of 16–20 October, as of 18 November 2026. What was done for a particular report is in that report's own "How this report was made" section, its methods and its podcast transcript.</p>
 </footer>
 
 </div>
