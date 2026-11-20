@@ -68,7 +68,7 @@ from your own data. *(Video to follow.)*
 ## Why you can trust it
 
 - **Pinned engines.** One version of the skill always runs the same engine versions. In this
-  release (2.15.0) they are DIA-NN 2.7.0, Sage 0.14.7, FragPipe 24.0, Radiant 2.3.3 (container), and Skyline 26.1.0.266 for the peak check. It never swaps in a different version without telling you.
+  release (2.15.1) they are DIA-NN 2.7.0, Sage 0.14.7, FragPipe 24.0, Radiant 2.3.3 (container), and Skyline 26.1.0.266 for the peak check. It never swaps in a different version without telling you.
 - **Every setting has a source.** The search parameters come from your data type and instrument,
   not from a template. Each value records where it came from (measured from your files, the
   instrument's table, or a default, marked as a default), so you can see why it chose 15 ppm.
@@ -108,7 +108,7 @@ The **[install guide](https://bsphinney.github.io/UCD-Proteomics-AI-Skill/skill-
 troubleshooting.
 
 **Installed it before 2.15, from DE-LIMP?** Until 2.15 the skill lived in the DE-LIMP repository.
-You get 2.15.0 from there as usual, and 2.15.0 moves your catalogue here by itself when a session
+You get 2.15.1 from there as usual, and it moves your catalogue here by itself when a session
 starts, and tells you. If it could not (offline, or Claude Desktop), move it yourself with one line
 ([install guide](https://bsphinney.github.io/UCD-Proteomics-AI-Skill/skill-install.html#moved)).
 
@@ -350,7 +350,7 @@ reference files are in
 
 ## What's new
 
-This is version **2.15.0** (2026-11-12). What changed in it and in every earlier release is in the
+This is version **2.15.1** (2026-11-19). What changed in it and in every earlier release is in the
 [CHANGELOG](CHANGELOG.md).
 
 ## License and citation

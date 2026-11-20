@@ -4,6 +4,10 @@ Changes to the UC Davis Proteomics Core pipeline skill (`ucdavis-proteomics-core
 The entries before 2.15 were written in the DE-LIMP repository
 (https://github.com/bsphinney/DE-LIMP), whose CHANGELOG also holds the DE-LIMP app's own entries.
 
+## [Skill 2.15.1] — 2026-11-19
+
+- **The update check says when this computer still updates from DE-LIMP.** Before, a 2.14 copy that updated to 2.15.0 and then ran `/reload-plugins` was told nothing: `skill_version.sh --check-update` found the version current, returned `"moved": true` with no message, and the plugin catalogue stayed on the old repository until a new session started. Now its `say` names the new repository and the command that moves the catalogue (`skill_version.sh --session-start`). The check itself still changes nothing. DE-LIMP's `skill/` folder carries 2.15.1 too, so a computer still on 2.14 gets this fix with its update.
+
 ## [Skill 2.15.0] — 2026-11-12
 
 2.15 does five big things and then fixes what real data showed.
