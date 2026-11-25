@@ -27,16 +27,16 @@ A **high-throughput plate** is a different route: STAN knows its file list
 - 698: 4. `conditions` — the design from CoreOmics
 - 723: 5. The search and DE — session on HIVE, report written locally
 - 794: 6. `deliver` — real files into the Bioshare folder (HIVE)
-- 990: 7. `bioshare` — register and share (where the key is)
-- 1026: 8. `email-draft`
-- 1062: Several submissions in one analysis
-- 1109: Core client work with no CoreOmics submission yet (the feedback survey)
-- 1187: Troubleshooting by exit code
-- 1203: The linked-share lesson
-- 1214: Less-used flags
-- 1224: Step 1 for Core staff: where the CoreOmics steps run, and `identify`
-- 1255: 1c. The service run, step by step (step 1c)
-- 1464: 12b. Deliver to the collaborator (step 12b)
+- 999: 7. `bioshare` — register and share (where the key is)
+- 1035: 8. `email-draft`
+- 1071: Several submissions in one analysis
+- 1118: Core client work with no CoreOmics submission yet (the feedback survey)
+- 1196: Troubleshooting by exit code
+- 1212: The linked-share lesson
+- 1223: Less-used flags
+- 1233: Step 1 for Core staff: where the CoreOmics steps run, and `identify`
+- 1264: 1c. The service run, step by step (step 1c)
+- 1473: 12b. Deliver to the collaborator (step 12b)
 <!-- /contents -->
 
 ## Why this needs its own script
@@ -848,6 +848,15 @@ submissions) have
 - **an analysis delivery's DE holds it** (step 8): it ran without a decided normalisation check
   (`normalization_gate`, `normalization_check.delivery_gate`); a DE from before 2.10 goes once
   staff record `normalization_check.py ack-legacy`.
+- **a file to deliver carries what staff typed for the Core** (`leak_scan`, `staff.leak_scan`;
+  dry run included): a decision's reason or an acknowledgement's note from a staff-only record,
+  found by value in any delivered text file or inside a delivered zip; or a Core staff member's
+  login or name in a decision's text (`reason`, `statement`, `note`, `why`) in a delivered JSON
+  record. Names are looked for only there, so a Methods that cites a staff member's paper is
+  not held. The hold names the files and the place, never the words. **No one needs asking:**
+  regenerate the files (for a normalisation decision from before 2.16,
+  `normalization_check.py restate --check <json>`, then the final DE, the Methods, the audit,
+  the report and `session.py finalize`), log it with `log_decision.py`, and deliver again.
 - **an analysis delivery has no DE at all** (no `output/tables/de_provenance.json`; `--mode auto`
   resolves to analysis unless CoreOmics says raw data only). The hold says so: "this session has
   no differential expression". If a delivery without the DE is intended — a QC report, an

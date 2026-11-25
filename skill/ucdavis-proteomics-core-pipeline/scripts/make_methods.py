@@ -2329,7 +2329,10 @@ def de_normalisation_sentence(prov):
     et_ = nc.get("experiment_type") or {}
     d = nc.get("decision") or {}
     # a person's decision, by role (normalization_check.statement); their name is staff-only
-    chose = d.get("statement") or (
+    # (client_statement: generated from the check's record, never the person's typed reason --
+    # also for a DE record from before 2.16, which still holds it)
+    from normalization_check import client_statement
+    chose = client_statement(nc) or (
         f"{d.get('by') or NOT_RECORDED} chose "
         f"{(d.get('quantities') or NOT_RECORDED).replace('raw', 'non-normalised')} "
         f"quantities: {d.get('reason') or NOT_RECORDED}.")

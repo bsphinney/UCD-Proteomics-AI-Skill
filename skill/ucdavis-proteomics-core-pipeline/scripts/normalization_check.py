@@ -56,6 +56,8 @@ differently from a classic IP?); run_de.R copies it into de_provenance.json
   # is a Core staff member's, never Claude's: --by is their HIVE login (staff.py checks it)
   python3 normalization_check.py decide --check <S>/output/norm_check/normalization_check.json \\
       --quantities raw|normalised --by <their HIVE login> --reason "<why, in their words>"
+      # their words go ONLY to the staff-only record; client files get a sentence generated from
+      # the check (statement). A record from before 2.16 that still holds them: `restate --check`
   # the final DE, held to the decision
   Rscript run_de.R ... --quantities <decided> --normalization-check <the json> --outdir <S>/output/tables
   # a DE from before 2.10 (no check record) that staff say stands: lets the delivery through
@@ -1427,6 +1429,7 @@ def summary_md(rec):
     L += ["", f"**Recommendation:** {rec['recommendation']}", ""]
     if rec["decision"]:
         d = rec["decision"]
+        d = client_decision(rec)
         said = (d.get("statement")
                 or f"{d['quantities']} quantities -- {d.get('by')}: {d.get('reason')}")
         L.append(f"**Decision:** {said}")
@@ -1446,13 +1449,91 @@ def load(path):
     return rec
 
 
-def statement(quantities, reason, who=staff.ROLE):
-    """THE sentence client documents give a person's decision: by role, never by name. A second
-    `decide` replaces the first, and this sentence carries no history: what a client reads states
-    the decision that stands, never the earlier reason or that it was corrected (client_text.py;
-    both decisions stay in the staff-only record)."""
-    r = re.sub(r"^because\s+", "", (reason or "").strip(), flags=re.I).rstrip(". ")
-    return f"{who} chose {LABEL.get(quantities, quantities)} quantities because {r}."
+#: What the check record says of a person's reason: their words are staff-only (decide).
+REASON_STAFF_ONLY = "given to the Core in the person's own words; kept in its staff-only record"
+#: Marks a decision whose sentence was generated from the record (2.16), never typed.
+STATEMENT_FROM = "the check's record"
+
+
+def statement(quantities, rec, who=staff.ROLE):
+    """THE sentence client documents give a person's decision: by role, never by name, and
+    GENERATED from the check's own record -- what was chosen, against which default, whether the
+    data check had raised anything and what it recommended. Never the person's typed reason: a
+    reason "in their words" once carried a name into the report, AUDIT.md, the Methods and
+    de_provenance.json (a staff report, 2026-11-25), so those words stay in the staff-only record.
+    A second `decide` replaces the first, and this sentence carries no history (client_text.py)."""
+    rec = rec if isinstance(rec, dict) else {}
+    label = LABEL.get(quantities, quantities)
+    default = (rec.get("default") or {}).get("quantities")
+    typed = bool((rec.get("experiment_type") or {}).get("type"))
+    tripped = bool(rec.get("tripped") if "tripped" in rec else rec.get("trips"))
+    reviewed = "the data check's findings" if tripped else "the data check, which raised nothing"
+    if not typed or default not in LABEL:
+        said = f"{who} reviewed {reviewed} and chose {label} quantities"
+    elif quantities == default:
+        said = f"{who} reviewed {reviewed} and kept the default, {label} quantities"
+    else:
+        said = (f"{who} reviewed {reviewed} and chose {label} quantities instead of the default "
+                f"({LABEL[default]})")
+    try:
+        pick = _recommend(rec)[0] if rec.get("volcano") is not None else None
+    except (KeyError, TypeError, AttributeError):
+        pick = None                       # a record too thin to recommend from: say nothing of it
+    if pick in LABEL and (tripped or not typed):
+        said += ("; the check had recommended the same" if pick == quantities else
+                 f"; the check had recommended {LABEL[pick]} quantities")
+    return said + "."
+
+
+def client_decision(rec):
+    """The record's decision as a client file may carry it. A person's decision gets the
+    generated sentence (statement) and no typed reason -- also one recorded before 2.16, whose
+    `reason` and `statement` held the person's own words. The skill's own decision (the default,
+    the data check agreed) is returned as it is: nothing in it was typed."""
+    d = (rec or {}).get("decision")
+    if (not isinstance(d, dict) or d.get("source") != "user"
+            or d.get("statement_from") == STATEMENT_FROM):
+        return d
+    return dict(d, reason=REASON_STAFF_ONLY, statement=statement(d.get("quantities"), rec),
+                statement_from=STATEMENT_FROM)
+
+
+def client_statement(nc):
+    """The decision sentence for a client file, from a check record or its copy in
+    de_provenance.json (make_methods.py, audit_results.py): client_decision's, so a record from
+    before 2.16 never hands its typed reason on. None when the record gives no sentence."""
+    return (client_decision(nc) or {}).get("statement")
+
+
+def typed_reasons(rec):
+    """The person's own words still inside a check record written before 2.16 -> [text]."""
+    d = (rec or {}).get("decision")
+    if not isinstance(d, dict) or d.get("source") != "user" or d.get("statement_from") == STATEMENT_FROM:
+        return []
+    return [str(d[k]) for k in ("reason", "statement") if str(d.get(k) or "").strip()]
+
+
+def restate(path):
+    """Rewrite a check record written before 2.16 so it holds the generated sentence, not the
+    person's words (which go to the staff-only record if they are not there already). The
+    decision itself is untouched. -> (record, changed)."""
+    rec = load(path)
+    d = rec.get("decision")
+    if not typed_reasons(rec):
+        return rec, False
+    where, named = decision_staff_record(path, rec)
+    try:
+        known = {str(e.get("reason") or "").strip() for e in staff.read(where)}
+    except (OSError, ValueError):
+        known = set()
+    if str(d.get("reason") or "").strip() not in known:
+        staff.append(where, {"event": "restate", "by": d.get("by"), "account": staff.login(),
+                             "at": staff.now(), "quantities": d.get("quantities"),
+                             "reason": str(d.get("reason") or "").strip(),
+                             "decided_at": d.get("at"), "check": os.path.abspath(path)})
+    rec["decision"] = dict(client_decision(rec), staff_record=d.get("staff_record") or named)
+    write(rec, os.path.dirname(os.path.abspath(path)))
+    return rec, True
 
 
 def decision_staff_record(path, rec):
@@ -1470,11 +1551,13 @@ def decision_staff_record(path, rec):
 def decide(path, quantities, by, reason):
     """Record a Core staff member's decision -- theirs, never Claude's: --by is their HIVE login
     (staff.require). The check record (and so de_provenance.json, the Methods, the zip) names the
-    role; their name and login go to the staff-only record."""
+    role and carries a sentence generated from the check (statement); their name, their login and
+    the reason in their words go to the staff-only record, and nowhere else."""
     if quantities not in (et.RAW, et.NORMALISED):
         raise ValueError("--quantities must be raw or normalised")
     if not (reason and reason.strip()):
-        raise ValueError("--reason is required: why they chose it, in their words")
+        raise ValueError("--reason is required: why they chose it, in their words (kept in the "
+                         "staff-only record)")
     rec = load(path)
     c = staff.require(by)
     at = staff.now()
@@ -1483,8 +1566,8 @@ def decide(path, quantities, by, reason):
                          "account": staff.login(), "at": at, "quantities": quantities,
                          "reason": reason.strip(), "check": os.path.abspath(path)})
     rec["decision"] = {"quantities": quantities, "source": "user", "by": staff.ROLE,
-                       "reason": reason.strip(), "statement": statement(quantities, reason),
-                       "at": at, "default_was": rec["default"]["quantities"],
+                       "reason": REASON_STAFF_ONLY, "statement": statement(quantities, rec),
+                       "statement_from": STATEMENT_FROM, "at": at, "default_was": rec["default"]["quantities"],
                        "data_check_tripped": rec["tripped"],
                        # the person, by name and login: staff-only, never delivered
                        "staff_record": named}
@@ -1525,7 +1608,7 @@ def gate(path, quantities, report=None, conditions=None, design=None, applied=No
                        "normalization_check.py decide."), rec
     if d["quantities"] != quantities:
         return False, (f"REFUSED: the recorded decision is {d['quantities']} quantities "
-                       f"({d['by']}: {d['reason']}), and this DE asked for {quantities}. Run it "
+                       f"({d.get('by')}), and this DE asked for {quantities}. Run it "
                        f"with --quantities {d['quantities']}, or record a new decision -- never a "
                        "silent switch."), rec
     return True, (f"{quantities} quantities, as decided ({d['by']}); data check "
@@ -1558,13 +1641,19 @@ def main():
     d.add_argument("--quantities", required=True, choices=(et.RAW, et.NORMALISED))
     d.add_argument("--by", required=True, help="their HIVE login, listed in the Core's staff file "
                                                "(staff.py)")
-    d.add_argument("--reason", required=True, help="why, in their words -- shown to the client, "
-                                                   "so no names")
+    d.add_argument("--reason", required=True, help="why, in their words -- kept in the "
+                                                   "staff-only record, never shown to the "
+                                                   "client (client files get a sentence "
+                                                   "generated from the check)")
     k = sub.add_parser("ack-legacy", help="a DE from before 2.10 (no check record) stands: let "
                                           "its delivery through")
     k.add_argument("--session", required=True)
     k.add_argument("--by", required=True, help="the Core staff member's HIVE login (staff.py)")
     k.add_argument("--note", required=True, help="why this DE stands, one line")
+    rs = sub.add_parser("restate", help="rewrite a check record from before 2.16 so it holds "
+                                        "the generated decision sentence, not the person's words "
+                                        "(which stay in the staff-only record)")
+    rs.add_argument("--check", required=True)
     g = sub.add_parser("gate")
     g.add_argument("--check", required=True)
     g.add_argument("--quantities", required=True)
@@ -1617,6 +1706,9 @@ def main():
         elif a.cmd == "decide":
             rec = decide(a.check, a.quantities, a.by, a.reason)
             print(json.dumps({"decision": rec["decision"]}, indent=2))
+        elif a.cmd == "restate":
+            rec, changed = restate(a.check)
+            print(json.dumps({"changed": changed, "decision": rec["decision"]}, indent=2))
         elif a.cmd == "ack-legacy":
             g = ack_legacy(a.session, a.by, a.note)
             print(json.dumps({"gate": g}, indent=2))
@@ -1633,7 +1725,10 @@ def main():
             ok, msg, rec = gate(a.check, a.quantities, a.report, a.conditions, design,
                                 a.between_run_applied)
             dc = design_check(rec, design, a.quantities, a.between_run_applied)
-            print(json.dumps({"ok": ok, "message": msg, "record": rec,
+            # the decision as the DE record may carry it: run_de.R copies THIS, so a check from
+            # before 2.16 never hands the person's typed reason to de_provenance.json
+            rec = dict(rec, decision=client_decision(rec))
+            print(json.dumps({"ok": ok, "message": msg, "record": rec, "decision": rec["decision"],
                               "design_match": dc["match"], "warnings": dc["warnings"],
                               "between_run_pending": dc.get("between_run_pending")}))
     except (ValueError, OSError) as e:

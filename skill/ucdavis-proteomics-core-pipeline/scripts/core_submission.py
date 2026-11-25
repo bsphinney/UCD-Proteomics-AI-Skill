@@ -5337,6 +5337,39 @@ def cmd_deliver(a) -> int:
             plan["hint"] = ngate["hint"]
             emit(plan)
             return EXIT_DECIDE
+    # The third: nothing a staff member typed for the Core (a decision's reason, an
+    # acknowledgement's note -- staff-only records) and no staff login or name in a decision's
+    # text leaves in a delivered file (staff.leak_scan, the rule; a typed reason once carried a
+    # name into the report, the audit and the Methods -- a staff report, 2026-11-25). Dry run
+    # included. The hit names the file and the place, never the words.
+    if mode != "raw-only" and session_dir:
+        leaks = sibling("staff").leak_scan(session_dir, [(i["src"], i["name"]) for i in ok])
+        plan["leak_scan"] = {k: leaks[k] for k in ("scanned", "hits", "not_scanned", "problems")}
+        for w in leaks["not_scanned"]:
+            warnings.append(f"staff-text scan: {w}")
+        if leaks["problems"]:
+            # a staff-only record that cannot be read: what it holds cannot be looked for
+            plan["error"] = ("held: a staff-only record could not be read, so the delivery "
+                             "cannot be checked for the text in it: " + "; ".join(leaks["problems"]))
+            plan["hint"] = ("repair or restore that record (the nightly backup has earlier "
+                            "copies), then deliver again")
+            emit(plan)
+            return EXIT_DECIDE
+        if leaks["hits"]:
+            files = sorted({h["file"] for h in leaks["hits"]})
+            plan["error"] = ("held: " + str(len(files)) + " file(s) to deliver carry text a staff "
+                             "member typed for the Core, or a staff login or name in a decision's "
+                             "text: " + ", ".join(files[:8])
+                             + (f" and {len(files) - 8} more" if len(files) > 8 else ""))
+            plan["hint"] = ("no one needs asking: regenerate the files. For a normalisation "
+                            "decision recorded before skill 2.16: python3 scripts/"
+                            "normalization_check.py restate --check <each normalization_check."
+                            "json>, then re-run the final DE (step 8), the Methods, the audit and "
+                            "the report (steps 9-11) and session.py finalize, and deliver again. "
+                            "For any other file in leak_scan.hits, re-run the step that wrote it "
+                            "with a reason that names no one. Log it with log_decision.py")
+            emit(plan)
+            return EXIT_DECIDE
     record_dir = session_dir or (record or {}).get("work_dir")
     if total > a.max_gb * 1024 ** 3 and not a.no_size_guard:
         plan["deliver_job"] = write_deliver_job(a, session_dir, record_dir, label, total, warnings)

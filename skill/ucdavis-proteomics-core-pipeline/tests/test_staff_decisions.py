@@ -212,14 +212,20 @@ class DecideIsThePersons(StaffEnv):
         s, path = self.in_session()
         d = nc.decide(path, et.RAW, "jdoe", "Because " + REASON + ".")["decision"]
         self.assertEqual(d["by"], staff.ROLE)
-        self.assertEqual(d["statement"], "Core staff chose non-normalised (raw) quantities because "
-                                         "the IgG controls carry little protein.")
+        # a sentence generated from the check; the person's words are in the staff-only record
+        self.assertEqual(d["statement"], "Core staff reviewed the data check's findings and chose "
+                                         "non-normalised (raw) quantities; the check had "
+                                         "recommended normalised quantities.")
+        self.assertEqual(d["reason"], nc.REASON_STAFF_ONLY)
+        self.assertEqual(staff.read(os.path.join(s, "logs", nc.STAFF_RECORD))[0]["reason"],
+                         "Because " + REASON + ".")
         self.assertEqual(d["staff_record"], os.path.join("logs", nc.STAFF_RECORD))
         for f in (path, os.path.join(os.path.dirname(path), nc.SUMMARY)):
             with open(f) as fh:
                 text = fh.read()
             self.assertNotIn("jdoe", text, f)
-            self.assertIn("Core staff chose non-normalised (raw) quantities", text)
+            self.assertIn("chose non-normalised (raw) quantities", text)
+            self.assertNotIn(REASON, text, f)
         entries = staff.read(os.path.join(s, "logs", nc.STAFF_RECORD))
         self.assertEqual([(e["event"], e["by"], e["account"], e["quantities"]) for e in entries],
                          [("decide", "jdoe", ME, et.RAW)])
@@ -243,8 +249,9 @@ class DecideIsThePersons(StaffEnv):
         prov = {"normalisation": "none", "normalization_check": dict(rec, status="decided",
                                                                      quantities_applied=et.RAW)}
         sentence = make_methods.de_normalisation_sentence(prov)
-        self.assertIn("and Core staff chose non-normalised (raw) quantities because the IgG "
-                      "controls carry little protein.", sentence)
+        self.assertIn("and Core staff reviewed the data check's findings and chose "
+                      "non-normalised (raw) quantities", sentence)
+        self.assertNotIn(REASON, sentence)
         self.assertNotIn("jdoe", sentence)
         tables = os.path.join(self.tmp, "tables")
         os.makedirs(tables)
@@ -258,7 +265,7 @@ class DecideIsThePersons(StaffEnv):
             with open(os.path.join(self.tmp, f)) as fh:
                 text = fh.read()
             self.assertNotIn("jdoe", text, f)
-            self.assertIn("Core staff chose non-normalised (raw) quantities", text, f)
+            self.assertIn("chose non-normalised (raw) quantities", text, f)
 
     def test_the_cli_refuses_an_agent(self):
         _, path = self.in_session()

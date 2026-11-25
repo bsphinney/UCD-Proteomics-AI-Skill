@@ -1288,8 +1288,11 @@ def audit_normalization_check(findings, de_prov):
     d = nc.get("decision") or {}
     # AUDIT.md is delivered: a person's decision by role (normalization_check.statement), never
     # by name -- the name is in the staff-only record
-    chose = d.get("statement") or (f"{d.get('by')} chose {d.get('quantities')} quantities: "
-                                   f"{d.get('reason')}.")
+    # (client_statement: generated from the check's record, never the person's typed reason --
+    # also for a DE record from before 2.16, which still holds it)
+    from normalization_check import client_statement
+    chose = client_statement(nc) or (f"{d.get('by')} chose {d.get('quantities')} quantities: "
+                                     f"{d.get('reason')}.")
     detail = {"experiment_type": et_.get("type"), "default": (nc.get("default") or {}).get("quantities"),
               "applied": nc.get("quantities_applied"), "trips": nc.get("trips"),
               "decision_by": d.get("by")}

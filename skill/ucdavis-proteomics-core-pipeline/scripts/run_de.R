@@ -614,6 +614,10 @@ norm_check_rec <- if (is.null(norm_check_path)) {
   # the record verbatim (simplifyVector = FALSE keeps every JSON array an array, so the block's
   # schema survives into de_provenance.json unchanged -- python_json simplifies)
   .r <- jsonlite::fromJSON(norm_check_path, simplifyVector = FALSE)
+  # the decision as a client file may carry it (normalization_check.client_decision, in the
+  # gate's answer): a person's decision is a sentence generated from the check, never their
+  # typed reason -- which a check record from before 2.16 still holds
+  if (!is.null(.ng$res$decision)) .r$decision <- as.list(.ng$res$decision)
   .r$status <- "decided"
   .r$quantities_applied <- quantities
   .r$design_match <- .ng$res$design_match %||% "not compared (normalization_check.py gave no answer)"

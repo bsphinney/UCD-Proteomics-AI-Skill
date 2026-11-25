@@ -22,10 +22,10 @@ bundle's `de.method` says `maxlfq`).
 - 663: Citations (verified June 2026)
 - 681: Less-used flags
 - 685: Step 8: the normalisation check and the final DE
-- 787: Step 8: blocks and numeric covariates
-- 820: Step 8: keratin samples and contaminants
-- 856: Step 8: the method, what `run_de.R` writes, QuantUMS
-- 928: 8b. Figures, and what counts as significant (step 8b)
+- 792: Step 8: blocks and numeric covariates
+- 825: Step 8: keratin samples and contaminants
+- 861: Step 8: the method, what `run_de.R` writes, QuantUMS
+- 933: 8b. Figures, and what counts as significant (step 8b)
 <!-- /contents -->
 
 ## Invocation
@@ -745,9 +745,14 @@ Never choose, and never fill in `--by` yourself. `--by` is their HIVE login, nev
 `/quobyte/proteomics-grp/.config/core_staff.txt`, trusted only when a Core admin owns it). With
 the list, a login on it is accepted and any other is refused. With no list, a login that is an
 agent's name (claude, assistant, bot…) is refused, and any other passes with a NOT VERIFIED
-warning. Their name and login go only into the
+warning. Their name, their login and the reason in their own words go only into the
 staff-only `logs/normalization_check.staff.json`. The Methods, AUDIT.md, `de_provenance.json` and
-the zip say "Core staff chose … because <reason>", so the reason must not name anyone. A
+the zip carry a sentence `decide` generates from the check's record: what was chosen, against
+which default, whether the data check raised anything and what it recommended ("Core staff
+reviewed the data check's findings and kept the default, normalised quantities; the check had
+recommended …"). So record the reason as they said it; it cannot reach a client. A check record
+from before 2.16 still holds the typed words: `normalization_check.py restate --check <json>`
+rewrites it (the decision is untouched), then re-run the final DE. A
 second `decide` replaces the first: its sentence has no history, and the report, the audit and
 the podcast state only the decision that stands -- never the earlier reason, nor that it was
 "corrected" (the change and why go in `logs/decisions.md`; both decisions stay in the staff-only
