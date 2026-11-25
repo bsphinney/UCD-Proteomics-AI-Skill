@@ -8,12 +8,13 @@ over-interpret anything. FAILs should stop interpretation; WARNs go in the repor
 
 <!-- contents: tests/test_skill_structure.py --toc -->
 **Contents** (section: line)
-- 19: What it checks
-- 38: What the client reads: a plain-language table
-- 57: How the orchestrator uses it
-- 69: Why deterministic, not LLM-judged
-- 77: Tuning
-- 85: 8c. The audit and the sample-quality check (step 8c)
+- 20: What it checks
+- 39: What the client reads: a plain-language table
+- 58: How the orchestrator uses it
+- 70: Searching again without contaminant entries
+- 111: Why deterministic, not LLM-judged
+- 119: Tuning
+- 127: 8c. The audit and the sample-quality check (step 8c)
 <!-- /contents -->
 
 ## What it checks
@@ -64,7 +65,48 @@ when staff ask, and in plain words).
   differential results aren't trustworthy; tell the user plainly and how to fix it
   (add replicates, de-confound the design, split by acquisition/instrument).
 - **Relay every `WARN`** and fold the findings into the report.
-- **A `contaminant_competition` WARN** names proteins the contaminant list took away. Tell the user; a re-search without those entries is Core staff's call (the director chose, 2026-10-20, to keep the universal list and report what it takes).
+- **A `contaminant_competition` WARN** names proteins the contaminant list took away. Tell the user. The first search always uses the universal list (the director's decision, 2026-10-20). Whether to search again without some entries is decided by the record, not by you and not by asking: `search_again.advised` → "Searching again without contaminant entries" below. When it is not advised, a re-search is Core staff's call.
+
+## Searching again without contaminant entries
+
+The Core director's decision, 2026-11-25: when the contaminant list took a real part of the
+sample's signal, fix it without asking anyone, and record what was done. A serum or plasma of an
+animal is the usual case: the universal list's bovine serum entries are close copies of the
+sample's own abundant proteins (measured: 14% of a pig serum's signal, 6% of a mouse serum's).
+
+`contaminant_competition.py` decides, by a fixed rule, in every DIA-NN search's record
+(`contaminant_competition.json`, shown by the watcher): `search_again.advised` is true when the
+median run would get back at least `threshold_pct` (2%) of its precursor signal by leaving out the
+entries in `search_again.drop_contaminant`. Those are the entries that carry more of the sample's
+signal than signal of their own; never a digestion enzyme, never a keratin, and never another
+skin protein that handling brings in with keratin (filaggrin, filaggrin-2, hornerin, dermokine in
+the shipped sets; the rule is `search_again.never_drop_rule`, and `search_again.kept_never_drop`
+names the entries it held back). Whose signal those carry cannot be told. A protein that was
+really added to the sample (bovine albumin) has far more signal of its own and stays.
+
+When `advised` is true, do this without asking the user or Core staff, and before any DE:
+
+1. Rebuild the FASTA with the step-6 `fetch_fasta.py` command exactly as it was, plus
+   `search_again.fetch_fasta_args` (the `--drop-contaminant` list), into a new file.
+2. Search again with it in a new session, every other setting unchanged (the same engine,
+   version, files and parameters). This is the one new search that needs no new "go" (golden
+   rule 1). The first search stays where it is; never delete it.
+3. Log the decision in both sessions, the record's words verbatim:
+   ```
+   python3 scripts/log_decision.py --session <S> --step '7b. search again' --what-file - --why-file - <<'EOF'
+   Automatic second search without <N> contaminant entries (no one was asked). First search: <its session>. Second: <its session>. Reserved for the second search: <CPU-hours>.
+   ---
+   <search_again.reason, verbatim>. The entries: search_again.drop_contaminant in <path to the first search's contaminant_competition.json>.
+   EOF
+   ```
+4. Run the DE and everything after it on the second search only.
+5. In the summary at the end of the analysis, under the decisions made without asking, say it in
+   one or two sentences: that the search was run twice, why (the percentage), how many entries
+   were left out, and what the second search cost.
+
+It happens once. The second search's record reads `already_dropped_by_name` and is never advised
+again; if it still says `NOT SEARCHED AGAIN`, relay that sentence and carry on. When `advised` is
+false and there is no such sentence, nothing is to be done.
 
 ## Why deterministic, not LLM-judged
 These are exactly the checks where an over-eager interpreter would hand a new user a

@@ -30,7 +30,7 @@ reproducibility bundle (10) → finalize (12; it writes `AGENTS.md`; run `sessio
    accuracy + its source, organism, FASTA, design, DE method) and get one explicit "go". **One
    confirmation, not a menu.** The jobs that carry out that plan (later chain steps, watcher retries,
    DE, set tests, figures, the podcast) then need no further yes. A new search with settings the user
-   has not seen needs a new go, unless they told you to decide (log each decision). Core staff: the
+   has not seen needs a new go, unless they told you to decide or step 7b's `search_again` advises it (log each decision). Core staff: the
    board only records each job's hours; it limits and approves nothing. Sharing with a collaborator (`bioshare send`) is a second, separate yes.
 2. **Never fabricate parameters.** A value is a shipped default, its source quoted (`ppm_source`),
    or the user's; a default in user-facing text is tagged `DEFAULT — not user-confirmed`.
@@ -350,8 +350,8 @@ fragpipe-diatracer.md "7."; a cluster: search-engines.md "7. On a cluster"). In 
 `stalled` is true, apply the `fix` and resubmit AUTONOMOUSLY.** `node_fault` → tell the user it is the
 node; `node_fault.py retry`. A dead chain → `record_run.py search-done --status failed`. DE only after
 `COMPLETED` and `report.parquet`; offer the first pass only for `switch_recommended_for`. → watcher.md
-"7b.". Every DIA-NN search: tell the user which genes `contaminant_competition` names COMPETED OUT or
-SIPHONED (a report, never a gate; audit.md). Core staff: board.md §3 row "search finished".
+"7b.". Every DIA-NN search: tell which genes `contaminant_competition` names COMPETED OUT or SIPHONED;
+`search_again.advised` → rebuild and search again UNASKED, logged (audit.md "Searching again without contaminant entries"). Core staff: board.md §3 row "search finished".
 
 ### 7c. Hand the search to FRAN — automatic, Core searches only
 The job stages a Core DIA-NN search itself; the rest (`left_to_agent`) you `check` and `stage` with

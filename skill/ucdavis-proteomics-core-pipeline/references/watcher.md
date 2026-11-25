@@ -16,18 +16,18 @@ what you did afterwards; don't ask permission to unstick a job.
 - 84: What a poll reads, and says
 - 90: Error classes → fixes (what `watch_run.sh` detects)
 - 122: Warnings that are not failures: proteins the contaminant list took
-- 132: Warnings that are not failures: a DIA-NN --dda search on its first pass
-- 143: Warnings that are not failures: Sage LFQ
-- 160: Warnings that are not failures: protein inference in step 5
-- 175: SLURM specifics (HIVE)
-- 193: Node faults: the node check every chain job runs first
-- 207: Keeping a search off nodes known to be bad (`--exclude`)
-- 232: Auto-recovery playbook (apply autonomously; log every action to `commands.log`)
-- 255: Don't
-- 273: Progress reporting (`--out`, `--poll`)
-- 308: 0c. Is this a resume? (step 0c)
-- 344: A closed laptop: `RECOVERY.md` (step 0c)
-- 353: 7b. The watch loop as SKILL.md runs it (step 7b)
+- 135: Warnings that are not failures: a DIA-NN --dda search on its first pass
+- 146: Warnings that are not failures: Sage LFQ
+- 163: Warnings that are not failures: protein inference in step 5
+- 178: SLURM specifics (HIVE)
+- 196: Node faults: the node check every chain job runs first
+- 210: Keeping a search off nodes known to be bad (`--exclude`)
+- 235: Auto-recovery playbook (apply autonomously; log every action to `commands.log`)
+- 258: Don't
+- 276: Progress reporting (`--out`, `--poll`)
+- 311: 0c. Is this a resume? (step 0c)
+- 347: A closed laptop: `RECOVERY.md` (step 0c)
+- 356: 7b. The watch loop as SKILL.md runs it (step 7b)
 <!-- /contents -->
 
 ## Watch the WHOLE chain, not its last job
@@ -123,11 +123,14 @@ rewritten into `C:/Program Files/Git/nfs/...` (which read as `no_jobs_file`).
 
 Every DIA-NN search's last job runs `contaminant_competition.py` (`references/audit.md`). Once
 the search has finished, the watcher reads `<out>/contaminant_competition.json` and adds
-`contaminant_competition` (`status`, `competed_out`, `siphoned`, `drop_contaminant`) and, when a
-gene was taken, its message to `warnings`. A record whose report has since changed (a re-search
+`contaminant_competition` (`status`, `competed_out`, `siphoned`, `drop_contaminant`, and
+`search_again` when the record advises one or says why not) and, when a
+gene was taken or a second search is advised, its message to `warnings`. A record whose report has since changed (a re-search
 into the same folder) reads `status: stale` and is not shown; `unchecked` when the report could
 not be looked at (poll again). Not a failure, nothing to
-resubmit: tell the user which genes.
+resubmit: tell the user which genes. `search_again.advised: true` is the one case with something
+to do, and it is done without asking: `references/audit.md` "Searching again without contaminant
+entries".
 
 ## Warnings that are not failures: a DIA-NN --dda search on its first pass
 
@@ -444,8 +447,8 @@ If they take it, `make_methods.py` says so in the Methods, from `de_provenance.j
 (never write that by hand), and `audit_results.py` reports the comparison in AUDIT.md either way.
 
 **Every DIA-NN search: the proteins the contaminant list took.** Its last job runs
-`contaminant_competition.py` (a report, never a gate); the watcher's `contaminant_competition`
+`contaminant_competition.py` (it never fails a job); the watcher's `contaminant_competition`
 names COMPETED OUT genes (no quantity left) and SIPHONED ones. Tell the user; AUDIT.md carries
-it to the report. → `references/audit.md`.
+it to the report. `search_again.advised` → search again unasked and log it. → `references/audit.md`.
 
 Core staff: board.md §3 row "search finished", once its last job has ended.
