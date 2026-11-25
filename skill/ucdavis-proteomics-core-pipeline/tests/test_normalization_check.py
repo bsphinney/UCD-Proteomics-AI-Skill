@@ -442,11 +442,12 @@ class VerdictAndGate(unittest.TestCase):
             nc.decide(path, et.RAW, "canalyst", "IgG controls carry little protein")
             rec = nc.decide(path, et.NORMALISED, "canalyst", "the loading was equal after all")
             said = rec["decision"]["statement"]
-            self.assertEqual(said, "Core staff chose normalised quantities because the loading "
-                                   "was equal after all.")
+            self.assertEqual(said, "Core staff reviewed the data check's findings and chose "
+                                   "normalised quantities; the check had recommended the same.")
             with open(os.path.join(d, nc.SUMMARY), encoding="utf-8") as fh:
                 md = fh.read()
             self.assertNotIn("IgG controls carry little protein", md + json.dumps(rec))
+            self.assertNotIn("the loading was equal after all", md + json.dumps(rec))
             self.assertEqual(client_text.draft_history(md + " " + said), [])
             with open(os.path.join(d, nc.STAFF_RECORD)) as fh:
                 self.assertEqual([e["reason"] for e in json.load(fh)["entries"]],
@@ -621,8 +622,12 @@ class EndToEnd(unittest.TestCase):
         with open(os.path.join(final, "methods.txt")) as fh:
             methods = fh.read()
         self.assertIn("Quantities    : non-normalised (--quantities raw)", methods)
-        self.assertIn("Core staff chose non-normalised (raw) quantities because the IgG lanes carry "
-                      "far less protein.", " ".join(methods.split()))
+        # the decision as a sentence generated from the check, never the person's typed reason
+        self.assertIn("Core staff reviewed the data check's findings and chose non-normalised "
+                      "(raw) quantities instead of the default (normalised)",
+                      " ".join(methods.split()))
+        with open(os.path.join(final, "de_provenance.json")) as fh:
+            self.assertNotIn("far less protein", fh.read() + methods)
         # who chose, by name, is staff-only: never in the DE's (delivered) record or Methods
         with open(os.path.join(final, "de_provenance.json")) as fh:
             self.assertNotIn("canalyst", fh.read() + methods)

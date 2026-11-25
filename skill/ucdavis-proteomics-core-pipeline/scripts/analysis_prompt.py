@@ -143,11 +143,15 @@ def normalisation_brief(w, prov, etype, etype_err, design):
           "normalisation suited this experiment was not checked.")
     else:
         d = nc.get("decision") or {}
+        # the decision as a client file may say it (normalization_check.client_statement:
+        # generated from the check, never a person's typed reason)
+        from normalization_check import client_statement
+        chose = client_statement(nc) or (f"{d.get('by')} chose {d.get('quantities')}: "
+                                         f"{d.get('reason')}.")
         w(f"- **Normalisation check:** default {nc.get('default', {}).get('quantities')} for this "
           "type; the data check " + ("agreed." if not nc.get("tripped") else
                                     "did NOT agree (" + "; ".join(nc.get("trips") or []) +
-                                    f"); {d.get('by')} chose {d.get('quantities')}: {d.get('reason')}."
-                                    " Say so in Data Quality Notes."))
+                                    f"); {chose} Say so in Data Quality Notes."))
         vol = (nc.get("volcano") or {}).get(nc.get("quantities_applied") or "") or {}
         for c, v in (vol.get("contrasts") or {}).items():
             if "n" not in v:

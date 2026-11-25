@@ -606,6 +606,216 @@ def redact_log(path, *places):
     return text, notes
 
 
+# ---------------------------------------------------------------- the delivery's leak scan --
+# What a person typed for the Core -- the reason for a decision, an acknowledgement's note --
+# stays in the staff-only records. A reason "in their words" once reached a client report, the
+# audit, the Methods and de_provenance.json with the person's name in it (a staff report,
+# 2026-11-25), and the delivery went out. So core_submission.py deliver looks, before it copies:
+#   * every such text, by value, in every text file it would deliver (and inside a delivered zip);
+#   * a Core staff member's login or name in a decision's own text in a delivered JSON record
+#     (keys LEAK_KEYS: reason, statement, note, why).
+# Names are looked for only there, never in the whole text: a Methods cites papers by Core staff.
+LEAK_TEXT_KEYS = ("reason", "note", "why_text", "why")       # typed, in a staff-only record
+#: The staff-record entries whose text is typed for the Core ALONE (by `event`, as a prefix). Not
+#: "override": an override's reason is written for the client too (estimate_params.py's sidecar,
+#: "the sidecar travels to the client") -- there only a staff login or name in it is a leak. Not
+#: "engine_selection" or "platform_note": the skill's own words.
+LEAK_EVENTS = ("decide", "restate", "ack-legacy", "core-client")
+#: by value, only a text that cannot be an ordinary phrase
+LEAK_MIN_WORDS, LEAK_MIN_CHARS = 4, 20
+#: a part of a staff member's full name counts from this many letters, and as written (capital
+#: first): "Will" the person, never "will" the verb
+LEAK_NAME_MIN = 4
+LEAK_KEYS = re.compile(r"(?:^|_)(?:reasons?|statement|notes?|why)$", re.I)
+LEAK_SCAN_EXT = (".md", ".txt", ".json", ".html", ".htm", ".yaml", ".yml", ".log", ".r", ".rmd",
+                 ".py", ".sh")
+LEAK_SCAN_MAX = 64 * 1024 ** 2          # a larger file is listed as not scanned, never skipped silently
+#: where a session keeps staff-only records besides logs/ (a check's own folder, one level down)
+_LEAK_RECORD_DEPTH = 3
+
+
+def _staff_records(session_dir, srcs=()):
+    """The staff-only records of a session: in logs/, under output/ (to _LEAK_RECORD_DEPTH) and
+    beside any file in `srcs`."""
+    found, dirs = [], set()
+    if session_dir:
+        dirs.add(os.path.join(session_dir, "logs"))
+        top = os.path.join(session_dir, "output")
+        for root, sub, _files in os.walk(top):
+            if root[len(top):].count(os.sep) >= _LEAK_RECORD_DEPTH:
+                sub[:] = []
+            dirs.add(root)
+    dirs.update(os.path.dirname(os.path.abspath(p)) for p in srcs if p)
+    for d in sorted(dirs):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        found += [os.path.join(d, n) for n in sorted(names) if is_staff_only(n)]
+    return found
+
+
+def typed_texts(session_dir, srcs=()):
+    """What staff typed for the Core in this session -> ([text], [login], [problem]): each
+    staff-only record's LEAK_TEXT_KEYS, and the logins those records name (by, account)."""
+    texts, logins, problems = [], [], []
+    for path in _staff_records(session_dir, srcs):
+        try:
+            entries = read(path)
+        except (OSError, ValueError) as e:
+            problems.append(f"{path}: {type(e).__name__}: {e}")
+            continue
+        for e in entries:
+            if str(e.get("event") or "").startswith(LEAK_EVENTS):
+                for k in LEAK_TEXT_KEYS:
+                    v = e.get(k)
+                    if isinstance(v, str) and v.strip() and v.strip() not in texts:
+                        texts.append(v.strip())
+            for k in ("by", "account"):
+                v = str(e.get(k) or "").strip().lower()
+                # a person's login only: never "user", "claude" or a role's word
+                if (_LOGIN.match(v) and v not in logins and not is_agent_like(v)
+                        and v not in ("user", "staff", "core")):
+                    logins.append(v)
+    return texts, logins, problems
+
+
+def staff_identities(extra_logins=()):
+    """Words that name a Core staff member -> {word: "login" | "name"}: each login on the Core's
+    staff list (and in `extra_logins`), lowercase, and the parts of that account's full name (its
+    passwd entry) of LEAK_NAME_MIN+ letters, capital first. Without a usable list, the
+    `extra_logins` only."""
+    logins = list(load_staff()[0] or [])
+    logins += [x for x in extra_logins if x not in logins]
+    words = {}
+    for lg in logins:
+        words[lg] = "login"
+        try:
+            import pwd
+            full = pwd.getpwnam(lg).pw_gecos.split(",")[0]
+        except (ImportError, KeyError):
+            full = ""
+        for part in re.findall(r"[^\W\d_]{%d,}" % LEAK_NAME_MIN, full):
+            words.setdefault(part.capitalize(), "name")
+    return words
+
+
+def _leak_strings(obj, path=""):
+    """(key path, text) for each string under a LEAK_KEYS key of a JSON value."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            here = f"{path}.{k}" if path else str(k)
+            if LEAK_KEYS.search(str(k)):
+                for s in ([v] if isinstance(v, str) else
+                          [x for x in v if isinstance(x, str)] if isinstance(v, list) else []):
+                    yield here, s
+            if isinstance(v, (dict, list)):
+                yield from _leak_strings(v, here)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _leak_strings(v, f"{path}[{i}]")
+
+
+def _leak_forms(texts):
+    """Each typed text as a delivered file may hold it -> [str], whitespace collapsed: as typed,
+    as JSON writes it and as HTML escapes it. Only a text of LEAK_MIN_WORDS+ words and
+    LEAK_MIN_CHARS+ characters: a shorter one is an ordinary phrase."""
+    import html
+    forms = []
+    for t in texts:
+        t = " ".join(t.split())
+        if len(t.split()) < LEAK_MIN_WORDS or len(t) < LEAK_MIN_CHARS:
+            continue
+        for f in (t, json.dumps(t)[1:-1], json.dumps(t, ensure_ascii=False)[1:-1],
+                  html.escape(t), html.escape(t, quote=False),
+                  html.escape(t).replace("&#x27;", "&#39;")):
+            if f not in forms:
+                forms.append(f)
+    return forms
+
+
+def _leaks_in_text(name, text, patterns, id_rx, kinds):
+    hits = []
+    flat = " ".join(text.split())
+    for form in patterns:
+        if form in flat:
+            at = text.find(form.split()[0] + " " + form.split()[1])
+            hits.append(dict({"file": name, "what": "text a staff member typed for the Core (a "
+                                                    "decision's reason or note)"},
+                             **({"line": text.count("\n", 0, at) + 1} if at >= 0 else {})))
+            break
+    if id_rx is not None and name.lower().endswith(".json"):
+        try:
+            rec = json.loads(text)
+        except (ValueError, RecursionError):
+            rec = None
+        for key, s in _leak_strings(rec):
+            m = id_rx.search(s)
+            if m:
+                hits.append({"file": name, "key": key,
+                             "what": f"a Core staff member's {kinds[m.group('n') or m.group('l').lower()]}"
+                                     " in a decision's text"})
+    return hits
+
+
+def leak_scan(session_dir, files):
+    """Would this delivery carry what staff typed for the Core, or a staff member's login or name
+    in a decision's text? `files`: [(source path, delivered name)]. -> {"hits": [{file, what,
+    line | key}], "scanned": n, "not_scanned": [name: why], "problems": [...]}. A hit never quotes
+    the text or the name: the plan it lands in is read by more people than staff. `problems`: a
+    staff-only record that could not be read, so its text could not be looked for -- the caller
+    holds on it (fails closed). Text files only (LEAK_SCAN_EXT): a PDF or .docx of the report is
+    made from the HTML or Markdown that is scanned."""
+    texts, logins, problems = typed_texts(session_dir, [src for src, _ in files])
+    # the session's own records (logs/) must be readable; a stray, unreadable copy elsewhere
+    # (never delivered either) is said, and holds nothing
+    logs = os.path.join(os.path.abspath(session_dir), "logs") + os.sep if session_dir else None
+    stray = [w for w in problems if not (logs and os.path.abspath(w).startswith(logs))]
+    problems = [w for w in problems if w not in stray]
+    patterns = _leak_forms(texts)
+    kinds = staff_identities(logins)
+    # a login in any case; a name part only as a name is written
+    alt = {k: "|".join(re.escape(w) for w in sorted((w for w, kind in kinds.items() if kind == k),
+                                                    key=len, reverse=True)) or r"(?!)"
+           for k in ("login", "name")}
+    id_rx = (re.compile(r"(?<![\w.@/-])(?:(?P<l>(?i:" + alt["login"] + r"))|(?P<n>" + alt["name"]
+                        + r"))(?![\w@/-])") if kinds else None)
+    out = {"hits": [], "scanned": 0, "problems": problems,
+           "not_scanned": [f"a staff-only record outside logs/ could not be read: {w}"
+                           for w in stray],
+           "typed_texts": len(texts), "staff_words": len(kinds)}
+    if not patterns and id_rx is None:
+        return out
+
+    def one(name, data):
+        out["scanned"] += 1
+        out["hits"] += _leaks_in_text(name, data.decode("utf-8", "replace"), patterns, id_rx, kinds)
+
+    for src, name in files:
+        low = name.lower()
+        try:
+            if low.endswith(".zip"):
+                import zipfile
+                with zipfile.ZipFile(src) as z:
+                    for info in z.infolist():
+                        inner = f"{name}!{info.filename}"
+                        if not info.filename.lower().endswith(LEAK_SCAN_EXT):
+                            continue
+                        if info.file_size > LEAK_SCAN_MAX:
+                            out["not_scanned"].append(f"{inner}: larger than the scan reads")
+                            continue
+                        one(inner, z.read(info))
+            elif low.endswith(LEAK_SCAN_EXT):
+                if os.path.getsize(src) > LEAK_SCAN_MAX:
+                    out["not_scanned"].append(f"{name}: larger than the scan reads")
+                    continue
+                with open(src, "rb") as fh:
+                    one(name, fh.read())
+        except (OSError, ValueError, RuntimeError) as e:      # an unreadable file or a bad zip
+            out["not_scanned"].append(f"{name}: {type(e).__name__}: {e}")
+    return out
+
+
 def login():
     """The login running this command (who TYPED it), or None."""
     try:

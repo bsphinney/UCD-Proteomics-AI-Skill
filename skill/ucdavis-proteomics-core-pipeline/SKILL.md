@@ -66,7 +66,8 @@ reproducibility bundle (10) → finalize (12; it writes `AGENTS.md`; run `sessio
     long text on stdin, in a heredoc quoted `<<'EOF'`.
 12. **Staff-only stays staff-only.** Anyone who is not Core staff (`core_staff` not true) never
     hears of CoreOmics, the board, submission numbers, FRAN or QC verdicts. No client deliverable
-    carries a QC verdict or a person's name (reasons and overrides name no one), `logs/` is never
+    carries a QC verdict or a person's name (overrides name no one; a decision's typed reason
+    stays in the staff-only record, and `deliver` holds a delivery that carries one), `logs/` is never
     delivered, and another client's identifiers never enter this analysis's record.
 13. **Watch every search to the end** (`watch_run.sh`, progress on every poll); recovering a run in
     flight needs no new go; never resubmit one that is RUNNING; stop after 2 failed fixes of a class.

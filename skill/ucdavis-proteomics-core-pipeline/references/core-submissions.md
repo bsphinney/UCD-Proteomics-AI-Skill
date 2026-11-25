@@ -848,6 +848,15 @@ submissions) have
 - **an analysis delivery's DE holds it** (step 8): it ran without a decided normalisation check
   (`normalization_gate`, `normalization_check.delivery_gate`); a DE from before 2.10 goes once
   staff record `normalization_check.py ack-legacy`.
+- **a file to deliver carries what staff typed for the Core** (`leak_scan`, `staff.leak_scan`;
+  dry run included): a decision's reason or an acknowledgement's note from a staff-only record,
+  found by value in any delivered text file or inside a delivered zip; or a Core staff member's
+  login or name in a decision's text (`reason`, `statement`, `note`, `why`) in a delivered JSON
+  record. Names are looked for only there, so a Methods that cites a staff member's paper is
+  not held. The hold names the files and the place, never the words. **No one needs asking:**
+  regenerate the files (for a normalisation decision from before 2.16,
+  `normalization_check.py restate --check <json>`, then the final DE, the Methods, the audit,
+  the report and `session.py finalize`), log it with `log_decision.py`, and deliver again.
 - **an analysis delivery has no DE at all** (no `output/tables/de_provenance.json`; `--mode auto`
   resolves to analysis unless CoreOmics says raw data only). The hold says so: "this session has
   no differential expression". If a delivery without the DE is intended — a QC report, an
