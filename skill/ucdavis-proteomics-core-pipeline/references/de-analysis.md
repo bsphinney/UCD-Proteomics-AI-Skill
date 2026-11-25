@@ -22,10 +22,10 @@ bundle's `de.method` says `maxlfq`).
 - 663: Citations (verified June 2026)
 - 681: Less-used flags
 - 685: Step 8: the normalisation check and the final DE
-- 787: Step 8: blocks and numeric covariates
-- 820: Step 8: keratin samples and contaminants
-- 856: Step 8: the method, what `run_de.R` writes, QuantUMS
-- 928: 8b. Figures, and what counts as significant (step 8b)
+- 792: Step 8: blocks and numeric covariates
+- 825: Step 8: keratin samples and contaminants
+- 861: Step 8: the method, what `run_de.R` writes, QuantUMS
+- 933: 8b. Figures, and what counts as significant (step 8b)
 <!-- /contents -->
 
 ## Invocation

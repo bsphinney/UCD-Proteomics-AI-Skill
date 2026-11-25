@@ -27,16 +27,16 @@ A **high-throughput plate** is a different route: STAN knows its file list
 - 698: 4. `conditions` — the design from CoreOmics
 - 723: 5. The search and DE — session on HIVE, report written locally
 - 794: 6. `deliver` — real files into the Bioshare folder (HIVE)
-- 990: 7. `bioshare` — register and share (where the key is)
-- 1026: 8. `email-draft`
-- 1062: Several submissions in one analysis
-- 1109: Core client work with no CoreOmics submission yet (the feedback survey)
-- 1187: Troubleshooting by exit code
-- 1203: The linked-share lesson
-- 1214: Less-used flags
-- 1224: Step 1 for Core staff: where the CoreOmics steps run, and `identify`
-- 1255: 1c. The service run, step by step (step 1c)
-- 1464: 12b. Deliver to the collaborator (step 12b)
+- 999: 7. `bioshare` — register and share (where the key is)
+- 1035: 8. `email-draft`
+- 1071: Several submissions in one analysis
+- 1118: Core client work with no CoreOmics submission yet (the feedback survey)
+- 1196: Troubleshooting by exit code
+- 1212: The linked-share lesson
+- 1223: Less-used flags
+- 1233: Step 1 for Core staff: where the CoreOmics steps run, and `identify`
+- 1264: 1c. The service run, step by step (step 1c)
+- 1473: 12b. Deliver to the collaborator (step 12b)
 <!-- /contents -->
 
 ## Why this needs its own script
