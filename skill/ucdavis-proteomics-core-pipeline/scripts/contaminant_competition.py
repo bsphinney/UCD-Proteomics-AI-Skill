@@ -16,7 +16,11 @@ fetch_fasta.py already drops contaminant entries identical to a target, and thos
 cannot tell apart from one (its peptide rule). Which peptides a sample shows only the search can
 say, so this check reads the report after every DIA-NN search. It reports; it never changes the
 contaminant list or the search, and never fails a job or an audit (the Core director's decision,
-2026-10-20: keep the universal list for every search, and name what it takes).
+2026-10-20: keep the universal list for every search, and name what it takes). Since 2026-11-25
+(the director again: fix it without asking, and record what was done) the record also says when
+the search should be run again without some entries (`search_again`), and whoever runs the
+analysis does that unasked and logs it (references/audit.md "Searching again without contaminant
+entries"). The decision is this script's rule, never the reader's judgement.
 
 WHAT IT READS. DIA-NN's report (report.parquet, or a .tsv report), rows kept as run_de.R keeps
 them (diann_q_columns: the q-columns present, cutoff_for() each, keep_expression / row_passes),
@@ -60,6 +64,14 @@ DIA-NN's --cont-quant-exclude rule, which run_de.R applies too.
     protein added to the sample). Measured on a pig serum search: 14.6% of a run's signal on
     contaminant entries, 0.7% of it contaminant-only; a sample with bovine albumin added reads
     the other way round.
+  * SEARCH AGAIN: an entry that carries more of the sample's signal (precursors it shares with
+    a sample protein) than signal of its own would give that signal back if it were left out --
+    never a digestion enzyme, never a keratin-family entry (handling contamination in any
+    sample). When the median run would get back at least SEARCH_AGAIN_MIN_PCT of its precursor
+    signal, `search_again.advised` is true and `fetch_fasta_args` holds the --drop-contaminant
+    list. Once: a database that already leaves entries out by name is not advised again. On a
+    pig serum search the rule named 111 entries, 108 of them among the 140 staff had left out by
+    hand, and 13.8% of the median run's signal.
 The record carries the report's size and modification time (`report_stat`): a record is read
 only for the report it describes (describes()), never for a later search in the same folder.
 
@@ -97,7 +109,8 @@ if HERE not in sys.path:
 from fetch_fasta import (CONTAMINANT_TAGS, MIN_UNIQUE_PEPTIDES, REBUILD_ADVICE,  # noqa: E402
                          _contaminant_ids, _digestion_enzyme, _fasta_records, _header_ids,
                          _independent_count, fasta_accessions_and_targets,
-                         is_contaminant_accession, keratin_database_check,
+                         is_contaminant_accession, keratin_contaminants,
+                         keratin_database_check,
                          keratin_sample_recorded, sidecar_sha256_matches, sidecar_state,
                          target_peptide_hits)
 from diann_q_columns import (DEFAULT_Q_CUTOFF, cutoff_for, fdr_columns,  # noqa: E402
@@ -176,6 +189,14 @@ def exempted(cell, exempt):
 # no sample protein has (foreign material: trypsin, keratin, serum or a protein added to the
 # sample). The three add up to the contaminant share.
 SHARE_KINDS = ("taken_from_sample", "shared_with_present_contaminant", "contaminant_only")
+
+
+# SEARCH AGAIN (the Core director's decision, 2026-11-25: fix it without asking, and record what
+# was done). When at least this much of the median run's precursor signal is the sample's and
+# would come back to it by leaving contaminant entries out, the record advises a second search
+# without them (search_again). Measured on finished serum searches: pig 14%, mouse 6.5% with the
+# universal list; 0.7% or less once the entries were left out, and in a human serum search.
+SEARCH_AGAIN_MIN_PCT = 2.0
 
 
 def share_kind(names_sample_protein, an_entry_shows_itself):
@@ -355,7 +376,8 @@ def de_exemption(de_prov):
 def read_fasta(fasta):
     """{"accs": {accession (upper): (entry, gene)}, "targets": [target records], "by_gene":
     {gene: {its target accessions (upper)}}, "cont_seq": {contaminant accession (upper):
-    sequence}} of the searched FASTA."""
+    sequence}, "cont_keratin": {the keratin-family contaminant accessions (upper)}} of the
+    searched FASTA."""
     with open(fasta, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
     accs, targets = fasta_accessions_and_targets(text)
@@ -364,12 +386,13 @@ def read_fasta(fasta):
         acc, _entry, gene = _header_ids(header)
         if gene:
             by_gene.setdefault(gene, set()).add(acc.upper())
-    cont_seq = {}
-    for header, lines in _fasta_records(text):
+    cont_seq, recs = {}, list(_fasta_records(text))
+    for header, lines in recs:
         c = _contaminant_ids(header)
         if c:
             cont_seq[c[1].upper()] = "".join(ln.strip() for ln in lines).upper()
-    return {"accs": accs, "targets": targets, "by_gene": by_gene, "cont_seq": cont_seq}
+    return {"accs": accs, "targets": targets, "by_gene": by_gene, "cont_seq": cont_seq,
+            "cont_keratin": {k["cont_acc"].upper() for _i, k in keratin_contaminants(recs)}}
 
 
 def resolve_inputs(search_out=None, report=None, fasta=None, fasta_meta=None):
@@ -612,10 +635,59 @@ def _check(rec, report, fasta, meta, q_cutoff, q_columns, no_fasta_reason, exemp
     seeds = {a.upper() for ids, _p in ev["cont"] for a in _targets(ids)}
     seeds |= {h["target_acc"].upper() for h in on_target.values()}
     kept = connected(ev["kept"], seeds, accs, (fa or {}).get("by_gene") or {})
-    rec.update(classify(ev, kept, accs, (fa or {}).get("cont_seq") or {}, on_target))
+    rec.update(classify(ev, kept, accs, (fa or {}).get("cont_seq") or {}, on_target,
+                        (fa or {}).get("cont_keratin")))
+    rec["search_again"] = search_again(rec["search_again"], meta)
     rec["cont_quant_exclude"] = cont_quant_exclude(report)
     rec["status"] = "ok"
     return rec
+
+
+def search_again(found, meta):
+    """The advice, decided here and never by whoever reads it: `advised` True when the median
+    run would get back at least SEARCH_AGAIN_MIN_PCT of its precursor signal by leaving out
+    `drop_contaminant` -- once. A database that already leaves entries out by name
+    (--drop-contaminant, as the sidecar records it) is not advised again: a second automatic
+    round would be a loop, and what is still taken then is for a person to look at."""
+    out = dict(found)
+    med, drop = (found.get("recoverable_pct") or {}).get("median"), found.get("drop_contaminant")
+    already = [str(x) for x in ((meta or {}).get("drop_contaminant_requested") or [])]
+    out["already_dropped_by_name"] = len(already)
+    if not found.get("keratin_entries_known"):
+        out.update(advised=False,
+                   reason="the searched FASTA could not be read, so which contaminant entries "
+                          "are keratins is not known: nothing is advised")
+    elif med is None or med < SEARCH_AGAIN_MIN_PCT or not drop:
+        out.update(advised=False, reason=None)
+    elif already:
+        out.update(advised=False,
+                   reason=(f"{med:g}% of the median run's signal would still come back, but "
+                           f"this database already leaves out {len(already)} contaminant "
+                           "entries by name: not searched again automatically"))
+    else:
+        out.update(advised=True,
+                   reason=(f"{med:g}% of the median run's precursor signal is the sample's own, "
+                           "on precursors shared with "
+                           f"{_n(len(drop), 'contaminant entry', 'contaminant entries')} that "
+                           "carry more of the sample's signal than signal of their own (no "
+                           "digestion enzyme, no keratin) "
+                           f"(at least {SEARCH_AGAIN_MIN_PCT:g}% is the rule)"))
+    out["fetch_fasta_args"] = (" ".join(f"--drop-contaminant {c}" for c in drop)
+                               if out["advised"] else None)
+    return out
+
+
+def search_again_text(rec):
+    """For staff and the decisions log: what the record advises, in one sentence ("" when
+    nothing, or for a record from before the advice)."""
+    sa = rec.get("search_again") if isinstance(rec.get("search_again"), dict) else {}
+    if not sa.get("reason"):
+        return ""
+    if sa.get("advised"):
+        return (f"SEARCH AGAIN: {sa['reason']}. Rebuild the FASTA with the same fetch_fasta.py "
+                "command plus the --drop-contaminant list in search_again.fetch_fasta_args and "
+                "search again, without asking; log the decision (SKILL.md 7b).")
+    return f"NOT SEARCHED AGAIN: {sa['reason']}."
 
 
 def _gene(acc, accs):
@@ -690,7 +762,7 @@ def parsimony(feats):
     return groups
 
 
-def classify(ev, kept_rows, accs, cont_seq, on_target):
+def classify(ev, kept_rows, accs, cont_seq, on_target, keratin=None):
     """The findings from the evidence: the share, which contaminant entries show themselves, and
     the sample genes COMPETED OUT / SIPHONED / masked (and how many only lost a minority)."""
     # 1. each contaminant precursor's entries and sample proteins (an I/L twin of a sample digest
@@ -730,6 +802,29 @@ def classify(ev, kept_rows, accs, cont_seq, on_target):
         kind = share_kind(bool(targets), any(c in shows for c in conts))
         for run, q in (ag.get("by_run") or {}).items():
             split.setdefault(run, dict.fromkeys(SHARE_KINDS, 0.0))[kind] += q
+
+    # 1c. the entries a second search would leave out (search_again): one that carries more of
+    # the sample's signal (precursors it shares with a sample protein) than signal of its own
+    # (peptides no sample protein has) -- whether or not a few peptides of its own were found.
+    # Bovine albumin added to a sample has far more of its own than it shares, and stays; the
+    # bovine serum entries in a pig serum have almost none, and go. Never a digestion enzyme,
+    # and never a keratin-family entry (`keratin`: the FASTA's; None when it could not be read,
+    # and then nothing is advised): skin and hair keratin is handling contamination in any
+    # sample, and shares most of its peptides with the sample's own keratins.
+    own_sig, shared_sig = {}, {}
+    for conts, targets, _pep, ag, _twin in rows:
+        for c in conts:
+            (shared_sig if targets else own_sig)[c] = (
+                (shared_sig if targets else own_sig).get(c, 0.0) + ag["signal"])
+    takes = {c for c in seen if shared_sig.get(c, 0.0) > own_sig.get(c, 0.0)
+             and not _digestion_enzyme(c) and c.upper() not in (keratin or ())}
+    if keratin is None:
+        takes = set()
+    back = {}                               # per run: the sample's signal that would come back
+    for conts, targets, _pep, ag, _twin in rows:
+        if targets and all(c in takes for c in conts):
+            for run, q in (ag.get("by_run") or {}).items():
+                back[run] = back.get(run, 0.0) + q
 
     # 2. the features: the sample's precursors the rule takes ("lost"), those shared with an entry
     # that shows itself ("masked"), and the connected kept (contaminant-free) ones -- each with
@@ -809,6 +904,8 @@ def classify(ev, kept_rows, accs, cont_seq, on_target):
     share = {run: max(0.0, round(100 * c / t, 2)) for run, (t, c) in sorted(ev["runs"].items())
              if t > 0}
     pcts = list(share.values())
+    back_pct = [max(0.0, round(100 * back.get(run, 0.0) / t, 2))
+                for run, (t, _c) in sorted(ev["runs"].items()) if t > 0]
     by_kind = {run: {k: max(0.0, round(100 * split.get(run, {}).get(k, 0.0) / t, 2))
                      for k in SHARE_KINDS}
                for run, (t, _c) in sorted(ev["runs"].items()) if t > 0}
@@ -832,7 +929,14 @@ def classify(ev, kept_rows, accs, cont_seq, on_target):
             "competed_out": competed, "siphoned": siphoned, "masked": masked,
             "n_genes_lost_minority": minority,
             "drop_contaminant": [c for c in behind if not _digestion_enzyme(c)],
-            "kept_digestion_enzymes": [c for c in behind if _digestion_enzyme(c)]}
+            "kept_digestion_enzymes": [c for c in behind if _digestion_enzyme(c)],
+            "search_again": {
+                "recoverable_pct": {"median": round(statistics.median(back_pct), 2)
+                                    if back_pct else None,
+                                    "max": max(back_pct) if back_pct else None},
+                "threshold_pct": SEARCH_AGAIN_MIN_PCT,
+                "keratin_entries_known": keratin is not None,
+                "drop_contaminant": sorted(takes)}}
 
 
 # ---- what people read --------------------------------------------------------------------------
@@ -1009,7 +1113,8 @@ def staff_message(rec, de=None):
         head = (f"Checked: no {org} gene lost all or most of its signal to a contaminant entry "
                 f"({_n(quiet, 'contaminant entry', 'contaminant entries')} seen without "
                 "peptides of their own).")
-    return " ".join(x for x in (head, fix_text(rec), notes_text(rec)) if x)
+    return " ".join(x for x in (head, search_again_text(rec), fix_text(rec), notes_text(rec))
+                    if x)
 
 
 def plain_competed(rec, de=None):
@@ -1102,12 +1207,13 @@ def audit_findings(rec, de=None):
     if "database_build" not in rec:      # a record from before the key: its sidecar, read once
         rec = dict(rec, database_build=database_build_of(rec))
     keys = ("report", "fasta", "organism", "contaminant_share_pct", "drop_contaminant",
+            "search_again",
             "contaminants_not_showing_themselves", "q_columns", "cutoffs", "record_file",
             "checked_by", "database_build")
     detail = {k: rec.get(k) for k in keys if rec.get(k) is not None}
     detail.update({k: [x["gene"] for x in rec.get(k) or []]
                    for k in ("competed_out", "siphoned", "masked")})
-    tail = " ".join(x for x in (fix_text(rec), notes_text(rec)) if x)
+    tail = " ".join(x for x in (search_again_text(rec), fix_text(rec), notes_text(rec)) if x)
     said = fate(rec, de)[0]
     out = []
     if rec.get("competed_out"):
@@ -1147,7 +1253,8 @@ def plain_masked(rec, de=None):
 
 def say(rec, stream=None):
     """The job log's line: WARNING when a gene was lost, else INFO (NOTE when it could not run)."""
-    level = ("WARNING" if rec.get("competed_out") or rec.get("siphoned") else
+    level = ("WARNING" if rec.get("competed_out") or rec.get("siphoned")
+             or (rec.get("search_again") or {}).get("advised") else
              "NOTE" if rec.get("status") == "not_run" else "INFO")
     print(f"{TAG} {level}: {staff_message(rec)}", file=stream or sys.stderr, flush=True)
 
@@ -1327,7 +1434,7 @@ def main(argv=None):
         print(f"{TAG} NOTE: could not write {p}.", file=sys.stderr)
     if written:
         print(f"{TAG} recorded in {', '.join(written)}", file=sys.stderr)
-    summary = {k: rec.get(k) for k in ("status", "reason", "drop_contaminant")}
+    summary = {k: rec.get(k) for k in ("status", "reason", "drop_contaminant", "search_again")}
     summary.update({k: [x["gene"] for x in rec.get(k) or []]
                     for k in ("competed_out", "siphoned", "masked")})
     print(json.dumps(summary, indent=2))

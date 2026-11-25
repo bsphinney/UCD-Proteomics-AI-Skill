@@ -769,8 +769,15 @@ elif isinstance(cc, dict) and cc.get("status"):
         "competed_out": [x.get("gene") for x in cc.get("competed_out") or []],
         "siphoned": [x.get("gene") for x in cc.get("siphoned") or []],
         "drop_contaminant": cc.get("drop_contaminant") or []}
-    if (cc.get("competed_out") or cc.get("siphoned") or cc["status"] == "not_run") \
-            and cc.get("message"):
+    # the record's own advice to search again without contaminant entries (audit.md): acted on
+    # without asking, so the watcher carries what the agent needs to act and to log
+    sa = cc.get("search_again") if isinstance(cc.get("search_again"), dict) else {}
+    if sa.get("reason"):
+        out["contaminant_competition"]["search_again"] = {
+            k: sa.get(k) for k in ("advised", "reason", "recoverable_pct", "threshold_pct",
+                                   "fetch_fasta_args")}
+    if (cc.get("competed_out") or cc.get("siphoned") or cc["status"] == "not_run"
+            or sa.get("advised")) and cc.get("message"):
         out.setdefault("warnings", []).append(cc["message"])
 if os.environ.get("DFP"):
     out["dda_first_pass"] = True

@@ -461,6 +461,90 @@ class TheCheck(Fixture):
                          ([], ["Cont_P00761"]))
 
 
+class SearchAgain(Fixture):
+    """The Core director's decision of 2026-11-25: when the contaminant list took a real part of
+    the sample's signal, the search is run again without those entries, unasked, and the decision
+    is recorded. The rule is the script's, so no reader decides: which entries, and when."""
+
+    def test_signal_the_sample_would_get_back_advises_a_second_search(self):
+        sa = self.run_check(CLEAN + COMPETED)["search_again"]
+        # per run, actin's 1600 of 2550 would come back without the bovine actin entry
+        self.assertEqual(sa["recoverable_pct"], {"median": 62.75, "max": 62.75})
+        self.assertIs(sa["advised"], True)
+        self.assertEqual(sa["drop_contaminant"], ["Cont_P60712"])
+        self.assertEqual(sa["fetch_fasta_args"], "--drop-contaminant Cont_P60712")
+        self.assertIn("62.75% of the median run's precursor signal is the sample's own",
+                      sa["reason"])
+        self.assertEqual(sa["threshold_pct"], cc.SEARCH_AGAIN_MIN_PCT)
+
+    def test_an_entry_with_more_signal_of_its_own_than_it_shares_stays(self):
+        # albumin added to the sample: BSA's own peptides carry 400, the one it shares 300
+        sa = self.run_check(CLEAN + MASKED)["search_again"]
+        self.assertEqual(sa["drop_contaminant"], [])
+        self.assertEqual((sa["advised"], sa["reason"], sa["fetch_fasta_args"]),
+                         (False, None, None))
+
+    def test_an_entry_that_shows_two_weak_peptides_but_shares_far_more_goes(self):
+        # a serum of another species: the bovine entry "shows itself", yet nearly all it
+        # carries is the sample's (the pig serum searches: 8.7% of the signal read as masked)
+        rows = CLEAN + [("P02768;Cont_P02769", "VVVVVVVK", 3000),
+                        ("Cont_P02769", "NNNNNNNK", 2), ("Cont_P02769", "QQQQQQQR", 2)]
+        rec = self.run_check(rows)
+        self.assertIn("Cont_P02769", rec["contaminants_showing_themselves"])
+        self.assertEqual(rec["search_again"]["drop_contaminant"], ["Cont_P02769"])
+        self.assertIs(rec["search_again"]["advised"], True)
+
+    def test_a_keratin_or_a_digestion_enzyme_is_never_dropped_automatically(self):
+        rows = CLEAN + KERATIN + [("P04406;Cont_P00761", "DDDDDDDK", 5000)]
+        sa = self.run_check(rows)["search_again"]
+        self.assertEqual(sa["drop_contaminant"], [])
+        self.assertIs(sa["advised"], False)
+
+    def test_a_small_loss_is_reported_and_not_searched_again(self):
+        rows = [("P04406", "DDDDDDDK", 500000)] + COMPETED         # 1600 of 501600: 0.32%
+        rec = self.run_check(rows)
+        self.assertEqual([x["gene"] for x in rec["competed_out"]], ["ACTB"])
+        self.assertIs(rec["search_again"]["advised"], False)
+        self.assertNotIn("SEARCH AGAIN", cc.staff_message(rec))
+
+    def test_a_database_that_already_leaves_entries_out_by_name_is_not_advised_twice(self):
+        self.meta["drop_contaminant_requested"] = ["Cont_Q9XSJ4"]
+        sa = self.run_check(CLEAN + COMPETED)["search_again"]
+        self.assertIs(sa["advised"], False)
+        self.assertEqual(sa["already_dropped_by_name"], 1)
+        self.assertIn("not searched again automatically", sa["reason"])
+        self.assertIsNone(sa["fetch_fasta_args"])
+
+    def test_without_the_fasta_nothing_is_advised(self):
+        sa = self.run_check(CLEAN + COMPETED, fasta=False)["search_again"]
+        self.assertIs(sa["advised"], False)
+        self.assertIn("which contaminant entries are keratins is not known", sa["reason"])
+
+    def test_the_skill_says_to_act_on_it_unasked_and_to_log_it(self):
+        skill = " ".join(read(os.path.join(SKILL, "SKILL.md")).split())
+        audit = read(os.path.join(SKILL, "references", "audit.md"))
+        self.assertIn("`search_again.advised` → rebuild and search again UNASKED, logged", skill)
+        self.assertIn("step 7b's `search_again` advises it (log each decision)", skill)
+        self.assertIn("## Searching again without contaminant entries", audit)
+        sec = audit.split("## Searching again without contaminant entries")[1].split("\n## ")[0]
+        for must in ("without asking the user or Core staff", "log_decision.py",
+                     "search_again.fetch_fasta_args", "never delete it",
+                     "summary at the end of the analysis", "It happens once"):
+            self.assertIn(must, sec)
+
+    def test_the_advice_is_said_to_staff_and_the_job_log_warns(self):
+        import io
+        rec = self.run_check(CLEAN + COMPETED)
+        self.assertIn("SEARCH AGAIN: 62.75%", cc.staff_message(rec))
+        self.assertIn("without asking; log the decision", cc.staff_message(rec))
+        self.assertIn("SEARCH AGAIN", cc.audit_findings(rec)[0][1])
+        buf = io.StringIO()
+        cc.say(rec, buf)
+        self.assertIn("WARNING", buf.getvalue())
+        del rec["search_again"]                              # a record from before the advice
+        self.assertNotIn("SEARCH AGAIN", cc.staff_message(rec))
+
+
 class TheRecordDescribesOneReport(Fixture):
     def test_a_changed_report_is_not_described_by_the_old_record(self):
         rec = self.run_check(CLEAN + COMPETED)
@@ -1157,6 +1241,12 @@ class TheWatcherSaysIt(Fixture):
         self.assertEqual(got["contaminant_competition"]["competed_out"], ["ACTB"])
         self.assertEqual(got["contaminant_competition"]["drop_contaminant"], ["Cont_P60712"])
         self.assertTrue(any("COMPETED OUT" in w for w in got["warnings"]))
+        # the advice to search again, with what the agent needs to act on it and to log it
+        sa = got["contaminant_competition"]["search_again"]
+        self.assertIs(sa["advised"], True)
+        self.assertEqual(sa["fetch_fasta_args"], "--drop-contaminant Cont_P60712")
+        self.assertIn("62.75%", sa["reason"])
+        self.assertTrue(any("SEARCH AGAIN" in w for w in got["warnings"]))
         self.assertFalse(got["failed"])
 
     def test_a_running_search_shows_no_record(self):
