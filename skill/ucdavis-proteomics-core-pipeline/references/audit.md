@@ -12,9 +12,9 @@ over-interpret anything. FAILs should stop interpretation; WARNs go in the repor
 - 39: What the client reads: a plain-language table
 - 58: How the orchestrator uses it
 - 70: Searching again without contaminant entries
-- 108: Why deterministic, not LLM-judged
-- 116: Tuning
-- 124: 8c. The audit and the sample-quality check (step 8c)
+- 111: Why deterministic, not LLM-judged
+- 119: Tuning
+- 127: 8c. The audit and the sample-quality check (step 8c)
 <!-- /contents -->
 
 ## What it checks
@@ -78,7 +78,10 @@ sample's own abundant proteins (measured: 14% of a pig serum's signal, 6% of a m
 (`contaminant_competition.json`, shown by the watcher): `search_again.advised` is true when the
 median run would get back at least `threshold_pct` (2%) of its precursor signal by leaving out the
 entries in `search_again.drop_contaminant`. Those are the entries that carry more of the sample's
-signal than signal of their own; never a digestion enzyme, never a keratin. A protein that was
+signal than signal of their own; never a digestion enzyme, never a keratin, and never another
+skin protein that handling brings in with keratin (filaggrin, filaggrin-2, hornerin, dermokine in
+the shipped sets; the rule is `search_again.never_drop_rule`, and `search_again.kept_never_drop`
+names the entries it held back). Whose signal those carry cannot be told. A protein that was
 really added to the sample (bovine albumin) has far more signal of its own and stays.
 
 When `advised` is true, do this without asking the user or Core staff, and before any DE:

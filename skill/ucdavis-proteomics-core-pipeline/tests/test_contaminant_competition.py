@@ -515,10 +515,56 @@ class SearchAgain(Fixture):
         self.assertIn("not searched again automatically", sa["reason"])
         self.assertIsNone(sa["fetch_fasta_args"])
 
+    def test_filaggrin_2_and_the_other_skin_proteins_are_never_dropped_automatically(self):
+        """The first HIVE test (a pig sample): the rule's list held human filaggrin-2
+        (Cont_Q5D862), a skin protein that comes from handling, as keratin does. Whose signal its
+        shared peptides carry cannot be told, so it stays, and the record says it was held."""
+        write(self.fasta, FASTA
+              + entry("F1SXX1", "FILA2_PIG", "FLG2", "MAAAAPPPKLLLLLLLR")
+              + entry("Q5D862", "FILA2_HUMAN", "FLG2", "MSSSSSSSKLLLLLLLR", True))
+        rows = CLEAN + COMPETED + [("F1SXX1;Cont_Q5D862", "LLLLLLLR", 3000)]
+        sa = self.run_check(rows)["search_again"]
+        self.assertEqual(sa["drop_contaminant"], ["Cont_P60712"])
+        self.assertEqual(sa["kept_never_drop"], ["Cont_Q5D862"])
+        self.assertIs(sa["advised"], True)
+        self.assertIn("FLG2", sa["never_drop_rule"])
+        self.assertIn("no keratin or other skin protein", sa["reason"])
+        # what came back counts actin's only: filaggrin-2's 3000 stays with the contaminant
+        self.assertEqual(sa["recoverable_pct"]["median"], round(100 * 1600 / 5550, 2))
+
+    def test_the_skin_handling_rule_reads_gene_or_protein_name(self):
+        for gene in ("FLG", "FLG2", "Flg2", "HRNR", "RPTN", "TCHH", "CRNN", "LOR", "IVL",
+                     "SPRR2A", "LCE1A", "DSG1", "DSC3", "DSP", "JUP", "PKP1", "CDSN", "DMKN",
+                     "DCD"):
+            self.assertTrue(cc.is_skin_handling(gene), gene)
+        for gene in ("DSPP", "FLG3", "Krtcap2", "KRTDAP", "JUPX", "ALB", ""):
+            self.assertFalse(cc.is_skin_handling(gene), gene)
+        self.assertTrue(cc.is_skin_handling("", "Filaggrin-2"))
+        self.assertTrue(cc.is_skin_handling("", "Junction plakoglobin"))
+        self.assertFalse(cc.is_skin_handling("", "Keratinocyte-associated protein 2"))
+        # it is the search-again rule's own: a keratin sample's keratin set is unchanged
+        self.assertFalse(ff.is_keratin_gene("FLG2", "Filaggrin-2"))
+
+    @unittest.skipUnless(os.path.isdir(os.path.join(os.path.dirname(os.path.dirname(SKILL)),
+                                                    "contaminants")),
+                         "needs the repo's contaminants/ folder")
+    def test_in_the_shipped_sets_the_skin_proteins_are_filaggrin_hornerin_dermokine(self):
+        repo = os.path.join(os.path.dirname(os.path.dirname(SKILL)), "contaminants")
+        for name in sorted(os.listdir(repo)):
+            if not name.endswith(".fasta"):
+                continue
+            recs = ff._fasta_records(read(os.path.join(repo, name)))
+            keratin = {k["cont_acc"].upper() for _i, k in ff.keratin_contaminants(recs)}
+            never = cc.never_drop_entries(recs)
+            self.assertTrue(keratin <= never, name)
+            self.assertEqual(sorted(never - keratin),
+                             ["CONT_P20930", "CONT_Q5D862", "CONT_Q6E0U4", "CONT_Q86YZ3"], name)
+
     def test_without_the_fasta_nothing_is_advised(self):
         sa = self.run_check(CLEAN + COMPETED, fasta=False)["search_again"]
         self.assertIs(sa["advised"], False)
-        self.assertIn("which contaminant entries are keratins is not known", sa["reason"])
+        self.assertIn("which contaminant entries are keratins or other skin proteins is not "
+                      "known", sa["reason"])
 
     def test_the_skill_says_to_act_on_it_unasked_and_to_log_it(self):
         skill = " ".join(read(os.path.join(SKILL, "SKILL.md")).split())
@@ -529,7 +575,9 @@ class SearchAgain(Fixture):
         sec = audit.split("## Searching again without contaminant entries")[1].split("\n## ")[0]
         for must in ("without asking the user or Core staff", "log_decision.py",
                      "search_again.fetch_fasta_args", "never delete it",
-                     "summary at the end of the analysis", "It happens once"):
+                     "summary at the end of the analysis", "It happens once",
+                     "skin protein that handling brings in with keratin",
+                     "search_again.kept_never_drop"):
             self.assertIn(must, sec)
 
     def test_the_advice_is_said_to_staff_and_the_job_log_warns(self):

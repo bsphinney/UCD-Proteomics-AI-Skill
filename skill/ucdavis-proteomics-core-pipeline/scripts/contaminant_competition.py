@@ -66,8 +66,9 @@ DIA-NN's --cont-quant-exclude rule, which run_de.R applies too.
     the other way round.
   * SEARCH AGAIN: an entry that carries more of the sample's signal (precursors it shares with
     a sample protein) than signal of its own would give that signal back if it were left out --
-    never a digestion enzyme, never a keratin-family entry (handling contamination in any
-    sample). When the median run would get back at least SEARCH_AGAIN_MIN_PCT of its precursor
+    never a digestion enzyme, never a keratin-family entry or another skin protein that comes
+    with keratin from handling, filaggrin for one (NEVER_DROP_RULE; `kept_never_drop` names those
+    the rule held back). When the median run would get back at least SEARCH_AGAIN_MIN_PCT of its precursor
     signal, `search_again.advised` is true and `fetch_fasta_args` holds the --drop-contaminant
     list. Once: a database that already leaves entries out by name is not advised again. On a
     pig serum search the rule named 111 entries, 108 of them among the 140 staff had left out by
@@ -106,10 +107,11 @@ if HERE not in sys.path:
 
 # The tags, the evidence threshold, the digest and the target-peptide test are fetch_fasta.py's,
 # the q-value filter diann_q_columns.py's -- never a copy here (DE-LIMP rule 3).
-from fetch_fasta import (CONTAMINANT_TAGS, MIN_UNIQUE_PEPTIDES, REBUILD_ADVICE,  # noqa: E402
+from fetch_fasta import (CONTAMINANT_TAGS, KERATIN_FAMILY_RULE,  # noqa: E402
+                         MIN_UNIQUE_PEPTIDES, REBUILD_ADVICE,
                          _contaminant_ids, _digestion_enzyme, _fasta_records, _header_ids,
-                         _independent_count, fasta_accessions_and_targets,
-                         is_contaminant_accession, keratin_contaminants,
+                         _independent_count, _protein_name, fasta_accessions_and_targets,
+                         is_contaminant_accession, is_keratin_gene,
                          keratin_database_check,
                          keratin_sample_recorded, sidecar_sha256_matches, sidecar_state,
                          target_peptide_hits)
@@ -197,6 +199,53 @@ SHARE_KINDS = ("taken_from_sample", "shared_with_present_contaminant", "contamin
 # without them (search_again). Measured on finished serum searches: pig 14%, mouse 6.5% with the
 # universal list; 0.7% or less once the entries were left out, and in a human serum search.
 SEARCH_AGAIN_MIN_PCT = 2.0
+
+# NEVER DROPPED by the search-again rule: handling contamination, the skin, hair and sweat that
+# hands and air bring into any sample. Such an entry shares peptides with the sample's own copy of
+# the same protein, so the rule would read their signal as the sample's; whose it is cannot be
+# told, and leaving the entry out would put handling contamination into the sample's quantities.
+#   * keratin-family entries: fetch_fasta.is_keratin_gene (KERATIN_FAMILY_RULE), the one keratin
+#     definition, which a keratin sample's build and the DE use too -- unchanged here;
+#   * the other skin proteins that come with keratin (SKIN_HANDLING_RULE): the S100 fused-type
+#     proteins of the stratum corneum, the cornified envelope, the corneodesmosome, and dermokine
+#     and dermcidin (skin and sweat). In the shipped contaminant sets (checked 2026-11-25) that
+#     is filaggrin, filaggrin-2, hornerin and dermokine (human); the rest of the rule is the same
+#     class, named so an entry added later is covered by its gene or protein name.
+# This set is the search-again rule's only. What a keratin sample is, and what its build removes,
+# stay fetch_fasta.py's.
+_SKIN_HANDLING_GENE = re.compile(
+    r"^(?:FLG2?|HRNR|RPTN|TCHH|CRNN|LOR|IVL|SPRR\d[A-Z]?|LCE\d[A-Z]?|DSG[1-4]|DSC[1-3]|DSP|JUP"
+    r"|PKP[1-4]|CDSN|DMKN|DCD)$", re.I)
+_SKIN_HANDLING_NAME = re.compile(
+    r"^(?:putative\s+)?(?:filaggrin|hornerin|repetin|trichohyalin|cornulin|loricrin|involucrin"
+    r"|small proline-rich|late cornified envelope|desmoglein|desmocollin|desmoplakin"
+    r"|junction plakoglobin|plakophilin|corneodesmosin|dermokine|dermcidin)\b", re.I)
+SKIN_HANDLING_RULE = ("other skin proteins: gene FLG, FLG2, HRNR, RPTN, TCHH, CRNN (S100 "
+                      "fused-type), LOR, IVL, SPRR<n>, LCE<n> (cornified envelope), DSG<n>, "
+                      "DSC<n>, DSP, JUP, PKP<n>, CDSN (corneodesmosome), DMKN, DCD (any case), or "
+                      "a UniProt protein name starting with one of those proteins' names")
+NEVER_DROP_RULE = ("never left out by the search-again rule: a digestion enzyme in use, a "
+                   + KERATIN_FAMILY_RULE + "; " + SKIN_HANDLING_RULE)
+
+
+def is_skin_handling(gene, protein_name=""):
+    """True for a skin protein that comes with keratin from handling (SKIN_HANDLING_RULE), by its
+    gene or, for an entry without GN=, its UniProt protein name."""
+    return bool(_SKIN_HANDLING_GENE.match((gene or "").strip())
+                or _SKIN_HANDLING_NAME.match((protein_name or "").strip()))
+
+
+def never_drop_entries(recs):
+    """The contaminant accessions (upper; as the report carries them) of `recs` (_fasta_records)
+    that the search-again rule never leaves out: keratin-family or another skin protein
+    (NEVER_DROP_RULE; digestion enzymes are _digestion_enzyme's)."""
+    out = set()
+    for header, _lines in recs:
+        ids = _contaminant_ids(header)
+        if ids and (is_keratin_gene(ids[3], _protein_name(header))
+                    or is_skin_handling(ids[3], _protein_name(header))):
+            out.add(ids[1].upper())
+    return out
 
 
 def share_kind(names_sample_protein, an_entry_shows_itself):
@@ -376,8 +425,9 @@ def de_exemption(de_prov):
 def read_fasta(fasta):
     """{"accs": {accession (upper): (entry, gene)}, "targets": [target records], "by_gene":
     {gene: {its target accessions (upper)}}, "cont_seq": {contaminant accession (upper):
-    sequence}, "cont_keratin": {the keratin-family contaminant accessions (upper)}} of the
-    searched FASTA."""
+    sequence}, "cont_never_drop": {the contaminant accessions (upper) the search-again rule never
+    leaves out: keratin-family and other skin proteins, never_drop_entries}} of the searched
+    FASTA."""
     with open(fasta, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
     accs, targets = fasta_accessions_and_targets(text)
@@ -392,7 +442,7 @@ def read_fasta(fasta):
         if c:
             cont_seq[c[1].upper()] = "".join(ln.strip() for ln in lines).upper()
     return {"accs": accs, "targets": targets, "by_gene": by_gene, "cont_seq": cont_seq,
-            "cont_keratin": {k["cont_acc"].upper() for _i, k in keratin_contaminants(recs)}}
+            "cont_never_drop": never_drop_entries(recs)}
 
 
 def resolve_inputs(search_out=None, report=None, fasta=None, fasta_meta=None):
@@ -636,7 +686,7 @@ def _check(rec, report, fasta, meta, q_cutoff, q_columns, no_fasta_reason, exemp
     seeds |= {h["target_acc"].upper() for h in on_target.values()}
     kept = connected(ev["kept"], seeds, accs, (fa or {}).get("by_gene") or {})
     rec.update(classify(ev, kept, accs, (fa or {}).get("cont_seq") or {}, on_target,
-                        (fa or {}).get("cont_keratin")))
+                        (fa or {}).get("cont_never_drop")))
     rec["search_again"] = search_again(rec["search_again"], meta)
     rec["cont_quant_exclude"] = cont_quant_exclude(report)
     rec["status"] = "ok"
@@ -653,10 +703,10 @@ def search_again(found, meta):
     med, drop = (found.get("recoverable_pct") or {}).get("median"), found.get("drop_contaminant")
     already = [str(x) for x in ((meta or {}).get("drop_contaminant_requested") or [])]
     out["already_dropped_by_name"] = len(already)
-    if not found.get("keratin_entries_known"):
+    if not found.get("never_drop_entries_known"):
         out.update(advised=False,
                    reason="the searched FASTA could not be read, so which contaminant entries "
-                          "are keratins is not known: nothing is advised")
+                          "are keratins or other skin proteins is not known: nothing is advised")
     elif med is None or med < SEARCH_AGAIN_MIN_PCT or not drop:
         out.update(advised=False, reason=None)
     elif already:
@@ -670,7 +720,7 @@ def search_again(found, meta):
                            "on precursors shared with "
                            f"{_n(len(drop), 'contaminant entry', 'contaminant entries')} that "
                            "carry more of the sample's signal than signal of their own (no "
-                           "digestion enzyme, no keratin) "
+                           "digestion enzyme, no keratin or other skin protein) "
                            f"(at least {SEARCH_AGAIN_MIN_PCT:g}% is the rule)"))
     out["fetch_fasta_args"] = (" ".join(f"--drop-contaminant {c}" for c in drop)
                                if out["advised"] else None)
@@ -762,7 +812,7 @@ def parsimony(feats):
     return groups
 
 
-def classify(ev, kept_rows, accs, cont_seq, on_target, keratin=None):
+def classify(ev, kept_rows, accs, cont_seq, on_target, never_drop=None):
     """The findings from the evidence: the share, which contaminant entries show themselves, and
     the sample genes COMPETED OUT / SIPHONED / masked (and how many only lost a minority)."""
     # 1. each contaminant precursor's entries and sample proteins (an I/L twin of a sample digest
@@ -808,18 +858,20 @@ def classify(ev, kept_rows, accs, cont_seq, on_target, keratin=None):
     # (peptides no sample protein has) -- whether or not a few peptides of its own were found.
     # Bovine albumin added to a sample has far more of its own than it shares, and stays; the
     # bovine serum entries in a pig serum have almost none, and go. Never a digestion enzyme,
-    # and never a keratin-family entry (`keratin`: the FASTA's; None when it could not be read,
-    # and then nothing is advised): skin and hair keratin is handling contamination in any
-    # sample, and shares most of its peptides with the sample's own keratins.
+    # and never a keratin or other skin protein (`never_drop`: the FASTA's, NEVER_DROP_RULE; None
+    # when it could not be read, and then nothing is advised): handling contamination in any
+    # sample, sharing most of its peptides with the sample's own copies of those proteins.
     own_sig, shared_sig = {}, {}
     for conts, targets, _pep, ag, _twin in rows:
         for c in conts:
             (shared_sig if targets else own_sig)[c] = (
                 (shared_sig if targets else own_sig).get(c, 0.0) + ag["signal"])
-    takes = {c for c in seen if shared_sig.get(c, 0.0) > own_sig.get(c, 0.0)
-             and not _digestion_enzyme(c) and c.upper() not in (keratin or ())}
-    if keratin is None:
-        takes = set()
+    would = {c for c in seen if shared_sig.get(c, 0.0) > own_sig.get(c, 0.0)
+             and not _digestion_enzyme(c)}
+    held = sorted(c for c in would if c.upper() in (never_drop or ()))
+    takes = would - set(held)
+    if never_drop is None:
+        takes, held = set(), []
     back = {}                               # per run: the sample's signal that would come back
     for conts, targets, _pep, ag, _twin in rows:
         if targets and all(c in takes for c in conts):
@@ -935,8 +987,10 @@ def classify(ev, kept_rows, accs, cont_seq, on_target, keratin=None):
                                     if back_pct else None,
                                     "max": max(back_pct) if back_pct else None},
                 "threshold_pct": SEARCH_AGAIN_MIN_PCT,
-                "keratin_entries_known": keratin is not None,
-                "drop_contaminant": sorted(takes)}}
+                "never_drop_entries_known": never_drop is not None,
+                "drop_contaminant": sorted(takes),
+                # entries that met the rule but are kept: keratin or another skin protein
+                "kept_never_drop": held, "never_drop_rule": NEVER_DROP_RULE}}
 
 
 # ---- what people read --------------------------------------------------------------------------
