@@ -52,6 +52,14 @@ DIA-NN's --cont-quant-exclude rule, which run_de.R applies too.
   * Not applied: run_de.R's optional QuantUMS cutoffs and a run subset.
   * The contaminant share of the precursor signal, per run, as contaminants.R's
     contaminant_share() computes it (Precursor.Quantity, else Precursor.Normalised).
+  * That share split by whose signal it is, per run (`by_kind`, adding up to the share): the
+    sample's own on precursors shared with an entry that shows no peptides of its own
+    (taken_from_sample: database competition); shared with an entry that does show itself
+    (shared_with_present_contaminant: cannot be attributed); and on peptides no sample protein
+    has (contaminant_only: foreign material that is really there -- trypsin, keratin, or a
+    protein added to the sample). Measured on a pig serum search: 14.6% of a run's signal on
+    contaminant entries, 0.7% of it contaminant-only; a sample with bovine albumin added reads
+    the other way round.
 The record carries the report's size and modification time (`report_stat`): a record is read
 only for the report it describes (describes()), never for a later search in the same folder.
 
@@ -160,6 +168,20 @@ def exempted(cell, exempt):
     tagged = [a for a in ids if is_contaminant_accession(a)]
     return bool(tagged) and all(a in exempt["shared"] for a in tagged) and (
         len(tagged) < len(ids) or all(a in exempt.get("alone", ()) for a in tagged))
+
+
+# Whose signal a contaminant row carries (contaminant_share_pct.by_kind), in the words of THE
+# RULES above: the sample's own, taken by an entry that shows no peptides of its own (database
+# competition); shared with an entry that does show itself (cannot be attributed); or on peptides
+# no sample protein has (foreign material: trypsin, keratin, serum or a protein added to the
+# sample). The three add up to the contaminant share.
+SHARE_KINDS = ("taken_from_sample", "shared_with_present_contaminant", "contaminant_only")
+
+
+def share_kind(names_sample_protein, an_entry_shows_itself):
+    if not names_sample_protein:
+        return "contaminant_only"
+    return "shared_with_present_contaminant" if an_entry_shows_itself else "taken_from_sample"
 
 
 def _new():
@@ -701,6 +723,14 @@ def classify(ev, kept_rows, accs, cont_seq, on_target):
     seen = {c for conts, *_ in rows for c in conts}
     shows = {c for c in seen if n_own(c) >= MIN_UNIQUE_PEPTIDES}
 
+    # 1b. whose signal the contaminant rows carry, per run: the same three cases as the features
+    # below, so the share says how much of it is the sample's own and how much is foreign material
+    split = {}
+    for conts, targets, _pep, ag, _twin in rows:
+        kind = share_kind(bool(targets), any(c in shows for c in conts))
+        for run, q in (ag.get("by_run") or {}).items():
+            split.setdefault(run, dict.fromkeys(SHARE_KINDS, 0.0))[kind] += q
+
     # 2. the features: the sample's precursors the rule takes ("lost"), those shared with an entry
     # that shows itself ("masked"), and the connected kept (contaminant-free) ones -- each with
     # the genes it names
@@ -779,11 +809,22 @@ def classify(ev, kept_rows, accs, cont_seq, on_target):
     share = {run: max(0.0, round(100 * c / t, 2)) for run, (t, c) in sorted(ev["runs"].items())
              if t > 0}
     pcts = list(share.values())
+    by_kind = {run: {k: max(0.0, round(100 * split.get(run, {}).get(k, 0.0) / t, 2))
+                     for k in SHARE_KINDS}
+               for run, (t, _c) in sorted(ev["runs"].items()) if t > 0}
     return {"n_runs": len(ev["runs"]),
             "contaminant_share_pct": {"per_run": share,
                                       "median": round(statistics.median(pcts), 2) if pcts else None,
                                       "max": max(pcts) if pcts else None,
-                                      "column": ev["quantity_column"]},
+                                      "min": min(pcts) if pcts else None,
+                                      "column": ev["quantity_column"],
+                                      "by_kind": {
+                                          "per_run": by_kind,
+                                          "median": {k: round(statistics.median(
+                                              r[k] for r in by_kind.values()), 2)
+                                              for k in SHARE_KINDS} if by_kind else None,
+                                          "max": {k: max(r[k] for r in by_kind.values())
+                                                  for k in SHARE_KINDS} if by_kind else None}},
             "n_contaminant_entries_seen": len(seen),
             "contaminants_showing_themselves": sorted(shows),
             "contaminants_not_showing_themselves": sorted(seen - shows),
@@ -941,6 +982,13 @@ def notes_text(rec):
     if s.get("median") is not None:
         out.append(f"Contaminant entries carry a median {s['median']:g}% (max {s['max']:g}%) of "
                    f"a run's precursor signal ({s.get('column')}, {rec.get('n_runs')} runs).")
+        k = (s.get("by_kind") or {}).get("median")
+        if k:                                # a record from before the split has none
+            out.append(f"Of that, in the median run: {k['taken_from_sample']:g}% is the sample's "
+                       "own signal on peptides shared with an entry that shows none of its own; "
+                       f"{k['shared_with_present_contaminant']:g}% is shared with an entry that "
+                       f"does show itself; {k['contaminant_only']:g}% is on peptides no sample "
+                       "protein has.")
     return " ".join(out)
 
 

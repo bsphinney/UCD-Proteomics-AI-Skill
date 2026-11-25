@@ -395,6 +395,32 @@ class TheCheck(Fixture):
         m = re.search(r"CONTAMINANT_SHARE_COLUMNS <- c\(([^)]*)\)", src)
         self.assertEqual(tuple(re.findall(r'"([^"]+)"', m.group(1))), cc.SHARE_COLUMNS)
 
+    def test_the_share_is_split_by_whose_signal_it_is(self):
+        # The same share can be the sample's own signal taken by the list (pig serum against
+        # bovine serum entries) or foreign material that is really there (BSA added to the
+        # sample): per run, the three kinds add up to the share.
+        k = self.run_check(CLEAN + COMPETED + MASKED)["contaminant_share_pct"]["by_kind"]
+        # of 3250 per run: actin's 1600 taken; albumin's 300 shared with BSA, which shows itself;
+        # trypsin's 50 and BSA's own 400 on peptides no sample protein has
+        want = {"taken_from_sample": 49.23, "shared_with_present_contaminant": 9.23,
+                "contaminant_only": 13.85}
+        self.assertEqual(k["per_run"], {"r1": want, "r2": want})
+        self.assertEqual((k["median"], k["max"]), (want, want))
+        self.assertEqual(tuple(want), cc.SHARE_KINDS)
+
+    def test_an_il_twin_s_signal_is_the_sample_s(self):
+        k = self.run_check(CLEAN + IL_TWIN)["contaminant_share_pct"]["by_kind"]["median"]
+        # of 1650: the horse entry's 600 (an I/L twin of the target's peptide) and the shared 100
+        self.assertEqual(k, {"taken_from_sample": 42.42, "shared_with_present_contaminant": 0.0,
+                             "contaminant_only": 3.03})
+
+    def test_the_split_is_said_to_staff_and_a_record_without_it_still_reads(self):
+        rec = self.run_check(CLEAN + COMPETED + MASKED)
+        self.assertIn("Of that, in the median run: 49.23% is the sample's own signal",
+                      cc.staff_message(rec))
+        del rec["contaminant_share_pct"]["by_kind"]          # a record from before the split
+        self.assertNotIn("Of that", cc.staff_message(rec))
+
     def test_without_the_fasta_it_still_runs_and_says_what_it_could_not_do(self):
         rec = self.run_check(CLEAN + COMPETED, fasta=False)
         self.assertEqual([c["gene"] for c in rec["competed_out"]], ["P60709"])

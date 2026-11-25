@@ -265,4 +265,4 @@ Core service runs: the CoreOmics submission, high-throughput plates, delivery to
 
 ## Tests
 
-`tests/`: 381 files: 299 test files holding 6372 test methods, 13 shared helpers and 69 fixture files. Standard library only; run them with `python3 -m unittest discover -s skill/ucdavis-proteomics-core-pipeline/tests`.
+`tests/`: 381 files: 299 test files holding 6375 test methods, 13 shared helpers and 69 fixture files. Standard library only; run them with `python3 -m unittest discover -s skill/ucdavis-proteomics-core-pipeline/tests`.
