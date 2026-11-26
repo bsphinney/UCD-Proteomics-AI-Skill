@@ -185,6 +185,13 @@ the study facts, stat tiles, contents rail, figure cards with click-to-enlarge, 
 the audit / data-quality / expert-review sections, dark mode, print styles) lives in
 `scripts/report_style.py`, shared by the skill's HTML pages — restyle there, not per page.
 
+The header band also carries **"Prepared by"** and **"AI assistance"**, from `output/credit.json`.
+Before rendering, save the conversation and write the record: `save_transcript.py <session>`
+(hive_remote: `save_transcript.py --hive "$S"`), then `credit.py record <session>` where the
+session is. Never type either line into the report yourself: a staff member is named only when
+the Core staff list carries their `credit:` name, and the model is read from the saved
+conversation (outputs.md, "Keeping the record of the analysis").
+
 The same run also writes **`Analysis_Report.md`** beside the HTML: the full report as plain
 text, for NotebookLM or other AI notebooks. It is rendered from the same assembled sections
 (same headings, callouts as labelled blockquotes), and because those tools read text, not

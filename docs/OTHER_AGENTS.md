@@ -26,7 +26,8 @@ can follow the steps.
 
 **How hard is a port.** A first, useful port is small: copy the skill folder to the place the
 other agent looks for skills (many now read `.agents/skills/`). The core pipeline then runs.
-Expect the version check at session start to fail or be skipped, expect no saved transcript, and
+Expect the version check at session start to fail or be skipped, expect no saved transcript (so
+the report's "AI assistance" line, which `credit.py` reads from it, names no model), and
 expect the reviewer step to need a hand-written substitute. Nothing breaks the science. The
 skill's own text calls other agents out in one place already: `save_transcript.py` says "Other
 agents (not Claude Code): there is no transcript to find" and relies on `logs/decisions.md`

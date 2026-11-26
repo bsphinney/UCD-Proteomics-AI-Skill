@@ -4629,7 +4629,7 @@ def left_out_text(left):
 def build_readme(summary: dict, delivered: set, raw_names: list, mode: str = "analysis",
                  html_twin: bool = False, for_html: bool = False, hive_md=None,
                  podcast: bool = False, search_dir: str = "search", quantified=None,
-                 left_out=None) -> str:
+                 left_out=None, credit=None) -> str:
     """Collaborator-facing. Every claim comes from the submission record or from a file that
     was actually delivered -- no email addresses, no numbers that are not in the inputs, and no
     "we compared your groups" without a comparison table beside it. The only paths are the
@@ -4643,7 +4643,9 @@ def build_readme(summary: dict, delivered: set, raw_names: list, mode: str = "an
     `quantified`: searches_quantified() of the delivered search folders, so an
     identifications-only search is described as one (SEARCH_DID, SEARCH_FOLDER_HOLDS).
     `left_out`: deliver's session_left_out (a part-plate session): left_out_text() says which
-    submitted files were not analysed, and the raw-folder row says whose raw files it holds."""
+    submitted files were not analysed, and the raw-folder row says whose raw files it holds.
+    `credit`: the session's "Prepared by" / "AI assistance" lines (credit.facts, through
+    session_docs.gather): generated from its records, and the one place a staff name is meant."""
     sd = (search_dir or "search").strip("/") + "/"
     lo = left_out_text(left_out) if mode != "raw-only" else None
     raw_row = (f"{lo['raw']}, in the `raw` folder next to this one" if lo else
@@ -4838,7 +4840,10 @@ def build_readme(summary: dict, delivered: set, raw_names: list, mode: str = "an
           "Proteomics Core" + (" and the instrument grant named at the end of `methods.md`."
                                if "methods.md" in delivered else
                                ", and ask us for the instrument grant acknowledgment that applies."),
-          "", "## Questions", "", "Contact the UC Davis Proteomics Core.", ""]
+          ""]
+    if credit and mode != "raw-only":
+        L += ["  \n".join(f"**{k}:** {v}" for k, v in credit), ""]
+    L += ["## Questions", "", "Contact the UC Davis Proteomics Core.", ""]
     core = _core_run(summary) if "Analysis_Report.html" in delivered else None
     if core:
         L += [feedback_line("readme", core["prot"], podcast), ""]
@@ -4922,12 +4927,14 @@ def delivery_docs(summary: dict, session_dir, delivery: str, delivered: set, raw
     quantified = searches_quantified(
         sibling("session").paths_for(session_dir)["output_dir"] if session_dir else None,
         delivered_search_folders(delivered, mode, sdir))
+    credit = (f or {}).get("credit")
     html_ok = False
     if docs:
         try:
             src = build_readme(summary, delivered, raw_names, mode, html_twin=True, for_html=True,
                                hive_md=hive, podcast=delivered_podcast(session_dir, delivered),
-                               search_dir=sdir, quantified=quantified, left_out=left_out)
+                               search_dir=sdir, quantified=quantified, left_out=left_out,
+                               credit=credit)
             write_text_nofollow(os.path.join(delivery, "README.html"),
                                 docs._render_html(src, src.splitlines()[0].lstrip("# ").strip()),
                                 froot, warnings)
@@ -4941,7 +4948,8 @@ def delivery_docs(summary: dict, session_dir, delivery: str, delivered: set, raw
     write_text_nofollow(os.path.join(delivery, "README.md"),
                         build_readme(summary, delivered, raw_names, mode, html_twin=html_ok,
                                      hive_md=hive, podcast=delivered_podcast(session_dir, delivered),
-                                     search_dir=sdir, quantified=quantified, left_out=left_out),
+                                     search_dir=sdir, quantified=quantified, left_out=left_out,
+                                     credit=credit),
                         froot, warnings)
     delivered.add("README.md")
     lines.append(("README.md", None))

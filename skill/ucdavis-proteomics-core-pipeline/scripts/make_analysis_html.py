@@ -548,6 +548,8 @@ def session_facts(a, prov, submission=None):
     eng, ver = search_engine(a.session, prov)
     unchosen = search_not_recorded_text(a.session, prov)
     pinned = search_engine_pinned(a.session, prov)
+    import credit                               # who prepared it, which model helped: its record
+    credits = credit.facts(credit.refresh(s)) if s else []
     return [("Submission", submission),
             ("Organism", database_organisms(fmeta, man.get("organism"),
                                             man.get("organism_taxid"))),
@@ -556,6 +558,7 @@ def session_facts(a, prov, submission=None):
                         + (" (workflow manifest pin)" if eng and pinned else ""))
              or (f"not recorded ({unchosen})" if unchosen else None)),
             ("DE", prov.get("display_label")),
+            *credits,
             ("Report generated", datetime.date.today().isoformat())]
 
 

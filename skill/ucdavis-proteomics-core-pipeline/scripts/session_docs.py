@@ -414,6 +414,14 @@ def _params_as_run(p, sp, search_dir):
     return params_file(p)
 
 
+def _credit_facts(session_dir):
+    try:
+        import credit
+        return credit.facts(credit.refresh(session_dir))
+    except Exception:                           # a credit line never costs the documents
+        return []
+
+
 def gather(session_dir, registry=None, registry_note=None, pending=(), located_at=None):
     """Every fact the three documents state, read from the session. `registry`: the Core
     run-registry folder of this session, when known (record_run.locate() or its result).
@@ -438,6 +446,9 @@ def gather(session_dir, registry=None, registry_note=None, pending=(), located_a
          # the session has a DE (session.has_de: run_de.R's record): what the documents say about
          # the tables, the Methods and the review checklist follows it (L5b review L2, rule 1)
          "has_de": has_de(p),
+         # "Prepared by" / "AI assistance" (credit.py: its record, with any conversation saved
+         # since; only the lines that record supports)
+         "credit": _credit_facts(sd),
          # whether the search quantified (sage_lfq_check.search_quantified, the predicate the DE
          # gate shares): an identifications-only search's one table is identifications.tsv,
          # which the README and AGENTS.md name (C2 biologist M2)
@@ -762,6 +773,8 @@ def readme_md(f, for_html=False):
         L += ["", f"**Open `{names.get('README.html', 'README.html')}`** (double-click it) — the "
                   f"same page, with working links. {README_MD_NOT_LINKS}"]
     L += kept_note(f, "README.md")
+    if f.get("credit"):
+        L += ["", "  \n".join(f"**{k}:** {v}" for k, v in f["credit"])]
     start = []
     for key, text, what in (
             ("report_html", "Analysis report", " — figures, QC and the interpretation in one page"),

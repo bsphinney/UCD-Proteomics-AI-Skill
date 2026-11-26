@@ -82,7 +82,7 @@ GROUPS = (
       r"/compute_record\.R$", r"/run_name\.R$")),
     ("Report and Methods",
      "The report of record, its figures and wording, the Methods, the podcast and the peak check.",
-     (r"/make_report", r"/make_analysis_html", r"/make_figures", r"/make_methods", r"/methods\.md$",
+     (r"/make_report", r"/credit\.py$", r"/make_analysis_html", r"/make_figures", r"/make_methods", r"/methods\.md$",
       r"/analysis_prompt", r"/analysis\.md$", r"podcast", r"/kokoro", r"/client_text",
       r"/report_style", r"/report_files", r"/html_to_pdf", r"/to_docx", r"/make_comparison_report",
       r"/cross-tool-comparison\.md$", r"/skyline", r"/outputs\.md$")),

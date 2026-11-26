@@ -23,11 +23,11 @@ jobs** on HIVE — nothing depends on an interactive session staying open.
 - 357: Core staff — submission workflow prerequisites
 - 398: Rebuild on HIVE (non-Core users) — exact steps, no guessing
 - 432: Notes
-- 463: On HIVE: the login node or a compute node (golden rule 3, step 0a)
-- 512: Step 0a: the questions, the check and the modes
-- 591: Step 0: is this skill current? (every conversation)
-- 735: Step 1: locating the raw files
-- 740: Step 1: a path the user gave on a network drive
+- 464: On HIVE: the login node or a compute node (golden rule 3, step 0a)
+- 513: Step 0a: the questions, the check and the modes
+- 592: Step 0: is this skill current? (every conversation)
+- 736: Step 1: locating the raw files
+- 741: Step 1: a path the user gave on a network drive
 <!-- /contents -->
 
 ## Step 0a asks two questions (Core staff, three) → pick a mode
@@ -444,7 +444,8 @@ your own copy in your HIVE home. Run all of this **on HIVE** (via `hive_exec.sh`
   request it from the Core. It means only that: a member reuses the Core's software
   (DIA-NN builds, pre-staged FASTAs), and is not thereby Core staff.
 - "Core staff" = this HIVE login is on the Core staff list (`staff.py`: the list a Core admin
-  owns on HIVE, `/quobyte/proteomics-grp/.config/core_staff.txt`), reported by
+  owns on HIVE, `/quobyte/proteomics-grp/.config/core_staff.txt`; a line `<login>  credit: <name>`
+  also lets that person be named on client reports, `credit.py`), reported by
   `check_access.sh` as `core_staff`. It is the ONE test for every staff-only step: step 0a's
   question 3, steps 1–1c, the board and CoreOmics (SKILL.md golden rule 12), and in the scripts
   `session.py core-client`, the survey line, the podcast's `--core-run` and the PRM follow-up

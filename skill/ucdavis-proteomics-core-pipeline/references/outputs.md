@@ -6,16 +6,16 @@ Every run is packaged into a tidy **session directory** so people can find thing
 **Contents** (section: line)
 - 21: Where the session goes — ask the user
 - 33: Session layout (`session.py`)
-- 326: Re-analysis of the same dataset
-- 357: Comparing analyses (`compare_analyses.R`)
-- 377: 1b. A prior analysis: a new session is fresh (step 1b)
-- 389: 1b. A re-analysis, only when the user asks for one (step 1b)
-- 398: 3b. Creating the analysis session (step 3b)
-- 488: 11. The output-files report (step 11)
-- 509: 11b. A re-analysis: compare to the original (step 11b)
-- 526: Golden rule 16: stay on the standard path; the finish steps always run
-- 546: 12. Finalize the session, and the summary to the user (step 12)
-- 652: Keeping the record of the analysis: the decisions log and the conversation
+- 336: Re-analysis of the same dataset
+- 367: Comparing analyses (`compare_analyses.R`)
+- 387: 1b. A prior analysis: a new session is fresh (step 1b)
+- 399: 1b. A re-analysis, only when the user asks for one (step 1b)
+- 408: 3b. Creating the analysis session (step 3b)
+- 498: 11. The output-files report (step 11)
+- 519: 11b. A re-analysis: compare to the original (step 11b)
+- 536: Golden rule 16: stay on the standard path; the finish steps always run
+- 556: 12. Finalize the session, and the summary to the user (step 12)
+- 662: Keeping the record of the analysis: the decisions log and the conversation
 <!-- /contents -->
 
 ## Where the session goes — ask the user
@@ -108,6 +108,7 @@ The orchestrator asks where results should live (SKILL.md step 3b):
     decisions.md            #   the decisions log (log_decision.py): what was decided, and why
     conversation/           #   CORE-INTERNAL (save_transcript.py): <session-id>.jsonl (redacted
                             #   Claude Code transcripts), index.json, conversation.md
+  output/credit.json        # who prepared the report and which AI model helped (credit.py)
 ```
 
 - `session.py init --name "..." --raw <globs> [--base <path>] [--reanalysis-of <prior> [--beside]]`
@@ -273,6 +274,15 @@ Two records let an AI (or a person) check later how the analysis was done; AGENT
 "Reviewing this analysis" section is the checklist (groups and contrasts as confirmed, every
 number traced to a command, nothing skipped or re-run unrecorded, no warning ignored).
 - `logs/decisions.md` (`log_decision.py`): one entry per decision point, any agent.
+- `output/credit.json` (`credit.py record <S>`): the "Prepared by" and "AI assistance" lines of
+  the report header, both READMEs and the Methods' Acknowledgments. Generated, never typed. The
+  model is each model id in the saved conversations (so save the conversation first; a session
+  that changed model lists each), with the skill version. The staff member is named only by the
+  `credit:` name on their line of the Core staff list, which a Core admin adds when that person
+  agrees; otherwise there is no "Prepared by" line (`record` prints why; the record itself never
+  holds a login). A part no record holds is left out. Each document re-reads the conversations
+  when it is rendered, so a model used later is added, and checks the name against the staff
+  list again, so a `credit:` an admin removes is gone from the next render.
 - `logs/conversation/` (`save_transcript.py`, Claude Code only): each conversation's transcript,
   found by `CLAUDE_CODE_SESSION_ID` under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects/` and
   **redacted** before it is written (the skill's secret patterns, the secret values this
