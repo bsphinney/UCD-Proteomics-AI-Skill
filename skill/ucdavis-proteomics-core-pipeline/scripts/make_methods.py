@@ -3191,6 +3191,14 @@ def main():
     # instrument does not make the Core the place it was acquired (2.14.2 review)
     w(ack_text if facility or ack_label is None else f"{ack_text} {ACK_OUTSIDE_TAG}")
     w("")
+    # who prepared the analysis and which AI model helped (credit.py's record of the session:
+    # generated, never typed; left out when the record supports neither)
+    if a.session:
+        import credit
+        credit_line = credit.sentence(credit.refresh(os.path.abspath(a.session)))
+        if credit_line:
+            w(credit_line)
+            w("")
     w(f"*Acknowledgment source: {ACK_SOURCE} (confirm the exact current wording before publishing).*")
     w("")
 

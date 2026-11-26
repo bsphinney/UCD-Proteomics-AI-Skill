@@ -47,13 +47,13 @@ ones, not wrong sentences (see "What check cannot catch" below).
 - 219: The hosts
 - 245: Structure
 - 310: Fidelity rules
-- 470: The script file (`<session>/output/podcast/podcast_script.md`)
-- 535: Commands
-- 883: The local voice (Kokoro on HIVE)
-- 1023: Sending the report with the audio (`share`)
-- 1065: What ends up in `output/podcast/`
-- 1082: Known limitations
-- 1102: 9e. The audio discussion (step 9e)
+- 471: The script file (`<session>/output/podcast/podcast_script.md`)
+- 536: Commands
+- 884: The local voice (Kokoro on HIVE)
+- 1024: Sending the report with the audio (`share`)
+- 1066: What ends up in `output/podcast/`
+- 1083: Known limitations
+- 1103: 9e. The audio discussion (step 9e)
 <!-- /contents -->
 
 ## When it is made
@@ -345,7 +345,8 @@ Claims section):
   failed; `check.txt` lists the ones not in the sources as INFO -- read that line.
 - **Names**: no person's name except the hosts; the lab name ("the <PI surname> lab") is the most
   you may use. Pass people's full and first names to `check --forbid-name` (the PI, the
-  submitter, lab members, Core staff). They are searched in the transcript, the header lines,
+  submitter, lab members, Core staff, the report's "Prepared by" name too: that line is for the
+  page, not the audio). They are searched in the transcript, the header lines,
   the claims, the styles and the Pronunciation table.
 - **Pronunciation rows** go to the voices without being checked against the report, so a row
   may only re-spell its written form. Its digits -- numerals and number words, read the way

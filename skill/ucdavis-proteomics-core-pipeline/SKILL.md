@@ -416,7 +416,7 @@ skyline.md "8f.". Core staff: board.md §3 row "other job submitted". 8g: protei
 ### 9. Analyze the data (you write the report)
 `analysis_prompt.py ... --workflow-manifest ./wf/workflow.manifest.json --session <session>` writes
 the brief; read it and every file it lists; write `AI_Analysis_Report.md` (no "Audit & caveats":
-`make_analysis_html.py` adds a plain-language table); then `make_analysis_html.py --session <session>
+`make_analysis_html.py` adds a plain-language table); `save_transcript.py`, then `credit.py record <session>` (the "Prepared by" / "AI assistance" lines); then `make_analysis_html.py --session <session>
 --out <session>/output/Analysis_Report.html`, the report of record. NOT STATED sample type → name no
 tissue; the submitter's words for the samples; embed every figure; every number from the CSVs, never
 fabricated; QC stays above the results. No Word copy; point at the HTML first. → analysis.md "9.".

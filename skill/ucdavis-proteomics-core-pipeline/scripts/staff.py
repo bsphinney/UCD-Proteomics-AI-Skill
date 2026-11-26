@@ -9,7 +9,9 @@ that person's HIVE login (shaped like one, lowercased: a full name such as "Staf
 refused, list or no list), listed in the Core's staff file:
 
   CORE_STAFF_FILE (environment), default /quobyte/proteomics-grp/.config/core_staff.txt
-  one HIVE login per line; `#` starts a comment; anything after the login on a line is ignored
+  one HIVE login per line; `#` starts a comment; anything after the login on a line is ignored,
+  except `credit: <name>`: the name that person agreed to be credited by on client reports
+  (credit_for; credit.py writes the one "Prepared by" line from it)
 
 The file counts only when a Core admin owns it and its folder and nobody else can write either
 (slack_collab.trust_problem, the rule for every Core file on HIVE: /quobyte/proteomics-grp is
@@ -21,7 +23,8 @@ that is an agent's name (claude, assistant, agent, bot, ... as a whole part of i
 "ai", never "talbot") is refused, and any other login passes with a warning saying it was NOT
 VERIFIED.
 
-Names stay with the staff. What reaches a client -- methods, AUDIT.md, tables/,
+Names stay with the staff -- with ONE exception, the generated "Prepared by" line (credit.py),
+and only for a staff member whose line in the staff file carries `credit:`. What reaches a client -- methods, AUDIT.md, tables/,
 reproducibility/, the session zip -- says ROLE ("Core staff"); an override (estimate_params.py,
 resolve_defaults.py --override-by) says it only for a login on the list, else USER_ROLE ("the
 user"), through role_for(). The name and the login go into
@@ -154,6 +157,63 @@ def load_staff(path=None):
     if not logins:
         return None, f"{path} lists no HIVE login"
     return logins, None
+
+
+#: A staff-list line may end in `credit: <name>` -- the name that staff member has AGREED to see
+#: on client reports ("Prepared by <name>, UC Davis Proteomics Core": credit.py). The list is a
+#: Core admin's, so the admin writes it once the person has said yes; no `credit:` means no name.
+_CREDIT = re.compile(r"(?<![\w-])credit\s*[:=]\s*(.+)$", re.I)
+_CREDIT_NAME = re.compile(r"^[^\W\d_][^\W\d_ .,'’-]*(?:[ .,'’-]+[^\W\d_][^\W\d_.,'’-]*\.?){0,7}$")
+CREDIT_NAME_MAX = 80
+
+
+def is_credit_name(name):
+    """Is `name` shaped like a person's name as a credit line may print it (letters, spaces,
+    . , ' -; up to CREDIT_NAME_MAX characters)? Nothing that could be markup or a link."""
+    return (isinstance(name, str) and 0 < len(name) <= CREDIT_NAME_MAX
+            and bool(_CREDIT_NAME.match(name)))
+
+
+def credit_names(path=None):
+    """({login: the name they agreed to be credited by}, None) from a usable staff file, else
+    (None, why it cannot be used). A `credit:` that is not a person's name (is_credit_name)
+    credits nobody. The `why` can name logins and paths: it is for staff, never for a record a
+    client gets."""
+    path = path or staff_file()
+    import slack_collab as sc
+    info = sc._look(path, True)
+    if info.get("error") == "FileNotFoundError":
+        return None, f"{path} does not exist"
+    why = sc.trust_problem(info, sc._folder(path), sc.core_admins())
+    if why:
+        return None, f"{path} is not trusted: {why}"
+    names = {}
+    for ln in (info.get("text") or "").splitlines():
+        body = ln.split("#", 1)[0]
+        f = body.split()
+        if not f or not _LOGIN.match(f[0].lower()):
+            continue
+        m = _CREDIT.search(body[len(f[0]) + body.index(f[0]):])
+        import unicodedata
+        name = unicodedata.normalize("NFC", " ".join(m.group(1).split())) if m else ""
+        if is_credit_name(name):
+            names.setdefault(f[0].lower(), name)
+    return names, None
+
+
+def credit_for(by=None):
+    """(the name `by` -- default: the login running this -- agreed to be credited by, None), or
+    (None, why nobody is named). Never a name from anywhere but the Core's staff list."""
+    by = (by or login() or "").strip().lower()
+    if not by or not _LOGIN.match(by):
+        return None, "no login to look up"
+    names, why = credit_names()
+    if names is None:
+        return None, f"the Core staff list is not usable ({why})"
+    if by not in names:
+        return None, ("this login has no `credit:` name on the Core staff list (a Core admin adds "
+                      "one when the staff member agrees to be named)")
+    return names[by], None
 
 
 def check_by(by):
