@@ -1568,9 +1568,16 @@ def do_finalize(a):
     # now, before the zip; the stamp itself is written last.
     stamp_name = f"Finalize stamp (output/{report_files.FINALIZED_RECORD})"
     _, stamp_missing = stamp_outputs(p, list(docs["written"].values()))
+    # a methods.md that lacks a required section is there, but it is not the Methods
+    # (make_deposit.ensure_methods: no Word copy and no protocols were made from it)
+    lacks = (getattr(man, "for_agent", None) or {}).get("methods_incomplete")
+    if lacks and not any(rel == "output/methods.md" for rel, _ in stamp_missing):
+        stamp_missing.append(("output/methods.md", "it lacks: " + ", ".join(lacks)))
     not_finalized = None
     if stamp_missing and not gate["override_reason"]:
-        not_finalized = "; ".join(f"{rel} was not written ({why})" for rel, why in stamp_missing)
+        not_finalized = "; ".join(
+            f"{rel} is not complete ({why})" if why.startswith("it lacks: ") else
+            f"{rel} was not written ({why})" for rel, why in stamp_missing)
         _append_manifest(p["manifest_txt"], "SKIPPED", stamp_name, f"not written: {not_finalized}")
     elif stamp_missing:
         with open(p["manifest_txt"], "a", encoding="utf-8") as fh:
@@ -1825,7 +1832,7 @@ def do_finalize(a):
                                        f"written: {e.strerror or e}"]
     print(json.dumps(result, indent=2))
     if not result.get("finalized"):
-        hints = _not_finalized_hints(p, a, [rel for rel, _ in stamp_missing])
+        hints = _not_finalized_hints(p, a, [rel for rel, _ in stamp_missing], lacks)
         sys.stderr.write("[session] NOT FINALIZED -- no output/FINALIZED.json: "
                          + "; ".join(result["not_finalized"]) + ". Make what is missing and run "
                          "finalize again (or --override-finish \"<reason>\")."
@@ -1833,14 +1840,19 @@ def do_finalize(a):
         sys.exit(2)
 
 
-def _not_finalized_hints(p, a, missing):
+def _not_finalized_hints(p, a, missing, methods_lack=None):
     """How to make each document the stamp still needs (L5b review L5: a --methods fold-in with
     no raw-file list was refused with no way forward). -> [sentence]."""
     import shlex
     import report_files as rf
     q = shlex.quote
     hints = []
-    if "output/methods.md" in missing:
+    if "output/methods.md" in missing and methods_lack:
+        hints.append("output/methods.md: add the section(s) it lacks (" + ", ".join(methods_lack)
+                     + ") under exactly those headings, polished -- make_methods.py's complete "
+                       "draft beside it (output/methods_complete_draft.md) has their text to "
+                       "start from, and is never itself delivered -- then delete the draft")
+    elif "output/methods.md" in missing:
         given = getattr(a, "methods", None)
         hints.append("output/methods.md: "
                      + (f"use the Methods you gave with --methods as the session's own: cp "

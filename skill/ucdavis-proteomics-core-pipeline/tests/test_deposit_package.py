@@ -649,18 +649,100 @@ class MissingInputs(unittest.TestCase):
             self.assertEqual(set(col(header, rows, "characteristics[organism]")), {md.TO_FILL})
             self.assertNotIn("characteristics[sex]", header)   # not known to be human
 
-    def test_existing_methods_kept_and_draft_written(self):
+    def test_methods_lacking_a_section_are_never_replaced_by_the_draft(self):
+        """2026-11-25: a polished methods.md had no "Sample preparation" heading, so finalize
+        built the Word Methods and the deposit protocols from make_methods.py's unpolished draft
+        (its [confirm] tags and all) and stamped the session. Now: methods.md is kept, the
+        draft is only something to copy from, no Word copy or protocol is made from either, and
+        finalize refuses to stamp until the section is there."""
+        sys.path.insert(0, HERE)
+        from test_submission_report import attach_fixture
         with tempfile.TemporaryDirectory() as tmp:
             p = dia_session(tmp)
+            attach_fixture(p["session_dir"])        # a Core submission: a client deliverable
             write(p["methods_md"], "# My polished methods\n\n## Liquid chromatography\n\nX\n")
-            self.assertEqual(finalize(p["session_dir"]).returncode, 0)
+            r = finalize(p["session_dir"])
+            self.assertEqual(r.returncode, 2, r.stderr[-800:])
+            self.assertIn("Sample preparation", json.loads(r.stdout)["methods_incomplete"])
+            self.assertIn("NOT FINALIZED", r.stderr)
+            self.assertIn("output/methods.md is not complete (it lacks: Sample preparation, "
+                          "Mass spectrometry", r.stderr)
+            self.assertIn("add the section(s) it lacks", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(p["output_dir"], "FINALIZED.json")))
             with open(p["methods_md"]) as fh:
                 self.assertIn("My polished methods", fh.read())
             draft = os.path.join(p["output_dir"], "methods_complete_draft.md")
-            self.assertTrue(os.path.isfile(draft))
-            self.assertTrue(any("lacks: Mass spectrometry" in ln for ln in manifest_lines(p)))
-            self.assertTrue(any("the .docx and the deposit protocols come from it" in ln
-                                for ln in manifest_lines(p)))
+            self.assertTrue(os.path.isfile(draft))                 # to copy from
+            for name in ("methods.docx", "methods_complete_draft.docx"):
+                self.assertFalse(os.path.exists(os.path.join(p["output_dir"], name)), name)
+            line = next(ln for ln in manifest_lines(p) if "output/methods.md" in ln
+                        and "lacks" in ln)
+            self.assertTrue(line.startswith("[SKIPPED]"), line)
+            self.assertFalse(any("come from it" in ln for ln in manifest_lines(p)))
+            self.assertFalse(os.path.exists(os.path.join(p["deposit_dir"], "protocols.txt")))
+            line = next(ln for ln in manifest_lines(p) if "Deposit: protocols.txt" in ln)
+            self.assertTrue(line.startswith("[SKIPPED]"), line)
+            self.assertIn("lacks: Sample preparation, Mass spectrometry", line)
+            out = json.loads(r.stdout)
+            self.assertIn("Mass spectrometry", out["methods_incomplete"])
+            self.assertIn("no Word copy or deposit protocol was made", out["methods_to_fix"][0])
+            self.assertIsNone(out["finalized"])
+            # the section added: finalize stamps, and the Word copy is of methods.md
+            with open(draft, encoding="utf-8") as fh:
+                write(p["methods_md"], "# My polished methods\n\n" + fh.read().split("\n", 1)[1])
+            os.remove(draft)
+            r = finalize(p["session_dir"])
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            # (.docx needs pandoc or python-docx, which a test interpreter may lack: its line
+            # must only no longer say there is nothing to convert)
+            self.assertFalse(any("no methods .md to convert" in ln for ln in manifest_lines(p)))
+            self.assertFalse(os.path.exists(os.path.join(p["output_dir"],
+                                                         "methods_complete_draft.docx")))
+            self.assertNotIn("methods_incomplete", r.stdout)
+            self.assertTrue(os.path.isfile(os.path.join(p["deposit_dir"], "protocols.txt")))
+            # the Methods lose a heading after a finalize that made everything: the Word copy
+            # and the protocols of that finalize are not these Methods', and are removed
+            docx = os.path.join(p["output_dir"], "methods.docx")
+            old_draft_docx = os.path.join(p["output_dir"], "methods_complete_draft.docx")
+            for path in (docx, old_draft_docx):
+                write(path, "an earlier Word copy")
+            with open(p["methods_md"], encoding="utf-8") as fh:
+                text = fh.read()
+            write(p["methods_md"], text.replace("## Mass spectrometry", "## The instrument"))
+            r = finalize(p["session_dir"])
+            self.assertEqual(r.returncode, 2, r.stderr[-800:])
+            for path in (docx, old_draft_docx, os.path.join(p["deposit_dir"], "protocols.txt"),
+                         os.path.join(p["output_dir"], "FINALIZED.json")):
+                self.assertFalse(os.path.exists(path), path)
+            self.assertIn("methods.docx, methods_complete_draft.docx was removed",
+                          json.loads(r.stdout)["methods_to_fix"][0])
+            # --override-finish goes ahead, and still makes nothing from incomplete Methods
+            r = finalize(p["session_dir"], "--override-finish", "testing the override")
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            self.assertFalse(os.path.exists(docx))
+            self.assertFalse(os.path.exists(os.path.join(p["deposit_dir"], "protocols.txt")))
+
+    def test_outside_a_submission_the_users_own_methods_are_used_as_written(self):
+        """A user's own Methods, in their own layout: kept, and the Word copy and the protocols
+        are made from THEM -- never from make_methods.py's draft -- and finalize goes ahead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = dia_session(tmp)
+            write(p["methods_md"], "# My methods\n\n## Liquid chromatography\n\nMy own LC text.\n")
+            r = finalize(p["session_dir"])
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            out = json.loads(r.stdout)
+            self.assertNotIn("methods_incomplete", out)
+            self.assertIn("never from the draft", out["methods_to_fix"][0])
+            self.assertTrue(os.path.isfile(os.path.join(p["output_dir"], "methods_complete_draft.md")))
+            self.assertFalse(os.path.exists(os.path.join(p["output_dir"],
+                                                         "methods_complete_draft.docx")))
+            line = next(ln for ln in manifest_lines(p) if "output/methods.md" in ln)
+            self.assertIn("lacks: Mass spectrometry", line)
+            self.assertIn("made from it as written", line)
+            with open(os.path.join(p["deposit_dir"], "protocols.txt"), encoding="utf-8") as fh:
+                protocols = fh.read()
+            self.assertIn("My own LC text.", protocols)
+            self.assertNotIn("[facility default", protocols)     # nothing of the draft's
 
     def test_a_pipelines_own_de_heading_is_not_a_missing_section(self):
         """run_silac.R's Methods heading is "SILAC ratio analysis": finalize read every SILAC

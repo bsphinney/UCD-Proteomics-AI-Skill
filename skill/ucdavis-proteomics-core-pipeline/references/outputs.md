@@ -15,7 +15,7 @@ Every run is packaged into a tidy **session directory** so people can find thing
 - 509: 11b. A re-analysis: compare to the original (step 11b)
 - 526: Golden rule 16: stay on the standard path; the finish steps always run
 - 546: 12. Finalize the session, and the summary to the user (step 12)
-- 652: Keeping the record of the analysis: the decisions log and the conversation
+- 658: Keeping the record of the analysis: the decisions log and the conversation
 <!-- /contents -->
 
 ## Where the session goes — ask the user
@@ -572,8 +572,14 @@ starter README included), is never overwritten: the skill writes
 **publication Methods**: `output/methods.md` + `.docx`, covering LC-MS acquisition, the search
 (engine, pinned version, parameters, FDR), the sequence database and contaminants, the DE, and the
 instrument-grant acknowledgment. If step 9d did not write them, `make_methods.py` does it here. An
-existing `methods.md` is never overwritten; if it lacks a section, a complete draft is written
-beside it as `methods_complete_draft.md`. Finalize then writes the **repository-deposit package**
+existing `methods.md` is never overwritten, and nothing is ever made from `make_methods.py`'s
+draft. If it lacks a required section: outside a Core submission the `.docx` and the protocols
+are made from it as written, and `methods_to_fix` says what it lacks. For a Core submission
+(`Sample preparation` is required too, also when the lab prepared the samples) finalize exits 2 with
+`methods_incomplete`: no `.docx` and no deposit protocols are made (an earlier `methods.docx`
+and `protocols.txt` are removed: they are not these Methods), and `make_methods.py`'s
+complete draft is written beside it as `methods_complete_draft.md`, only to copy the section
+from. Add the section, delete the draft, finalize again. Finalize then writes the **repository-deposit package**
 `output/DATA_SUBMISSION/`: `HOW_TO_SUBMIT.md`/`.html`, a pre-filled SDRF `sdrf.tsv`,
 `protocols.txt`, `files_to_upload.tsv`, and `prepare_upload.sbatch`. Never run
 `prepare_upload.sbatch` yourself: it reads every raw file, so the user submits it with `sbatch`

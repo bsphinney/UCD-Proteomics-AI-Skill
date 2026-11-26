@@ -7,7 +7,10 @@
    contaminants, the differential-expression analysis, and the UC Davis instrument-grant
    acknowledgment. If the file is missing, finalize writes it with `make_methods.py` from what the
    session holds; an existing `methods.md` is never overwritten (it may be hand-polished) — if it
-   lacks a section, a complete draft is written beside it as `methods_complete_draft.md`.
+   lacks a section, a complete draft is written beside it as `methods_complete_draft.md` to copy
+   the section from (unpolished; nothing is made from it, and it is never delivered). For a
+   Core submission finalize then refuses to stamp, and makes no `.docx` and no protocols;
+   otherwise both are made from `methods.md` as written.
 2. **`output/DATA_SUBMISSION/`** — everything to deposit the data in PRIDE (default) or MassIVE:
 
 | File | What it is |
@@ -27,6 +30,14 @@ Sage/FragPipe, or finalized away from the raw files still finalizes: the missing
 `output/DATA_SUBMISSION/upload_staging/` (raw archives), like `output/raw_data/`.
 
 Run it by hand: `python3 scripts/make_deposit.py --session <session_dir>`.
+
+<!-- contents: tests/test_skill_structure.py --toc -->
+**Contents** (section: line)
+- 42: What is filled, and from where
+- 68: Sources (read 2026-09-24)
+- 93: Not verified
+- 102: When things change
+<!-- /contents -->
 
 ## What is filled, and from where
 
