@@ -1540,6 +1540,10 @@ def write_html(out):
 
 
 # ------------------------------------------------------------------------- methods --
+#: make_methods.py's complete draft, written beside a methods.md that lacks a required section.
+METHODS_DRAFT = "methods_complete_draft.md"
+
+
 def required_sections(f):
     need = ["Liquid chromatography", "Mass spectrometry", "Sequence database"]
     if os.path.isfile(f["p"]["submission_record"]):
@@ -1550,6 +1554,22 @@ def required_sections(f):
     if f["de_prov"]:
         need.append(mm.de_heading(f["de_prov"]))    # make_methods.py's own heading for it
     return need + ["Acknowledgments"]
+
+
+def methods_lacking(f, man=None):
+    """The required sections a Core submission's methods.md lacks, [] when it is complete,
+    absent or empty, or the session is no submission. ensure_methods' own finding when it ran in this Manifest (man.for_agent), else read
+    here -- make_deposit.py run by hand, or finalize --skip-methods."""
+    found = (getattr(man, "for_agent", None) or {}).get("methods_incomplete")
+    if found is not None:
+        return list(found)
+    md = f["p"]["methods_md"]
+    # only a Core submission's Methods are held to the sections (ensure_methods): a user's own
+    # Methods are used as written
+    if not (os.path.isfile(f["p"]["submission_record"]) and os.path.isfile(md) and _has_text(md)):
+        return []
+    with open(md, encoding="utf-8") as fh:
+        return missing_sections(required_sections(f), md_sections(fh.read()), f)
 
 
 def missing_sections(need, have, f):
@@ -1684,8 +1704,17 @@ def search_ambiguity(f, man):
 
 def ensure_methods(session_dir, man):
     """Make sure the session carries publication Methods (output/methods.md + .docx). A
-    methods.md already there is never overwritten -- it may be hand-polished; if it lacks a
-    required section, a complete draft is written beside it. Returns the file the protocols
+    methods.md already there is never overwritten -- it may be hand-polished. If it lacks a
+    required section, make_methods.py's complete draft is written beside it to copy from
+    (METHODS_DRAFT), and NOTHING is ever made from that draft. Outside a Core submission the
+    Word copy and the protocols are made from methods.md as written, and the agent is told
+    what it lacks. For a Core submission (a client deliverable) it is NOT complete Methods:
+    the part is [SKIPPED], no Word copy is made
+    and the deposit protocols are not drawn from it, a complete draft is written beside it to
+    copy the section from (METHODS_DRAFT -- never the source of a client file: it is
+    make_methods.py's unpolished text, with its [confirm] tags), the agent is told
+    (methods_to_fix, methods_incomplete) and finalize refuses to stamp (2026-11-25: a Word
+    Methods was built from the draft and nearly delivered). Returns the file the protocols
     should be drawn from (or None)."""
     f = gather(session_dir)
     p = f["p"]
@@ -1705,25 +1734,64 @@ def ensure_methods(session_dir, man):
             kept = scrub_kept_methods(md, man)
             if not missing:
                 return "present -- kept as written" + kept
-            draft = os.path.join(p["output_dir"], "methods_complete_draft.md")
+            if not os.path.isfile(p["submission_record"]):
+                # Not a Core submission: the user's own Methods, in their own layout, are
+                # theirs to keep. The Word copy and the protocols are made from methods.md AS
+                # WRITTEN -- never from the draft -- and the agent is told what it lacks.
+                draft = os.path.join(p["output_dir"], METHODS_DRAFT)
+                try:
+                    r = _run(methods_command(f, draft), "make_methods.py")
+                except Skip as e:
+                    r, where = None, f"a complete draft could not be written ({e})"
+                else:
+                    search_ambiguity(f, man)
+                    where = (f"make_methods.py's complete draft is output/{METHODS_DRAFT} "
+                             f"(unpolished: to copy from, never to deliver)")
+                man.for_agent.setdefault("methods_to_fix", []).append(
+                    f"output/methods.md lacks: {', '.join(missing)}. It is kept as written, and "
+                    f"the Word copy and the deposit protocols are made from it as it is (never "
+                    f"from the draft); {where}. If the Methods should cover the missing "
+                    f"section(s), add them to methods.md, delete the draft, and finalize again")
+                return (f"present, kept as written, but it lacks: {', '.join(missing)} -- the "
+                        f".docx and the deposit protocols are made from it as written; {where}"
+                        + kept + (methods_build_warnings(r, man, draft) if r is not None else ""))
+            # A Core submission's Methods go to a client: incomplete Methods are not delivered.
+            chosen["path"] = None                 # no Word copy, no protocols
+            man.for_agent["methods_incomplete"] = list(missing)
+            # a Word copy from an earlier finalize is of other Methods than these (finalize
+            # makes it from the .md, and makes it again whenever the .md is newer): removed, so
+            # the zip and a delivery cannot carry it as the current one
+            gone = []
+            for name in ("methods.docx", os.path.splitext(METHODS_DRAFT)[0] + ".docx"):
+                old = os.path.join(p["output_dir"], name)
+                if os.path.isfile(old):
+                    try:
+                        os.remove(old)
+                        gone.append(name)
+                    except OSError as e:
+                        kept += f"; an earlier {name} could not be removed ({e.strerror or e})"
+            if gone:
+                kept += (f"; removed the earlier Word cop{'y' if len(gone) == 1 else 'ies'} "
+                         f"({', '.join(gone)}): made from other text than this methods.md")
+            draft = os.path.join(p["output_dir"], METHODS_DRAFT)
             try:
                 r = _run(methods_command(f, draft), "make_methods.py")
             except Skip as e:
-                return (f"present, kept as written, but it lacks: {', '.join(missing)}; a "
-                        f"complete draft could not be written ({e})" + kept)
-            search_ambiguity(f, man)
-            chosen["path"] = draft
-            # the agent is told: the Word copy and the deposit protocols now come from an
-            # unpolished draft, which only completing methods.md undoes
-            man.for_agent.setdefault("methods_to_fix", []).append(
-                f"output/methods.md lacks: {', '.join(missing)}. The Word copy and the deposit "
-                f"protocols were built from output/methods_complete_draft.md (make_methods.py's "
-                f"unpolished draft) instead: add the missing section(s) to methods.md from the "
-                f"draft, delete the draft, and finalize again")
-            return (f"present, kept as written, but it lacks: {', '.join(missing)} -- a "
-                    f"complete draft is in output/methods_complete_draft.md, and the .docx and "
-                    f"the deposit protocols come from it"
-                    + kept + methods_build_warnings(r, man, draft))
+                r, where = None, f"a complete draft could not be written ({e})"
+            else:
+                search_ambiguity(f, man)
+                where = (f"make_methods.py's complete draft is output/{METHODS_DRAFT} (unpolished: "
+                         f"to copy from, never to deliver)")
+            fix = (f"output/methods.md lacks: {', '.join(missing)}. It is kept as written, and "
+                   f"no Word copy or deposit protocol was made from it or from the draft"
+                   + (f" (the earlier {', '.join(gone)} was removed: it is not these Methods)"
+                      if gone else "") + f"; {where}. Add the missing section(s) to methods.md under exactly "
+                   f"{'that heading' if len(missing) == 1 else 'those headings'} (polished, with "
+                   f"no [confirm] tag left), delete the draft, and finalize again")
+            man.for_agent.setdefault("methods_to_fix", []).append(fix)
+            raise Skip(f"it lacks: {', '.join(missing)} -- no .docx, no deposit protocols and "
+                       f"no finalize stamp until it is complete; {where}" + kept
+                       + (methods_build_warnings(r, man, draft) if r is not None else ""))
         r = _run(methods_command(f, md), "make_methods.py")
         search_ambiguity(f, man)
         chosen["path"] = md
@@ -2138,14 +2206,28 @@ def build(session_dir, man, methods_md=None):
         _need_plan()
         return write_prep_script(f, out, rows)
 
+    def _protocols():
+        # a methods.md that lacks a required section is not the Methods (ensure_methods): no
+        # protocol is drawn from it, and one left by an earlier build is not the Methods' either
+        lacks = methods_lacking(f, man)
+        if lacks:
+            stale = os.path.join(out, "protocols.txt")
+            removed = ""
+            if os.path.isfile(stale):
+                os.remove(stale)
+                removed = "; the protocols.txt of an earlier build was removed"
+            raise Skip(f"output/methods.md lacks: {', '.join(lacks)} -- no protocols until it "
+                       f"is complete{removed}")
+        return write_protocols(out, methods_md or (f["p"]["methods_md"]
+                                                   if _has_text(f["p"]["methods_md"]) else None),
+                               prot, f["de_prov"])
+
     planned = man.section("Deposit: upload plan", _plan)
     if search_ambiguous(f):              # no search output listed, and why (T44 review F3)
         man.section(SEARCH_UPLOAD_PART, _no_search_rows, f)
     man.section("Deposit: raw files in the upload plan", _raws)
     man.section("Deposit: sdrf.tsv (SDRF-Proteomics v1.1.0)", write_sdrf, f, out, sdrf)
-    man.section("Deposit: protocols.txt", write_protocols, out, methods_md
-                or (f["p"]["methods_md"] if _has_text(f["p"]["methods_md"]) else None),
-                prot, f["de_prov"])
+    man.section("Deposit: protocols.txt", _protocols)
     man.section("Deposit: files_to_upload.tsv", _list)
     man.section("Deposit: prepare_upload.sbatch (written, not run)", _prep)
     man.section("Deposit: HOW_TO_SUBMIT.md", write_howto, f, out, rows, sdrf, prot)

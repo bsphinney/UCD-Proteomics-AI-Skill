@@ -142,11 +142,49 @@ class Vendor(unittest.TestCase):
         self.assertIn(f"{mm.EMITTER_DEFAULT} {mm.DEF}", section(md, "Mass spectrometry"))
         self.assertIn("not recorded in the .d", md)
 
+    def _session_with_record(self, when):
+        """A session whose raw files cannot be read here, with step 2's record of when each
+        was acquired (input/acquisition.json). -> (the raw paths, the Methods' --out)."""
+        s = os.path.join(self.tmp, "session")
+        for sub in ("input", "output"):
+            os.makedirs(os.path.join(s, sub), exist_ok=True)
+        raws = [os.path.join(self.tmp, "gone", f"r{i}.d") for i in (1, 2)]
+        with open(os.path.join(s, "input", "acquisition.json"), "w", encoding="utf-8") as fh:
+            json.dump({"overall": "DIA",
+                       "files": [{"file": r, "acquired_at": w} for r, w in zip(raws, when)]}, fh)
+        return raws, os.path.join(s, "output", "methods.md")
+
+    def test_unreadable_raw_files_take_their_dates_from_the_session_record(self):
+        """finalize away from the data: the column goes by the dates step 2 recorded."""
+        for when, column in ((("2026-11-23T18:00:00Z", "2026-11-24T02:00:00Z"), mm.LC_COLUMN_MICHROM),
+                             (("2026-08-13T18:00:00Z", "2026-08-14T02:00:00Z"), mm.LC_COLUMN_DEFAULT)):
+            raws, out = self._session_with_record(when)
+            md, params = methods(self.tmp, raws, instrument="timsTOF HT", out=out)
+            self.assertIn(f"{column} {mm.DEF}", section(md, "Liquid chromatography"), when)
+            self.assertEqual(params["column"]["tag"], mm.DEF)
+        # 2026-09-17 05:00 UTC is the evening of the 16th at the facility: the day of the change
+        raws, out = self._session_with_record(("2026-09-17T05:00:00Z", "2026-09-17T06:00:00Z"))
+        md, _ = methods(self.tmp, raws, instrument="timsTOF HT", out=out)
+        self.assertIn(f"____ {mm.NR_TAG}", section(md, "Liquid chromatography"))
+        self.assertIn("changed on 2026-09-16", md)
+        # a date for only some of the runs says nothing of the rest: no column is named
+        raws, out = self._session_with_record(("2026-11-23T18:00:00Z", None))
+        md, _ = methods(self.tmp, raws, instrument="timsTOF HT", out=out)
+        lc = section(md, "Liquid chromatography")
+        self.assertNotIn("Michrom", lc)
+        self.assertIn(f"____ {mm.NR_TAG}", lc)
+
     def test_core_timstof_from_the_record_keeps_the_facility_defaults(self):   # (pin)
         d = os.path.join(self.tmp, "data", "r1.d")
         os.makedirs(d)
         md, _ = methods(self.tmp, [d], instrument="timsTOF HT")
-        self.assertIn(f"{mm.LC_COLUMN_DEFAULT} {mm.DEF}", section(md, "Liquid chromatography"))
+        # no acquisition date can be read from an empty .d, and the standard column changed on
+        # 2026-09-16: the column is a tagged blank, never a guess between the two
+        lc = section(md, "Liquid chromatography")
+        self.assertNotIn("PepSep", lc)
+        self.assertNotIn("Michrom", lc)
+        self.assertIn(f"____ {mm.NR_TAG}", lc)
+        self.assertIn("the column is not known", md)
         self.assertIn("TIMS", section(md, "Mass spectrometry"))
 
 

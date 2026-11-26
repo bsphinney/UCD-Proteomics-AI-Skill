@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
@@ -496,6 +497,155 @@ class Column(unittest.TestCase):
     def test_default_is_tagged(self):
         c = self.rec()
         self.assertEqual((c["text"], c["tag"]), (mm.LC_COLUMN_DEFAULT, mm.DEF))
+
+    def test_the_default_is_the_standard_column_on_the_runs_dates(self):
+        """2026-11-25: a batch acquired on 2026-11-23 was given the PepSep column in its
+        Methods; the timsTOF HT's standard column has been the Michrom one since 2026-09-16."""
+        for first, last, text, since in (
+                ("2026-08-13T18:23:03-07:00", "2026-08-14T05:51:10-07:00", mm.LC_COLUMN_DEFAULT,
+                 "until 2026-09-16"),
+                ("2026-09-15T23:59:00-07:00", None, mm.LC_COLUMN_DEFAULT, "until 2026-09-16"),
+                ("2026-09-17T00:01:00-07:00", None, mm.LC_COLUMN_MICHROM, "since 2026-09-16"),
+                ("2026-11-23T10:00:00-08:00", "2026-11-24T02:00:00-08:00", mm.LC_COLUMN_MICHROM,
+                 "since 2026-09-16")):
+            c = self.rec(first=first, last=last)
+            self.assertEqual((c["text"], c["tag"]), (text, mm.DEF), first)
+            self.assertIn(since, c["source"])
+            self.assertIn("confirm", c["source"])
+        self.assertIn("Michrom", mm.LC_COLUMN_MICHROM)
+        self.assertNotIn("PepSep", mm.LC_COLUMN_MICHROM)
+
+    def test_on_or_across_the_day_of_the_change_no_column_is_named(self):
+        for first, last in (("2026-09-16T09:00:00-07:00", "2026-09-16T20:00:00-07:00"),
+                            ("2026-09-10T09:00:00-07:00", "2026-09-20T20:00:00-07:00"),
+                            ("2026-09-15T22:00:00-07:00", "2026-09-16T01:00:00-07:00")):
+            c = self.rec(first=first, last=last)
+            self.assertEqual((c["text"], c["tag"]), ("____", mm.NR_TAG), first)
+            self.assertIn("changed on 2026-09-16", c["warnings"][-1])
+            self.assertIn("--lc-column", c["warnings"][-1])
+
+    def test_no_readable_date_names_no_column(self):
+        for first in (None, "", "not a date"):
+            c = self.rec(first=first, last=None)
+            self.assertEqual((c["text"], c["tag"]), ("____", mm.NR_TAG), first)
+            self.assertIn("no acquisition date", c["warnings"][-1])
+
+    STAN_EVENTS = [   # as STAN's /api/instruments/<name>/events answers, newest first
+        {"id": 3, "instrument": "timsTOF HT", "event_type": "column_change",
+         "event_date": "2026-09-16T19:09:26Z", "column_vendor": "Michrom",
+         "column_model": "C18 10cm x 150um, 1.5um", "column_serial": None, "first_run": "24444"},
+        {"id": 2, "instrument": "timsTOF HT", "event_type": "source_clean",
+         "event_date": "2026-09-10T12:00:00Z"},
+        {"id": 1, "instrument": "timsTOF HT", "event_type": "column_change",
+         "event_date": "2026-09-02T12:00:00Z", "column_vendor": None, "column_model": None}]
+
+    def stan(self, answer, **kw):
+        """column_record(--column-log stan) with STAN's one network call replaced."""
+        import qc_bracket
+        asked = []
+
+        def get_json(url, timeout):
+            asked.append(url)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        with mock.patch.object(qc_bracket, "get_json", get_json):
+            c = mm.column_record(None, (), mm.COLUMN_LOG_STAN, kw.pop("instrument", "timsTOF HT"),
+                                 kw.pop("first", "2026-11-23T10:00:00-08:00"),
+                                 kw.pop("last", "2026-11-24T02:00:00-08:00"))
+        return c, asked
+
+    def test_stan_names_the_column_in_place_for_the_runs(self):
+        c, asked = self.stan(self.STAN_EVENTS)
+        self.assertEqual(c["text"], "C18 10cm x 150um, 1.5um (Michrom)")
+        self.assertIsNone(c["tag"])                          # a record, not a default
+        self.assertIn("STAN's maintenance log: column_change of 2026-09-16", c["source"])
+        self.assertIn("first run on it 24444", c["source"])
+        self.assertEqual(len(asked), 1)
+        self.assertIn("/api/instruments/timsTOF%20HT/events", asked[0])
+
+    def test_a_stan_change_that_names_no_column_falls_to_the_column_of_the_dates(self):
+        c, _ = self.stan(self.STAN_EVENTS, first="2026-09-05T10:00:00-07:00",
+                         last="2026-09-06T02:00:00-07:00")
+        self.assertEqual((c["text"], c["tag"]), (mm.LC_COLUMN_DEFAULT, mm.DEF))
+        self.assertTrue(any("does not name the column" in w for w in c["warnings"]))
+
+    def test_an_unnamed_change_after_the_last_known_column_names_no_column(self):
+        """A swap logged in STAN with no column picked, later than the built-in history: the
+        column taken out is never printed as the one fitted."""
+        events = [{"instrument": "timsTOF HT", "event_type": "column_change",
+                   "event_date": "2026-12-10T12:00:00Z", "column_vendor": None,
+                   "column_model": None}] + self.STAN_EVENTS
+        c, _ = self.stan(events, first="2026-12-15T10:00:00-08:00", last="2026-12-16T02:00:00-08:00")
+        self.assertEqual((c["text"], c["tag"]), ("____", mm.NR_TAG))
+        self.assertIn("without naming the column", c["warnings"][-1])
+        self.assertIn("in STAN", c["warnings"][-1])
+        # runs before that swap still get the column STAN names for them
+        c, _ = self.stan(events)
+        self.assertEqual(c["text"], "C18 10cm x 150um, 1.5um (Michrom)")
+
+    def test_stan_unreachable_is_said_and_never_fails_the_methods(self):
+        import urllib.error
+        for answer in (urllib.error.URLError("no route to host"), ValueError("not JSON"),
+                       {"detail": "not a list"}, RuntimeError("anything else")):
+            c, _ = self.stan(answer)
+            self.assertEqual((c["text"], c["tag"]), (mm.LC_COLUMN_MICHROM, mm.DEF), answer)
+            self.assertTrue(any("STAN's column log could not be read" in w
+                                for w in c["warnings"]), c["warnings"])
+
+    def test_stan_is_not_asked_without_an_instrument_or_without_the_flag(self):
+        c, asked = self.stan(self.STAN_EVENTS, instrument=None)
+        self.assertEqual(asked, [])
+        self.assertTrue(any("the instrument is not known" in w for w in c["warnings"]))
+        import qc_bracket
+        with mock.patch.object(qc_bracket, "get_json", side_effect=AssertionError("asked")):
+            self.rec(first="2026-11-23T10:00:00-08:00")      # no --column-log: no network
+
+    def test_a_series_given_backwards_or_with_an_unreadable_end_is_not_one_day(self):
+        c = self.rec(first="2026-09-20T09:00:00-07:00", last="2026-09-12T09:00:00-07:00")
+        self.assertEqual((c["text"], c["tag"]), ("____", mm.NR_TAG))
+        self.assertIn("changed on 2026-09-16", c["warnings"][-1])
+        c = self.rec(first="2026-11-23T09:00:00-08:00", last="garbage")
+        self.assertEqual((c["text"], c["tag"]), ("____", mm.NR_TAG))
+        self.assertIn("last run's acquisition date could not be read", c["warnings"][-1])
+
+    def test_a_log_that_cannot_place_the_runs_falls_to_the_column_of_their_dates(self):
+        rows = [{"event_type": "column_change", "event_date": "2026-12-01T09:00:00-08:00",
+                 "column_vendor": "X", "column_model": "Later column"}]
+        c = self.rec(rows, first="2026-11-23T10:00:00-08:00", last="2026-11-24T02:00:00-08:00")
+        self.assertEqual((c["text"], c["tag"]), (mm.LC_COLUMN_MICHROM, mm.DEF))
+        self.assertTrue(any("no column change before the first run" in w for w in c["warnings"]))
+
+    def test_several_changes_give_the_latest_before_the_runs(self):
+        table = ((None, "A"), ("2026-01-10", "B"), ("2026-06-10", "C"))
+        for first, want in (("2026-01-01T00:00:00", "A"), ("2026-03-01T00:00:00", "B"),
+                            ("2026-08-01T00:00:00", "C")):
+            self.assertEqual(mm.facility_column(first, table=table)[0], want)
+        self.assertIsNone(mm.facility_column("2026-01-01T00:00:00", "2026-08-01T00:00:00",
+                                             table=table)[0])
+        self.assertIn("since 2026-06-10", mm.facility_column("2026-08-01T00:00:00", table=table)[1])
+
+    def test_runs_near_the_change_are_named_with_a_warning_to_confirm(self):
+        c = self.rec(first="2026-09-20T09:00:00-07:00", last="2026-09-21T09:00:00-07:00")
+        self.assertEqual(c["text"], mm.LC_COLUMN_MICHROM)
+        self.assertIn("within 7 days of the facility's column change of 2026-09-16",
+                      c["warnings"][-1])
+        c = self.rec(first="2026-09-09T09:00:00-07:00", last="2026-09-10T09:00:00-07:00")
+        self.assertEqual(c["text"], mm.LC_COLUMN_DEFAULT)
+        self.assertIn("confirm which column was fitted", c["warnings"][-1])
+        self.assertEqual(self.rec(first="2026-11-23T10:00:00-08:00", last=None)["warnings"], [])
+
+    def test_a_given_column_or_a_log_still_wins_after_the_change(self):
+        c = self.rec(user="Aurora 25 cm", first="2026-11-23T10:00:00-08:00")
+        self.assertEqual((c["text"], c["tag"]), ("Aurora 25 cm", None))
+
+    def test_the_column_history_is_in_date_order_with_one_undated_start(self):
+        days = [d for d, _ in mm.FACILITY_COLUMNS]
+        self.assertIsNone(days[0])
+        self.assertEqual(days[1:], sorted(days[1:]))
+        self.assertTrue(all(days[1:]))
+        text, source, note = mm.facility_column("2026-11-23T10:00:00", table=((None, "A"),))
+        self.assertEqual((text, source, note), ("A", "facility default — confirm", None))
 
     def test_user_column_wins(self):
         c = self.rec(CHANGES, user="Aurora 25 cm", runs=[{"column_info": "X"}])

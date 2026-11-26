@@ -10,9 +10,9 @@ silently fabricated (DE-LIMP rule #2). From a Bruker .d (bruker_method.py) it re
 system and method, the ion source, TIMS settings, the dia-PASEF window scheme, cycle time and
 collision-energy ramp, and writes them in the order published timsTOF Methods use; Thermo .raw
 is identified by facility filename prefix. The analytical column comes, in order, from
---lc-column, from HyStar's ColumnInfo when an operator entered one, from --column-log (an
-export of STAN's column-change log, matched to the acquisition dates), or else the facility's
-standard column, tagged. It writes:
+--lc-column, from HyStar's ColumnInfo when an operator entered one, from --column-log (`stan`:
+STAN's public column-change log for the instrument; or an export of it -- matched to the
+acquisition dates), or else the facility's standard column on those dates, tagged. It writes:
 
   methods.md          drop-in Methods prose (LC, MS, database search, sequence
                       database, differential expression) + a parameter table
@@ -29,7 +29,7 @@ Acknowledgments are from https://proteomics.ucdavis.edu/instrument-grant-acknowl
 Usage:
   python3 make_methods.py --raw '/data/*.d' --out methods.md \
       [--lc-column "PepSep MAX C18, 10 cm × 150 µm, 1.5 µm"] \
-      [--column-log stan_column_changes.csv [--column-log-instrument NAME]] \
+      [--column-log stan | stan_column_changes.csv [--column-log-instrument NAME]] \
       [--params wf/params.cfg --search-prov search/search_provenance.json \
        --workflow-manifest wf/workflow.manifest.json]   # adds the Database-search section
       [--de-dir output/tables]      # optional: adds a Differential-expression paragraph
@@ -105,6 +105,18 @@ def instrument_vendor(name):
 # and only for a Core timsTOF .d -- they are the timsTOF HT's (column_record's `core`).
 LC_COLUMN_DEFAULT = ("PepSep MAX C18 column (10 cm × 150 µm i.d., 1.5 µm particles; "
                      "Bruker PepSep, part no. 1893483)")
+# The standard column changed. FACILITY_COLUMNS is the timsTOF HT's standard column by date:
+# (the day it became the standard, or None for "before any change listed"; the column), oldest
+# first. A run is given the column of ITS date, still DEF-tagged (usual, not a record). The day
+# of a change belongs to neither column, and a series that reaches across one has no single
+# column: both get a tagged blank and the reason (2026-11-25: a batch acquired on 2026-11-23 was
+# given the PepSep column, ten weeks after the switch).
+#   2026-09-16  Michrom C18, per STAN's column log (Brett confirmed 2026-11-12).
+# When the Core changes its standard column again, add a line here.
+LC_COLUMN_MICHROM = "Michrom C18 column (10 cm × 150 µm i.d., 1.5 µm particles)"
+FACILITY_COLUMNS = ((None, LC_COLUMN_DEFAULT),
+                    ("2026-09-16", LC_COLUMN_MICHROM))
+FACILITY_COLUMN_NEAR_DAYS = 7      # a run this close to a change gets a warning to confirm
 EMITTER_DEFAULT = "a 20 µm-bore CaptiveSpray emitter (Bruker)"
 # STAN config/columns.yml `defaults.oven_c` (oven_c_source: operator-reported, read off the
 # timsTOF HT's Bruker Column Toaster on 2026-09-02). Not recorded per run, so always DEF-tagged.
@@ -193,18 +205,46 @@ def _wall(ts, like=None):
     return t.replace(tzinfo=None)
 
 
+#: `--column-log stan`: STAN's own maintenance log, asked over its public API.
+COLUMN_LOG_STAN = "stan"
+COLUMN_LOG_STAN_TIMEOUT_S = 20
+
+
+def _log_name(path):
+    return "STAN's maintenance log" if path == COLUMN_LOG_STAN else f"column log {os.path.basename(path)}"
+
+
 def read_column_log(path, instrument=None):
     """The column changes in a column log: an export (CSV, or JSON list) of STAN's
     maintenance_events rows -- event_type, event_date, column_vendor, column_model and
     optionally instrument, column_serial, first_run. STAN keeps these in PG Farm, which needs
     credentials, so this script never connects to it; the log has to be exported and passed.
+    `--column-log stan` (COLUMN_LOG_STAN) asks STAN's dashboard for the same rows instead: its
+    maintenance log for `instrument` is public (qc_bracket.stan_events, the one reader: GET
+    /api/instruments/<instrument>/events). It needs the instrument's name as STAN has it, and
+    a STAN that cannot be reached is a problem said, never a failure.
     Returns (rows, problem): rows are the column_change events of one instrument."""
-    try:
-        with open(path, encoding="utf-8-sig", newline="") as fh:
-            rows = (json.load(fh) if path.lower().endswith(".json") else
-                    list(csv.DictReader(fh)))
-    except (OSError, ValueError) as e:
-        return [], f"the column log {os.path.basename(path)} could not be read ({e})"
+    if path == COLUMN_LOG_STAN:
+        if not instrument:
+            return [], ("STAN's column log was not asked: the instrument is not known (pass "
+                        "--column-log-instrument with its name in STAN)")
+        try:
+            import qc_bracket
+            base = (os.environ.get(qc_bracket.STAN_URL_ENV) or qc_bracket.STAN_URL).rstrip("/")
+            rows, why = qc_bracket.stan_events(base, instrument, COLUMN_LOG_STAN_TIMEOUT_S)
+        except Exception as e:                        # never costs the Methods
+            rows, why = None, f"{type(e).__name__}: {e}"
+        if rows is None:
+            return [], f"STAN's column log could not be read ({why})"
+        for r in rows:                                # one instrument was asked for
+            r.setdefault("instrument", instrument)
+    else:
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as fh:
+                rows = (json.load(fh) if path.lower().endswith(".json") else
+                        list(csv.DictReader(fh)))
+        except (OSError, ValueError) as e:
+            return [], f"the column log {os.path.basename(path)} could not be read ({e})"
     if isinstance(rows, dict):
         rows = rows.get("events") or rows.get("rows") or []
     rows = [r for r in rows if isinstance(r, dict)
@@ -229,11 +269,14 @@ def column_record(user_column=None, runs=(), log_path=None, log_instrument=None,
       1. --lc-column, given by the user for this run;
       2. HyStar ColumnInfo, when an operator entered the column in the LC method;
       3. the column log's latest column_change at or before the first acquisition;
-      4. the facility's standard column, tagged DEF -- what is usually fitted, not a record --
-         only when `core` (a Core timsTOF .d: the default is the timsTOF HT's column); for any
-         other run, a blank tagged NR_TAG (a Thermo cohort once got the Bruker PepSep column).
+      4. the facility's standard column ON THE RUNS' DATES (facility_column: FACILITY_COLUMNS),
+         tagged DEF -- what is usually fitted, not a record -- only when `core` (a Core timsTOF
+         .d: the default is the timsTOF HT's column); for any other run, for runs with no
+         readable date, and for a series on or across the day the standard changed, a blank
+         tagged NR_TAG (a Thermo cohort once got the Bruker PepSep column).
     `first`/`last` are the series' first and last AcquisitionDateTime."""
     warn = []
+    unnamed_change = None
     if user_column:
         return {"text": user_column, "source": "--lc-column (user-given)", "tag": None,
                 "warnings": warn}
@@ -272,13 +315,14 @@ def column_record(user_column=None, runs=(), log_path=None, log_instrument=None,
                 if not model:
                     warn.append(f"the column change of {when.date()} in the column log does "
                                 f"not name the column")
+                    unnamed_change = when.date()
                 elif not during:
                     paren = [x for x in (vendor if vendor and not model.lower().startswith(
                         vendor.lower()) else None, f"serial/LOT {serial}" if serial else None)
                         if x]
                     anchor = str(row.get("first_run") or "").strip()
                     return {"text": model + (f" ({'; '.join(paren)})" if paren else ""),
-                            "source": (f"column log {os.path.basename(log_path)}: column_change "
+                            "source": (f"{_log_name(log_path)}: column_change "
                                        f"of {when.isoformat(sep=' ')}"
                                        + (f", first run on it {anchor}" if anchor else "")),
                             "tag": None, "warnings": warn, "installed": when.isoformat()}
@@ -287,8 +331,82 @@ def column_record(user_column=None, runs=(), log_path=None, log_instrument=None,
                 "column-log entry covers this run, and the facility's standard column applies "
                 "only to a Core timsTOF .d — confirm", "tag": NR_TAG,
                 "warnings": warn}
-    return {"text": LC_COLUMN_DEFAULT, "source": "facility default — confirm", "tag": DEF,
-            "warnings": warn}
+    text, source, why = facility_column(first, last)
+    # A column change the log dates but does not name, LATER than every change the built-in
+    # history knows: the column fitted then is not the built-in one, and nothing says what it
+    # is. A blank, never the column that was taken out.
+    known = [d for d, _ in FACILITY_COLUMNS if d]
+    if text is not None and unnamed_change is not None and core and (
+            not known or unnamed_change.isoformat() > max(known)):
+        text, why = None, (f"the column log records a column change on {unnamed_change} without "
+                           f"naming the column, and that is after the last standard column "
+                           f"this script knows ({max(known) if known else 'none dated'}): name "
+                           f"the column on that entry in STAN, or pass --lc-column")
+    if text is None:
+        warn.append(why)
+        return {"text": "____", "source": f"not recorded: {why} — confirm", "tag": NR_TAG,
+                "warnings": warn}
+    if why:
+        warn.append(why)
+    return {"text": text, "source": source, "tag": DEF, "warnings": warn}
+
+
+def _day(ts):
+    try:
+        return datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def facility_column(first, last=None, table=None):
+    """The facility's standard column for a series acquired from `first` to `last` (ISO
+    timestamps, the acquisition's own clock) -> (text, source, note). text None: no single
+    standard column can be named (no readable date; or the series is on, or reaches across, the
+    day the standard changed), and `note` says why. Otherwise `note` is a warning when the
+    series is within FACILITY_COLUMN_NEAR_DAYS of a change, else None."""
+    from datetime import date
+    table = FACILITY_COLUMNS if table is None else table
+    changes = [(date.fromisoformat(d), text) for d, text in table if d]
+    how = ("pass --lc-column with the column that was fitted, or --column-log with an export "
+           "of STAN's column changes")
+    d0, d1 = _day(first) if first else None, _day(last) if last else None
+    if d0 is None:
+        if not changes:
+            return table[0][1], "facility default — confirm", None
+        return None, None, ("no acquisition date could be read (from the raw files, or from "
+                            "the session's record of them), and the "
+                            "facility's standard column changed on "
+                            + ", ".join(str(d) for d, _ in changes)
+                            + f", so the column is not known: {how}")
+    if last and d1 is None:
+        return None, None, (f"the last run's acquisition date could not be read ({last!r}), so "
+                            f"the dates the series covers are not known: {how}")
+    if d1 is None:
+        d1 = d0
+    d0, d1 = min(d0, d1), max(d0, d1)
+    for day, _ in changes:
+        if d0 <= day <= d1:
+            span = f"on {d0}" if d0 == d1 else f"from {d0} to {d1}"
+            return None, None, (f"the runs were acquired {span}, and the facility's standard "
+                                f"column changed on {day}, so no single standard column can be "
+                                f"named for them: {how}")
+    text = next((t for d, t in table if not d), None)
+    since = None
+    for day, t in changes:
+        if day < d0:
+            text, since = t, day
+    if text is None:                              # before the first dated entry, and no undated one
+        return None, None, (f"the facility's column history starts on {changes[0][0]}, after "
+                            f"these runs ({d0}): {how}")
+    near = [day for day, _ in changes
+            if min(abs((d0 - day).days), abs((d1 - day).days)) <= FACILITY_COLUMN_NEAR_DAYS]
+    note = (f"the runs were acquired within {FACILITY_COLUMN_NEAR_DAYS} days of the facility's "
+            f"column change of {near[0]}: confirm which column was fitted ({how})"
+            if near else None)
+    source = ("facility default" + (f" since {since}" if since else
+                                    (f" until {changes[0][0]}" if changes else ""))
+              + " — confirm")
+    return text, source, note
 
 
 def _r(x, nd=2):
@@ -541,6 +659,42 @@ def _session_acquisition_json(a):
                 break
             d = up
     return None
+
+
+def recorded_acquisition_span(a, files):
+    """(first, last) acquisition time of `files` as the session's input/acquisition.json holds
+    them (detect_acquisition.py's `acquired_at`, UTC), as ISO text on the facility's clock
+    (FACILITY_TZ: the day a column was changed is a day there) -- or (None, None) unless the
+    record has a time for EVERY one of the files (a date for some says nothing of the rest)."""
+    path = _session_acquisition_json(a)
+    rec = _load_json(path) if path else None
+    rows = rec.get("files") if isinstance(rec, dict) else None
+    if not isinstance(rows, list):
+        return None, None
+    by = {os.path.basename(str(r.get("file") or "").rstrip("/\\")): r.get("acquired_at")
+          for r in rows if isinstance(r, dict)}
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(FACILITY_TZ)
+    except Exception:                               # no tz database: UTC-8, the later date
+        from datetime import timedelta, timezone
+        tz = timezone(timedelta(hours=-8))
+    whens = []
+    for f in files:
+        ts = by.get(os.path.basename(str(f).rstrip("/\\")))
+        try:
+            t = datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None, None
+        if t.tzinfo is None:
+            return None, None
+        whens.append(t.astimezone(tz))
+    if not whens:
+        return None, None
+    return min(whens).isoformat(), max(whens).isoformat()
+
+
+FACILITY_TZ = "America/Los_Angeles"
 
 
 def acquisition_from_records(a):
@@ -2694,9 +2848,11 @@ def main():
                          "else methods.md here)")
     ap.add_argument("--lc-column", help="the analytical column, as it should read in the "
                                         "Methods (overrides every other source)")
-    ap.add_argument("--column-log", help="a column-change log (CSV or JSON export of STAN's "
-                                         "maintenance_events): the column in place at the first "
-                                         "acquisition is used, with its install date as source")
+    ap.add_argument("--column-log", help="`stan` -- ask STAN's public maintenance log for this "
+                                         "instrument (for data acquired at the Core) -- or a "
+                                         "CSV or JSON export of its maintenance_events: the "
+                                         "column in place at the first acquisition is used, "
+                                         "with its install date as source")
     ap.add_argument("--column-log-instrument", help="the instrument to take from a column log "
                                                     "that covers several")
     ap.add_argument("--de-dir", help="optional: de_provenance.json for a Differential-expression paragraph")
@@ -2836,9 +2992,15 @@ def main():
     is_tims = vendor == "Bruker" and ("sources" in rep or "tims" in (instrument or "").lower())
     core_tims = is_tims and rep_file.endswith(".d")
     facility = core_tims or (ack_label is not None and rep_file.endswith((".d", ".raw")))
+    # the facility's column goes by the runs' dates: when the raw files cannot be read here,
+    # step 2's record of when each was acquired (input/acquisition.json) gives them
+    col_first, col_last = ser["acquired_first"], ser["acquired_last"]
+    if not col_first and core_tims:
+        col_first, col_last = recorded_acquisition_span(a, files)
     col = column_record(a.lc_column, metas if not from_record else (), a.column_log,
-                        a.column_log_instrument, ser["acquired_first"], ser["acquired_last"],
-                        core=core_tims)
+                        a.column_log_instrument
+                        or (instrument if a.column_log == COLUMN_LOG_STAN else None),
+                        col_first, col_last, core=core_tims)
 
     _write_text(os.path.splitext(a.out)[0] + "_params.json", json.dumps(
         {"files": [m.get("file") for m in metas], "representative": rep,

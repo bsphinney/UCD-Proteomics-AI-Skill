@@ -7,9 +7,9 @@ part of a full analysis or **standalone** (just `--raw` at the facility data).
 <!-- contents: tests/test_skill_structure.py --toc -->
 **Contents** (section: line)
 - 15: What it extracts vs. defaults
-- 135: Instrument grant acknowledgments (verified 2026-06)
-- 159: Output + workflow
-- 172: 9d. The Methods section (step 9d)
+- 147: Instrument grant acknowledgments (verified 2026-06)
+- 171: Output + workflow
+- 185: 9d. The Methods section (step 9d)
 <!-- /contents -->
 
 ## What it extracts vs. defaults
@@ -45,17 +45,29 @@ part of a full analysis or **standalone** (just `--raw` at the facility data).
 - **The analytical column**, most authoritative first:
   1. `--lc-column`, given by the user.
   2. HyStar `ColumnInfo`, when an operator entered it.
-  3. `--column-log FILE`: a CSV or JSON export of STAN's `maintenance_events`. It needs
+  3. `--column-log stan`: **pass this for data acquired at the Core.** It asks STAN's public
+     maintenance log (`/api/instruments/<instrument>/events`, the reader `qc_bracket.py` uses)
+     for the instrument the raw files name, so a column change logged in STAN reaches the
+     Methods with no change to the skill. STAN unreachable, or a change logged with no column
+     named: the reason is printed and rule 4 applies. Or `--column-log FILE`: a CSV or JSON
+     export of STAN's `maintenance_events`. Either way it needs
      `event_type`, `event_date`, `column_vendor` and `column_model`, and can carry
      `instrument`, `column_serial` and `first_run`. The latest `column_change` at or before
      the first acquisition is used, and its install date is cited as the source. A change
      inside the series, a change that names no column, or a log covering several instruments
      without `--column-log-instrument` falls back to the default, with the reason printed.
-     STAN keeps this log in PG Farm, which needs credentials, so the script never connects to
-     it; export the rows and pass the file.
-  4. Otherwise, **for a timsTOF `.d` only**, the facility's standard column, from STAN's column
-     catalogue (PepSep MAX C18, 10 cm × 150 µm, 1.5 µm, part 1893483), **tagged
-     `[facility default — confirm]`**. It is the Core timsTOF HT's column, so any other run (a
+     The script never connects to PG Farm (which needs credentials): `stan` reads the public
+     dashboard, and a file is an export.
+  4. Otherwise, **for a timsTOF `.d` only**, the facility's standard column **on the runs'
+     acquisition dates** (`FACILITY_COLUMNS` in `make_methods.py`: PepSep MAX C18, 10 cm ×
+     150 µm, 1.5 µm, part 1893483, until 2026-09-16; the Michrom C18, 10 cm × 150 µm, 1.5 µm,
+     since), **tagged `[facility default — confirm]`**. Runs on the day of the change, a series
+     that reaches across it, and runs with no readable date get `____ [not recorded — confirm]`
+     and the reason; runs within 7 days of it are named, with a warning to confirm. When the
+     raw files cannot be read here, the dates are step 2's (`input/acquisition.json`), and
+     only when it has one for every run. When the
+     Core changes its standard column, add a line to `FACILITY_COLUMNS`.
+     It is the Core timsTOF HT's column, so any other run (a
      Thermo `.raw`, an mzML, data from an instrument the Core does not have) gets
      `an analytical column ____ [not recorded — confirm]`: a Thermo cohort once got the Bruker
      PepSep column (2.14.2).
@@ -167,7 +179,8 @@ The agent should **verify the draft against the parameter table and polish the
 prose** (the example in `<your folder of instrument method files>` shows the
 target quality), resolve every `[… — confirm]` tag in the list above from a record or the
 user's answer (never with a guess: an unresolved tag stays), and keep the acknowledgment
-verbatim.
+verbatim. **Keep every `##` heading the draft has**, `Sample preparation` too when the lab
+prepared the samples (say so under it): finalize refuses a `methods.md` that lacks one.
 
 ## 9d. The Methods section (step 9d)
 
@@ -230,12 +243,11 @@ What it extracts, and what it only defaults:
   and its settings, the TIMS ramp, the dia-PASEF window scheme, the cycle time and the
   collision-energy ramp. It writes them in the order published timsTOF Methods use.
 - The analytical column comes from `--lc-column`, else from HyStar's ColumnInfo, else from
-  `--column-log`. That flag takes an export of STAN's column-change log, and the column in place
-  at the first acquisition is used. With none of these, **for a timsTOF `.d` only**, the
-  facility's standard column (PepSep MAX C18, 10 cm × 150 µm, 1.5 µm) is printed **tagged
-  `[facility default — confirm]`**; any other run (a Thermo `.raw`, an mzML, outside data) gets
+  `--column-log` (`stan` for Core data: STAN's public column-change log; or an export of it),
+  and the column in place at the first acquisition is used. With none of these, **for a timsTOF `.d` only**, the
+  facility's standard column on the runs' dates (PepSep MAX C18 until 2026-09-16, the Michrom
+  C18 since) is printed **tagged `[facility default — confirm]`**; any other run (a Thermo `.raw`, an mzML, outside data) gets
   `____ [not recorded — confirm]`.
-  STAN keeps that log in PG Farm, which needs credentials, so the script never connects to it.
 - It tags what no file records: column temperature, emitter, mobile phases, Evotip loading and
   peptide amount. STAN's 50 °C and the 20 µm emitter are given as facility defaults, tagged,
   **for a timsTOF `.d` only**; the facility's mobile phases only for a Core `.d` or `.raw`;

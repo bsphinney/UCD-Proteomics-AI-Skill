@@ -423,7 +423,7 @@ fabricated; QC stays above the results. No Word copy; point at the HTML first. �
 Core staff: board.md §3 row "results ready"; relay a survey NOTE here or at step 12 as printed.
 
 ### 9d. / 9e. Methods, and the audio discussion
-`make_methods.py`: no guessed value (`[not recorded — confirm]`), the acknowledgment exact; relay
+`make_methods.py` (Core data: `--column-log stan`): no guessed value (`[not recorded — confirm]`), the acknowledgment exact; relay
 `database_build_warnings` (methods.md "9d."). Podcast: a submission → by default; internal → offered;
 anyone else → only with their consent; it never holds anything up. **A reviewer that did not write
 the script** runs `make_podcast.py meaning` (→ `meaning_check.md`) before render. → podcast.md "9e.".
